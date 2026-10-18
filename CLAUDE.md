@@ -39,6 +39,9 @@ no bf16) + 64 GB RAM, available for weeks.
   (≈94–96% accurate when it answers; abstains on mud). Car #1 is unreadable (mud), which is a re-ID problem.
 - Pass rules: one car = one count. Merge tracks that re-start where the last box ended (<10 s), and merge coexisting
   tracks whose boxes nest (same car, two boxes). The lap app also drops duplicates within 5 s (`duplicata_ms`).
+- To keep a process off the GPU on Windows use `CUDA_VISIBLE_DEVICES=-1`. An empty value is dropped by Windows, so torch
+  still sees CUDA. `.venv\Scripts\python.exe` is a launcher: killing it leaves the real interpreter running, so stop long
+  jobs with the `PAUSE` file instead.
 - On Windows with a 16 GB GPU, don't run two GPU stages at once (VRAM spills to shared memory and gets ~10× slower).
 
 ## Conventions

@@ -179,7 +179,8 @@ every frame of the pass and vote per track, snapped to the roster. End-to-end ev
 
 ### WP11 · Laptop benchmark + real-time prototype (M5)
 
-ONNX/OpenVINO export, measured on the real target laptop (≤ 50 ms/frame detector, a few ms per number crop, < 1 GB RAM).
+Export at **384×640**, not a padded 640 square (WP9: half the cost, no retraining). On this 3900X, YOLO11n runs at
+22 ms with 4 threads (50 ms with 1) and YOLO11s at 49 ms with 4, both < 0.3 GB of RAM. ONNX/OpenVINO export, measured on the real target laptop (≤ 50 ms/frame detector, a few ms per number crop, < 1 GB RAM).
 Real-time loop: capture → detect → track → `passes.py` rules → read → emit a pass (timestamp + confidence) as a third
 `fonte` to the lap app, plus a number feed for the PTZ tracker.
 
