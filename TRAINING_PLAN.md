@@ -4,6 +4,9 @@ Status (2026-10-18): **teacher done.** WP0–WP6 and WP8 are done (each agent's 
 - Labels: 7.4k consensus tracks. VLM vs overlay identity agree 96.9% (DIN/SPP close-ups).
 - Datasets: being re-exported from the final labels. Car set ≈ 45k frames.
 - Waiting on: the user's QA review of `out/qa/<EV>_teacher.jsonl`, and WP9 training on the 2080 Ti.
+- WP10 recognizer is done: a 1.3M-param CRNN, 1–2.6 ms/crop on CPU, 96% track precision at 43% coverage on 24SU. Next on the
+  GPU: the number-panel detector, then the 26SE identity chain end to end, then cars_s640.
+- The YOLO11n epoch-32 snapshot on the last 26SE file gets pass recall 0.984 and precision 0.954 (YOLO-World: 1.00 / 0.98).
 - Number boxes exist for only 2.6k of the 7.4k consensus tracks. Plan: train the number-panel student on them, then let it
   propose boxes for the rest (cheaper than ~5 GPU-h of grounded reads), keeping only boxes whose read matches the consensus.
 
