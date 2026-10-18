@@ -142,9 +142,42 @@ def vote(P, weights=None):
     return int(o[0]), float(s[o[0]]), float(s[o[1]]) if len(o) > 1 else 0.0
 
 
+def vote_boxed(P, has_box, p_support=0.5, score="share"):
+    """Crop-count-independent track vote (WP10b fix of the panel-chain score). Crops where the panel detector found no
+    box carry no evidence and are ignored (vote() averaged their zeros in, so 30-crop passes scored lower than 4-crop
+    val tracks and a val-picked tau did not transfer). Score = mean over boxed crops of P(number | crop); support =
+    number of boxed crops whose own argmax is the voted number with P >= p_support. Answer when score >= tau and
+    support >= min_support (both picked on val).
+    score="share" (default): posterior-weighted vote share = sum_crops P(winner) / sum_crops max_n P(n): weak crops
+    (blur, partial panel, a box on a shirt) have little weight, so the score measures the agreement of the confident
+    reads and does not fall when a domain gives many weak crops. score="mean": plain mean of P(winner) over boxed crops.
+    The winner is the number with the largest summed posterior in both cases.
+    Returns (best index, score, runner-up score, n_boxed, support); best = -1 when no crop has a box."""
+    P = np.asarray(P, dtype=np.float64)
+    hb = np.asarray(has_box, dtype=bool)
+    if len(P) == 0 or not hb.any():
+        return -1, 0.0, 0.0, 0, 0
+    Q = P[hb]
+    s = Q.mean(0)
+    if score == "share":
+        s = Q.sum(0) / max(float(Q.max(1).sum()), 1e-9)
+    o = np.argsort(-s)
+    j = int(o[0])
+    sup = int(((Q.argmax(1) == j) & (Q[:, j] >= p_support)).sum())
+    return j, float(s[j]), float(s[o[1]]) if len(o) > 1 else 0.0, int(hb.sum()), sup
+
+
 def load_model(path, device="cpu"):
+    """CRNN checkpoint, or (WP10b) arch type 'parseq': PARSeq-tiny wrapped to the same (T,B,11) log-prob output."""
     ck = torch.load(path, map_location=device, weights_only=False)
     a = ck.get("arch", {})
+    if a.get("type") == "parseq":
+        from parseq_model import ParseqCTC
+        m = ParseqCTC(max_label_length=a.get("max_label_length", 4), refine_iters=a.get("refine_iters", 1),
+                      img_w=a.get("img_w", 128))
+        m.load_state_dict(ck["model"])
+        m.eval()
+        return m, a
     m = CRNN(h=a.get("h", IMG_H), width=a.get("width", 1.0), rnn=a.get("rnn", 128))
     m.load_state_dict(ck["model"])
     m.eval()

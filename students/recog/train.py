@@ -6,6 +6,12 @@ usage:
   CUDA_VISIBLE_DEVICES=-1 python students/recog/train.py --name syn_ft --init students/runs/recog/syn_pre/last.pt
   options: --p-neg 0.2 (share of "no number" windows, empty target)  --p-syn 0 (synthetic share mixed into real training)
            --epoch-size 6000 --batch 128 --lr 2e-3 --threads 6 --workers 2 --width 1.0
+  WP10b options (defaults = the WP10 recipe, unchanged):
+           --fold v1:K        drop the fold's held-out numbers from training (folds/numbers_v1.json, heldout_eval.py)
+           --keep-cars F      keep a random fraction F of the training (event, number) cars (data-scaling curve)
+           --syn-text uniform synthetic numbers 1-99 + "0N" with near-uniform digits (default: WP10 rand_text)
+           --p-splice P       share of digit-spliced real crops (splice.py bank) in each batch
+           --p-prop P         share of WP9 panel-proposal crops (prep_props.py cache_props.pkl, train events only)
 
 Early stopping on val (25SU) exact-match after stripping leading zeros (greedy CTC decode vs the consensus number),
 'ok' bucket. Runs: students/runs/recog/<name>/{best.pt,last.pt,log.csv,args.json}. Never trains on 26SE.
@@ -19,6 +25,7 @@ import sys
 import time
 from pathlib import Path
 
+import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -27,6 +34,7 @@ from torch.utils.data import DataLoader, Dataset
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from augment import augment, plain, synth_sample  # noqa: E402
 from common import CRNN, RUNS, BLANK, IMG_H, batch_tensor, encode, greedy, n_params, strip0  # noqa: E402
+import gen  # noqa: E402
 
 
 def load(split):
@@ -34,12 +42,23 @@ def load(split):
         return pickle.load(f)
 
 
+def load_props(held, keep_frac=1.0, keep_seed=0):
+    """WP9 panel proposals (prep_props.py), minus the fold's held-out numbers (and the same car subsample)."""
+    P = gen.keep_cars(gen.exclude_numbers(load("props"), held), keep_frac, keep_seed)
+    print(f"panel proposals: {len(P)} boxes, {len({(i['video'], i['track']) for i in P})} tracks", flush=True)
+    return P
+
+
 class TrainSet(Dataset):
-    def __init__(self, items, size, p_neg, p_syn, synth_only=False):
+    def __init__(self, items, size, p_neg, p_syn, synth_only=False, syn_text="default", p_splice=0.0, splicer=None,
+                 p_prop=0.0, props=None):
         self.pos = [i for i in items if not i["neg"] and i["bucket"] == "ok"]
         self.neg = [i for i in items if i["neg"]]
         self.bgs = [i["img"] for i in self.neg[:3000]]
         self.size, self.p_neg, self.p_syn, self.synth_only = size, p_neg, p_syn, synth_only
+        self.text_fn = gen.rand_text_uniform if syn_text == "uniform" else None
+        self.p_splice, self.splicer = p_splice, splicer
+        self.p_prop, self.props = p_prop, props or []
         self.rng = None
 
     def __len__(self):
@@ -54,7 +73,14 @@ class TrainSet(Dataset):
             it = rng.choice(self.neg)
             return augment(it["img"], it["box"], rng), ""
         if self.synth_only or u < self.p_neg + self.p_syn:
-            return synth_sample(rng, self.bgs)
+            return synth_sample(rng, self.bgs, self.text_fn)
+        if u < self.p_neg + self.p_syn + self.p_splice:
+            img, box, text = self.splicer.sample(rng)
+            return augment(img, box, rng), text
+        if u < self.p_neg + self.p_syn + self.p_splice + self.p_prop:
+            it = rng.choice(self.props)
+            img = cv2.imdecode(np.frombuffer(it["img_jpg"], np.uint8), cv2.IMREAD_COLOR)
+            return augment(img, it["box"], rng), it["text"]
         it = rng.choice(self.pos)
         return augment(it["img"], it["box"], rng), it["text"]
 
@@ -97,6 +123,13 @@ def main():
     ap.add_argument("--threads", type=int, default=6)
     ap.add_argument("--workers", type=int, default=2)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--fold", default=None, help="v1:K = hold out fold K's numbers (WP10b)")
+    ap.add_argument("--keep-cars", type=float, default=1.0)
+    ap.add_argument("--keep-seed", type=int, default=0)
+    ap.add_argument("--syn-text", choices=["default", "uniform"], default="default")
+    ap.add_argument("--p-splice", type=float, default=0.0)
+    ap.add_argument("--splice-bank", default=str(RUNS / "splice_bank.pkl"))
+    ap.add_argument("--p-prop", type=float, default=0.0)
     a = ap.parse_args()
     torch.set_num_threads(a.threads)
     torch.manual_seed(a.seed)
@@ -106,6 +139,20 @@ def main():
     (out / "args.json").write_text(json.dumps(vars(a), indent=1))
 
     tr = load("train")
+    held = gen.fold_numbers(a.fold)
+    n0 = len(tr)
+    tr = gen.exclude_numbers(tr, held)
+    tr = gen.keep_cars(tr, a.keep_cars, a.keep_seed)
+    if held or a.keep_cars < 1:
+        cars = {(gen.event_of(i), i["number"]) for i in tr if not i["neg"]}
+        print(f"train items {n0} -> {len(tr)}, held out {sorted(held)}, cars {len(cars)}, "
+              f"numbers {len({n for _, n in cars})}", flush=True)
+    splicer = None
+    if a.p_splice > 0:
+        from splice import Splicer
+        splicer = Splicer(a.splice_bank, exclude=held, keep_crops={i["crop"] for i in tr})
+        print("splice bank", splicer.summary(), flush=True)
+    props = load_props(held, a.keep_cars, a.keep_seed) if a.p_prop > 0 else None
     va = load("val")
     vpos = [i for i in va if not i["neg"] and i["bucket"] == "ok"]
     vneg = [i for i in va if i["neg"]][:600]
@@ -114,7 +161,7 @@ def main():
     vt = [i["text"] for i in vpos]
     vn = [i["number"] for i in vpos]
 
-    ds = TrainSet(tr, a.epoch_size, a.p_neg, a.p_syn, a.synth_only)
+    ds = TrainSet(tr, a.epoch_size, a.p_neg, a.p_syn, a.synth_only, a.syn_text, a.p_splice, splicer, a.p_prop, props)
     dl = DataLoader(ds, batch_size=a.batch, num_workers=a.workers, collate_fn=collate, persistent_workers=a.workers > 0,
                     drop_last=True)
     model = CRNN(h=IMG_H, width=a.width)

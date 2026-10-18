@@ -11,6 +11,9 @@ Modes (the final chain is: number-panel detector -> recognizer -> vote -> roster
   --mode panels --panel-weights W.pt  run a YOLO number-panel net (WP9, datasets/numbers_crop) on each crop first,
                                       writes the boxes csv, then as above. (--panel-conf 0.25, --panel-imgsz 640)
 
+Vote (WP10b): --vote mean (WP10: mean over all crops, crops without a box add zeros, so the score depends on the
+crop count) or --vote boxed (mean over crops with a box + a minimum number of supporting crops, common.vote_boxed;
+tau / --min-support default from students/runs/recog/<name>/eval/panel_tau.json, picked on 25SU by panel_tau.py).
 The abstain threshold comes from the val split (--tau, default: read from students/runs/recog/<name>/eval/
 window_val.json or metrics.json for the target precision --target), never from 26SE. The full curve is printed for
 information only.
@@ -31,7 +34,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from augment import plain  # noqa: E402
-from common import ROOT, RUNS, RosterScorer, batch_tensor, load_any, read_roster, vote  # noqa: E402
+from common import ROOT, RUNS, RosterScorer, batch_tensor, load_any, read_roster, vote, vote_boxed  # noqa: E402
 from evaluate import TAUS, wilson  # noqa: E402
 from window import read_car_crop  # noqa: E402
 
@@ -106,6 +109,9 @@ def main():
     ap.add_argument("--target", type=float, default=0.97)
     ap.add_argument("--threads", type=int, default=6)
     ap.add_argument("--limit", type=int, default=0, help="first N passes only (smoke test)")
+    ap.add_argument("--vote", choices=["mean", "boxed"], default="mean")
+    ap.add_argument("--min-support", type=int, default=None)
+    ap.add_argument("--tag", default="", help="suffix for the output folder")
     a = ap.parse_args()
     torch.set_num_threads(a.threads)
     model = load_any(RUNS / a.name, a.threads)
@@ -115,7 +121,7 @@ def main():
     if a.limit:
         P = P.head(a.limit)
     cp = crop_paths(P, a.all_crops, a.max_crops)
-    tag = f"{a.mode}{'_all' if a.all_crops else ''}"
+    tag = f"{a.mode}{'_all' if a.all_crops else ''}{'_boxed' if a.vote == 'boxed' else ''}{a.tag}"
     od = ROOT / "out" / f"eval_recog_{a.name}_{tag}"
     od.mkdir(parents=True, exist_ok=True)
     boxes = None
@@ -129,28 +135,44 @@ def main():
                      for p in B.path]
         boxes = {p: g[["x1", "y1", "x2", "y2"]].values.tolist() for p, g in B.groupby("path")}
     rows, t0, nc = [], time.time(), 0
+    min_support, tau_boxed, score_kind = 1, None, "share"
+    if a.vote == "boxed":
+        f = RUNS / a.name / "eval" / "panel_tau.json"
+        if f.exists():
+            pt = json.load(open(f))["chosen"]
+            min_support, tau_boxed, score_kind = pt["min_support"], pt["tau"], pt.get("score", "mean")
+        if a.min_support is not None:
+            min_support = a.min_support
     for i, r in enumerate(P.itertuples()):
-        Ps = []
+        Ps, HB = [], []
         for p in cp.get((r.src, int(r.pass_id)), []):
             im = cv2.imread(p)
             if im is None:
                 continue
             Ps.append(read_car_crop(model, im, sc) if a.mode == "window" else read_panels(model, im, boxes.get(p, []), sc))
+            HB.append(a.mode == "window" or len(boxes.get(p, [])) > 0)
             nc += 1
-        if Ps:
+        nb, sup = sum(HB), 0
+        if Ps and a.vote == "boxed":
+            j, s, s2, nb, sup = vote_boxed(Ps, HB, score=score_kind)
+            pred = roster[j] if j >= 0 else None
+            if j >= 0 and sup < min_support:
+                s = 0.0                      # abstains at any tau
+        elif Ps:
             j, s, s2 = vote(Ps)
             pred = roster[j]
         else:
             pred, s, s2 = None, 0.0, 0.0
         rows.append(dict(src=r.src, pass_id=r.pass_id, time=r.time, gt_car=r.gt_car, vlm_car=r.vlm_car,
-                         vlm_share=r.vlm_share, n_crops=len(Ps), pred=pred, score=s, margin=s - s2))
+                         vlm_share=r.vlm_share, n_crops=len(Ps), n_boxed=nb, support=sup, pred=pred, score=s,
+                         margin=s - s2))
         if i % 20 == 0:
             print(i, len(P), f"{(time.time() - t0) / max(nc, 1):.2f} s/crop", flush=True)
     D = pd.DataFrame(rows)
     D.to_csv(od / "passes.csv", index=False)
     G = D[D.gt_car.notna()]
-    tau = a.tau if a.tau is not None else default_tau(a.name, a.mode, a.target)
-    res = dict(name=a.name, mode=tag, passes=len(D), with_gt=len(G), crops=nc, s_per_crop=(time.time() - t0) / max(nc, 1),
+    tau = a.tau if a.tau is not None else (tau_boxed if a.vote == "boxed" else default_tau(a.name, a.mode, a.target))
+    res = dict(name=a.name, mode=tag, vote=a.vote, min_support=min_support if a.vote == "boxed" else None, passes=len(D), with_gt=len(G), crops=nc, s_per_crop=(time.time() - t0) / max(nc, 1),
                tau=tau, tau_source="--tau" if a.tau is not None else f"val, target precision {a.target}")
     vl = G[G.vlm_car.notna()]
     res["vlm_teacher"] = dict(coverage=len(vl) / max(len(G), 1), precision=float((vl.vlm_car == vl.gt_car).mean()))

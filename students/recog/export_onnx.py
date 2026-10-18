@@ -21,10 +21,10 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 
-def export(name):
+def export(name, ckpt="best.pt"):
     import torch
     from common import IMG_H, IMG_W, RUNS, load_model, n_params
-    m, _ = load_model(RUNS / name / "best.pt")
+    m, _ = load_model(RUNS / name / ckpt)
     x = torch.rand(1, 3, IMG_H, IMG_W)
     out = RUNS / name / "recog.onnx"
     torch.onnx.export(m, x, str(out), input_names=["image"], output_names=["logp"], opset_version=17,
@@ -81,6 +81,7 @@ def main():
     ap.add_argument("--name")
     ap.add_argument("--bench-only", action="store_true")
     ap.add_argument("--worker", nargs=4)
+    ap.add_argument("--ckpt", default="best.pt", help="checkpoint to export (WP10b protocol runs use last.pt)")
     a = ap.parse_args()
     if a.worker:
         kind, path, th, b = a.worker
@@ -90,11 +91,11 @@ def main():
     d = RUNS / a.name
     info = {}
     if not a.bench_only:
-        out, n, diff = export(a.name)
+        out, n, diff = export(a.name, a.ckpt)
         info.update(params=n, max_abs_diff=diff)
     res = []
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="-1")
-    for kind, path in (("ort", d / "recog.onnx"), ("torch", d / "best.pt")):
+    for kind, path in (("ort", d / "recog.onnx"), ("torch", d / a.ckpt)):
         for th in (1, 4):
             for b in (1, 8):
                 o = subprocess.run([sys.executable, __file__, "--worker", kind, str(path), str(th), str(b)],

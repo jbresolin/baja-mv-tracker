@@ -190,9 +190,9 @@ PLATE_COLORS = [(255, 255, 255), (240, 240, 235), (20, 20, 20), (200, 30, 30), (
                 (240, 200, 20), (240, 120, 20), (120, 30, 140), (130, 130, 130), (0, 150, 200), (220, 0, 120)]
 
 
-def render(rng, bg=None):
-    """Synthetic number: returns (BGR patch, box of the digits, text)."""
-    text = rand_text(rng)
+def render(rng, bg=None, text=None):
+    """Synthetic number: returns (BGR patch, box of the digits, text). text: fixed string (default: rand_text)."""
+    text = rand_text(rng) if text is None else text
     fname = rng.choice(FONTS)
     size = rng.randint(36, 72)
     try:
@@ -242,10 +242,11 @@ def render(rng, bg=None):
     return im, box, text
 
 
-def synth_sample(rng, bgs=None):
-    """A synthetic plate scaled so the digits are 14-60 px tall (the real box heights), then augmented."""
+def synth_sample(rng, bgs=None, text_fn=None):
+    """A synthetic plate scaled so the digits are 14-60 px tall (the real box heights), then augmented.
+    text_fn(rng) -> string overrides the default number distribution (WP10b: gen.rand_text_uniform)."""
     bg = rng.choice(bgs) if bgs and rng.random() < 0.7 else None
-    im, box, text = render(rng, bg)
+    im, box, text = render(rng, bg, text_fn(rng) if text_fn else None)
     s = rng.uniform(14, 60) / max(box[3] - box[1], 1)
     if s < 1:
         im = cv2.resize(im, (max(4, int(im.shape[1] * s)), max(4, int(im.shape[0] * s))), interpolation=cv2.INTER_AREA)
