@@ -369,3 +369,59 @@ the CPU at 100% the whole time, so CPU-side numbers are pessimistic.
 * WP4: plain read in **fp16, batch 4** (6 if the desktop is idle). Never 8 on this card while the desktop is in use.
 * Grounded read: **only for boxes, never for identity.** Run it on 2–3 crops of tracks that already have a plain-read
   consensus, and keep a box only if its label equals the consensus (as WP5 planned). Coordinates are 0–1000 relative to the crop.
+
+## Session 2: shots, shot tags and overlays (WP1/WP2)
+
+Code: `teacher/manifest.py`, `shots.py`, `shot_tags.py`, `overlay.py` (+ `shots_qa.py`, `overlay_qa.py`, `wp2_summary.py`,
+`common.py`). All CPU, resumable (`<stage>.done`, `errors.log`). Outputs: `data/videos.csv`, `data/events.csv`,
+`data/wp2_summary.csv`, `work/<id>/{shots.csv, overlays.csv, overlay_mask.png, overlay_preview.jpg}`.
+
+* **Manifest.** Event/prova are parsed from the first `<YY><BR|SE|SU|NE>_<PROVA>` in the file stem, so a later
+  `26BR_END_takeout.mkv` (any folder under `youtube/`) groups with `26BR_END.mp4`; the higher (height, bitrate) file is
+  `active`, the other `superseded` (tested with synthetic files). Stages only run on active rows. Ids are sanitised stems.
+  If Takeout delivers one prova split into several files, they would supersede each other: rename them `_p1`, `_p2`
+  with distinct provas or extend the rule.
+* **The streams have a fixed 5 s GOP.** Decoding I-frames only (`-skip_frame nokey`) is ~200× real time and gives a
+  frame every 5 s for free. The overlay stage uses only keyframes. Full decode at 10 fps / 128×72 is ~30× real time per
+  process (3 threads).
+* **Shot detection** (own detector on 10 fps signals; PySceneDetect not needed): hard cut = HSV content jump that is
+  large, ≥ 2.6× its neighbours and changes the colour histogram. Gradual transitions = the middle frame is a linear blend
+  of the frames k = 3/6/10 steps before and after (relative residual < 0.2) **and** dense optical flow cannot explain the
+  change (motion-compensated residual > 0.7). Without the flow test, PTZ zooms and pans produced ~3 false dissolves per
+  minute; the blend residual alone does not separate a slow zoom over grass from a dissolve. Transitions become their
+  own `is_transition=1` shots (tracking should skip them). Result: 5,720 shots in 42.4 h; 39/40 random boundaries in
+  25SU_DIN + 26BR_END were real (1 false: same scene on both sides); 5 spot checks inside the longest shots (up to 19 min)
+  were continuous PTZ / handheld zooms, no missed cut. 19SU_END's median shot of 1.6 s is real: sponsor commercials with
+  ~1 s cuts. Most transitions in these streams are 0.3–1 s dissolves, not hard cuts.
+* **Shot tags** (CLIP ViT-B/32, CPU, 1–3 keyframes per shot, max over several prompts per tag): **79% on the 150 shots
+  used to tune the prompts, 70% on 50 held-out shots** (`teacher/qa_labels/`). Main confusions: `track_wide` vs
+  `track_closeup` (CLIP has no notion of how big the car is: 9/27 held-out wide shots called close-up) and
+  `studio_interview` vs `graphics_fullscreen` (studio desks with a big logo and a TV). Onboard, pits, studio and drone are
+  recognised well. Mean-of-prompts pooling was worse than max (62% vs 75%). A generic "broadcast graphic" prompt pulled
+  studio shots into graphics; sponsor commercials are tagged graphics_fullscreen. Use the tags for stratification only,
+  as planned. Embeddings are cached (`shot_clip.npz`), so re-scoring with new prompts takes ~1 s per video.
+* **Overlays: what worked.** Per keyframe i and 24 random partners j ≥ 2 min away: an edge pixel counts when (a) the
+  local edge structure matches almost exactly (≥ 70% of the 9×9 window's edges coincide), (b) the surroundings differ
+  between i and j (≥ 30% of thumbnail cells on a 60–180 px annulus differ), and (c) i and j show different views
+  (< 30% of thumbnail cells look the same outside pass-1 regions). P(x) = share of frames with such a match. Pass 1 picks
+  the least similar partners (robust for static cameras), pass 2 random different-view partners (finds graphics that
+  only appear over one kind of shot, like DIN lower thirds). Regions: connected components of P ≥ 0.004 after removing
+  long straight lines (encoder grid streaks and ticker edges chain everything together otherwise), guillotine splits of
+  L-shapes, closed line rectangles (sponsor slots), then merges of regions that switch on and off together.
+  Visibility per keyframe = persistent edges present at ≥ 3× chance rate, or the region's colours match its typical "on"
+  look (scrolling tickers have no persistent text edges).
+* **Overlays: what failed.** Plain per-pixel stability (value or edge frequency over time) is dominated by static cameras
+  (19SU's start-line camera, SPP's single camera, studio), whose background is as stable as any graphic. "Partner must be
+  a different scene" by global similarity alone failed for studio shots (people move, layout changes) and, with random
+  partners, static views re-matched themselves. A whole-frame bounding box per component merged tower + ticker + logo
+  into one 1280×720 box until lines were split off.
+* **Overlay results** (previews `work/<id>/overlay_preview.jpg`, mask = union of boxes, `overlays.csv` has intervals):
+  END towers found in all END streams (19SU 54%, 24SU 7%, 25BR 39%, 25SU 86%, 26BR 27% of the time), corner logos
+  (19SU, 24SU, 24SU_SPP, 26BR_DIN), tickers (19SU, 24SU), 19SU's rotating sponsor slot, 26BR_DIN's corner labels and
+  lower third, 24SU_SPP's heat lower third and parts of the bracket, 26BR_END's onboard telemetry bar. Text-only lower
+  thirds whose text changes (25BR_DIN, 25SU_DIN) are only partly persistent, so they were added by hand in
+  `teacher/overlay_overrides.csv` (box + a reference time; visibility = colour match to that keyframe). One false
+  region (19SU, static scene) is dropped there. Big sparse graphics (SPP / DIN brackets) get loose boxes that cover live
+  video; WP3's `track.py` already ignores regions > 6% of the frame.
+* Runtimes (CPU, 3–4 videos in parallel): manifest 10 s; shots 3–17 min per video (26 min wall for all 42 h);
+  tags 1–9 min per video; overlays 2–16 min per video (two passes, ~1 h wall for all).

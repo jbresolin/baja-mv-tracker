@@ -1,0 +1,6 @@
+event,name,year,region,n_videos,hours,has_roster,split
+19SU,Baja SAE Brasil Sul 2019,2019,Sul,1,4.68,1,train
+24SU,Baja SAE Brasil Sul 2024,2024,Sul,2,6.03,1,test
+25BR,Baja SAE Brasil Nacional 2025,2025,Nacional,2,14.16,1,train
+25SU,Baja SAE Brasil Sul 2025,2025,Sul,2,7.57,1,train
+26BR,Baja SAE Brasil Nacional 2026,2026,Nacional,2,9.97,1,train

@@ -1,0 +1,8 @@
+id,action,x1,y1,x2,y2,kind,t_ref,note
+25BR_DIN,drop,44,570,314,654,,,partial lower third (label only); replaced by the full box below
+25BR_DIN,add,40,570,490,668,lower_third,4656,"test label + ""NN - TEAM"" bar + school line; text changes so only the label was persistent"
+25SU_DIN,drop,76,612,414,710,,,partial lower third; replaced below
+25SU_DIN,drop,22,620,88,672,,,"the ""#"" box of the lower third; replaced below"
+25SU_DIN,add,10,612,560,680,lower_third,5335,"""#N Team"" bar (length depends on the name)"
+25SU_DIN,add,10,16,300,76,top_label,5335,"test name label (SUSPENSÃO 1, TRAÇÃO, ...)"
+19SU_END,drop,30,146,332,528,,,"false region: static start-line scene (fence / track) that survived the different-view test, 5% coverage"

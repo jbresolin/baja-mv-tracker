@@ -1,0 +1,10 @@
+id,hours,n_shots,n_transitions,median_shot_s,shots_per_hour,h_track_wide,h_track_closeup,h_onboard,h_pits_paddock,h_drone_aerial,h_studio_interview,h_graphics_fullscreen,h_crowd_other,n_overlays,overlays
+19SU_END,4.68,412,11,1.6,88.1,3.54,0.77,0.03,0.0,0.08,0.0,0.23,0.01,6,"top_label (6,6,402,120) 67%; leaderboard_tower (964,6,1274,714) 54%; lower_third (38,518,280,658) 37%; graphic (6,520,48,666) 68%; graphic (6,580,34,714) 41%; ticker_bar (86,664,1274,720) 52%"
+24SU_END,4.58,275,76,27.3,60.0,2.59,1.84,0.01,0.0,0.0,0.13,0.0,0.0,5,"leaderboard_tower (868,6,1274,678) 6%; corner_logo_or_label (6,8,174,86) 50%; ticker_bar (6,636,1274,720) 71%; ticker_bar (6,652,1274,720) 19%; ticker_bar (6,700,1274,720) 3%"
+24SU_SPP,1.45,37,7,76.2,25.6,0.53,0.43,0.12,0.04,0.0,0.11,0.16,0.07,7,"corner_logo_or_label (6,6,174,86) 85%; inset_or_logo_box (308,30,506,552) 21%; graphic (532,134,586,160) 16%; graphic (696,174,846,258) 21%; inset_or_logo_box (312,244,674,704) 21%; graphic (862,336,1004,414) 15%; lower_third (46,494,464,690) 38%"
+25BR_DIN,7.05,1266,370,8.9,179.5,1.69,0.29,0.02,0.27,0.53,3.08,1.17,0.02,2,"corner_logo_or_label (990,26,1262,76) 1%; lower_third (36,566,494,672) 7%"
+25BR_END,7.11,1099,188,2.7,154.6,3.55,0.83,0.13,0.54,0.19,0.44,0.52,0.92,1,"leaderboard_tower (1004,14,1268,576) 39%"
+25SU_DIN,3.3,339,145,20.0,102.8,0.47,0.59,0.06,0.68,0.0,0.35,0.33,0.82,4,"inset_or_logo_box (8,8,436,668) 7%; top_label (6,12,304,80) 7%; corner_logo_or_label (1064,22,1274,62) 10%; lower_third (6,608,564,684) 10%"
+25SU_END,4.27,663,320,21.2,155.1,0.64,3.14,0.02,0.03,0.0,0.23,0.07,0.13,1,"leaderboard_tower (1004,12,1268,574) 86%"
+26BR_DIN,5.68,741,203,9.9,130.5,2.53,0.8,0.42,0.7,0.0,0.77,0.42,0.04,7,"top_label (566,6,716,114) 30%; corner_logo_or_label (6,16,284,76) 34%; corner_logo_or_label (954,18,1274,124) 35%; lower_third (6,600,432,720) 36%; graphic (486,610,516,684) 33%; graphic (1144,666,1236,700) 7%; graphic (372,676,540,704) 17%"
+26BR_END,4.29,888,413,13.5,207.2,1.15,1.75,1.12,0.09,0.0,0.17,0.01,0.0,4,"leaderboard_tower (1004,12,1268,704) 27%; graphic (766,658,936,702) 12%; graphic (54,670,140,708) 21%; graphic (200,674,304,704) 21%"
