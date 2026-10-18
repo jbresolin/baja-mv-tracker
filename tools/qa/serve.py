@@ -1,7 +1,10 @@
 """QA review server: one page, keyboard verdicts, every verdict appended to <batch>.verdicts.jsonl at once.
 
 usage (from the repo root):  python tools/qa/serve.py <batch.jsonl|.parquet> [--port 8765] [--root .] [--reviewer NAME]
-then open http://127.0.0.1:8765/ . Stdlib only. Binds to 127.0.0.1.
+                                                     [--host 127.0.0.1|0.0.0.0] [--token T]
+then open http://127.0.0.1:8765/ . Stdlib only. Binds to 127.0.0.1 by default.
+With --host 0.0.0.0 (review from another device on the LAN) a random access token is required: open the printed
+http://<lan-ip>:<port>/?t=<token> once; it sets a cookie, and requests without it get 403.
 
 Endpoints
   GET  /                  the review page (tools/qa/index.html)
@@ -10,15 +13,19 @@ Endpoints
   GET  /img/<path>        an image under --root (crop / context paths in the batch are relative to --root)
 """
 import argparse
+import hmac
 import json
 import mimetypes
 import os
+import secrets
+import socket
 import sys
 import threading
 from datetime import datetime
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import qalib  # noqa: E402
@@ -64,10 +71,23 @@ class State:
 
 class Handler(BaseHTTPRequestHandler):
     S: State = None
+    token: str = None   # set when serving beyond localhost
 
     def log_message(self, fmt, *args):   # quiet: only errors
         if args and str(args[1])[:1] in "45":
             sys.stderr.write("%s %s\n" % (self.address_string(), fmt % args))
+
+    def authed(self):
+        """No token -> open (localhost only). Else the ?t= query (which also sets the cookie) or the cookie."""
+        self.set_cookie = False
+        if not self.token:
+            return True
+        q = parse_qs(urlparse(self.path).query).get("t", [""])[0]
+        if q and hmac.compare_digest(q, self.token):
+            self.set_cookie = True
+            return True
+        c = SimpleCookie(self.headers.get("Cookie", ""))
+        return "qa_t" in c and hmac.compare_digest(c["qa_t"].value, self.token)
 
     def send(self, code, body, ctype="application/json; charset=utf-8", cache=False):
         if isinstance(body, (dict, list)):
@@ -77,11 +97,17 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "max-age=3600" if cache else "no-store")
+        self.send_header("Cache-Control", ("private, max-age=3600" if self.token else "max-age=3600") if cache
+                         else "no-store")
+        if getattr(self, "set_cookie", False):
+            self.send_header("Set-Cookie", f"qa_t={self.token}; Path=/; HttpOnly; SameSite=Strict")
         self.end_headers()
         self.wfile.write(body)
 
     def do_GET(self):
+        if not self.authed():
+            return self.send(403, "forbidden: open the URL with ?t=<token> printed by serve.py\n",
+                             "text/plain; charset=utf-8")
         path = urlparse(self.path).path
         S = self.S
         if path in ("/", "/index.html"):
@@ -99,6 +125,8 @@ class Handler(BaseHTTPRequestHandler):
         return self.send(404, {"error": "not found"})
 
     def do_POST(self):
+        if not self.authed():
+            return self.send(403, {"ok": False, "error": "forbidden"})
         if urlparse(self.path).path != "/api/verdict":
             return self.send(404, {"error": "not found"})
         try:
@@ -130,7 +158,11 @@ def main():
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--root", default=".", help="directory that crop paths are relative to (default: cwd = repo root)")
     ap.add_argument("--reviewer", default=os.environ.get("USERNAME") or os.environ.get("USER") or "")
+    ap.add_argument("--host", default="127.0.0.1", help="0.0.0.0 to review from another device (token required)")
+    ap.add_argument("--token", default=None, help="access token when --host is not localhost (default: random)")
     a = ap.parse_args()
+    local = a.host in ("127.0.0.1", "localhost", "::1")
+    Handler.token = None if local else (a.token or secrets.token_urlsafe(9))
     Handler.S = State(a.batch, a.root, a.reviewer)
     S = Handler.S
     missing = [c for it in S.items[:20] for c in it.get("crops", []) if not (S.root / c).is_file()]
@@ -138,9 +170,20 @@ def main():
         print(f"warning: {len(missing)} crops of the first 20 items not found under {S.root}, e.g. {missing[0]}",
               file=sys.stderr)
     done = len(qalib.load_verdicts(S.batch))
-    srv = ThreadingHTTPServer(("127.0.0.1", a.port), Handler)
+    srv = ThreadingHTTPServer((a.host, a.port), Handler)
     print(f"{S.batch.name}: {len(S.items)} items, {done} already reviewed; verdicts -> {S.vpath}")
-    print(f"open http://127.0.0.1:{a.port}/   (Ctrl+C to stop)", flush=True)
+    if local:
+        print(f"open http://127.0.0.1:{a.port}/   (Ctrl+C to stop)", flush=True)
+    else:
+        try:   # the address this PC uses to reach the LAN (no packet is sent)
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("192.0.2.1", 9))
+            ip = s.getsockname()[0]
+            s.close()
+        except OSError:
+            ip = socket.gethostbyname(socket.gethostname())
+        print(f"open http://{ip}:{a.port}/?t={Handler.token}   from any device on the LAN (Ctrl+C to stop)",
+              flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

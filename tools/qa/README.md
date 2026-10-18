@@ -11,7 +11,10 @@ Estimate teacher label precision per event and per shot type by reviewing ~150 r
 .venv\Scripts\python.exe tools\qa\report.py out\qa\26SE_session1.jsonl [--by event,shot_tag,meta.src] [--json r.json]
 ```
 
-`serve.py <batch> [--port 8765] [--root .] [--reviewer NAME]` binds to 127.0.0.1 only. Every keypress verdict is
+`serve.py <batch> [--port 8765] [--root .] [--reviewer NAME] [--host 0.0.0.0] [--token T]` binds to 127.0.0.1 by
+default. To review from another device on the LAN (laptop, tablet), pass `--host 0.0.0.0`. It prints
+`http://<lan-ip>:<port>/?t=<token>`, and only that URL works (it sets a cookie; requests without it get 403). On touch
+screens, tap the key hints in the footer. Every keypress verdict is
 appended (and fsynced) to `<batch>.verdicts.jsonl` immediately. Stop with Ctrl+C at any time; restarting the server and
 reloading the page resumes at the first unreviewed item. Several batches can be reviewed in parallel on different ports.
 

@@ -41,6 +41,7 @@
   #wrongteam { font-size:13px; color:var(--dim); margin-top:4px; min-height:1.3em; }
   footer { display:flex; flex-wrap:wrap; gap:4px 18px; padding:5px 12px; background:var(--panel);
            border-top:1px solid var(--line); font-size:12.5px; color:var(--dim); }
+  footer [data-k] { cursor:pointer; padding:4px 2px; user-select:none; }
   kbd { display:inline-block; min-width:22px; text-align:center; padding:1px 5px; border:1px solid #555;
         border-bottom-width:2px; border-radius:4px; color:var(--fg); background:#2a2e34; font:12px ui-monospace, monospace; }
   #grid { flex:1; display:grid; gap:6px; padding:6px; min-width:0; min-height:0; align-content:center; justify-content:center; }
@@ -93,13 +94,13 @@
     <div id="done"></div>
   </main>
   <footer id="keys">
-    <span><kbd>1</kbd> <span id="k1">correct</span></span>
-    <span><kbd>2</kbd> <span id="k2">wrong number (type it)</span></span>
-    <span><kbd>3</kbd> not a car / bad box</span>
-    <span><kbd>4</kbd> can't tell</span>
-    <span><kbd>B</kbd> number boxes wrong</span>
-    <span><kbd>R</kbd> per-crop reads</span>
-    <span><kbd>&#9003;</kbd> undo / previous</span>
+    <span data-k="1"><kbd>1</kbd> <span id="k1">correct</span></span>
+    <span data-k="2"><kbd>2</kbd> <span id="k2">wrong number (type it)</span></span>
+    <span data-k="3"><kbd>3</kbd> not a car / bad box</span>
+    <span data-k="4"><kbd>4</kbd> can't tell</span>
+    <span data-k="b"><kbd>B</kbd> number boxes wrong</span>
+    <span data-k="r"><kbd>R</kbd> per-crop reads</span>
+    <span data-k="Backspace"><kbd>&#9003;</kbd> undo / previous</span>
     <span><kbd>click</kbd> zoom</span>
   </footer>
 </div>
@@ -367,6 +368,9 @@ document.addEventListener("keydown", e => {
     case "Escape": unzoom(); break;
   }
 });
+// touch / mouse: the footer key hints act as buttons (same path as the keyboard)
+for (const s of document.querySelectorAll("#keys [data-k]"))
+  s.addEventListener("click", () => document.dispatchEvent(new KeyboardEvent("keydown", {key: s.dataset.k})));
 $("zoom").addEventListener("click", unzoom);
 window.addEventListener("resize", layoutGrid);
 window.addEventListener("beforeunload", e => { if (queue.length) { e.preventDefault(); e.returnValue = ""; } });
