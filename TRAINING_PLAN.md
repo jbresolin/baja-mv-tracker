@@ -6,7 +6,11 @@ Status (2026-10-18): **teacher done.** WP0–WP6 and WP8 are done (each agent's 
 - Waiting on: the user's QA review of `out/qa/<EV>_teacher.jsonl`, and WP9 training on the 2080 Ti.
 - WP10 recognizer is done: a 1.3M-param CRNN, 1–2.6 ms/crop on CPU, 96% track precision at 43% coverage on 24SU. Next on the
   GPU: the number-panel detector, then the 26SE identity chain end to end, then cars_s640.
-- The YOLO11n epoch-32 snapshot on the last 26SE file gets pass recall 0.984 and precision 0.954 (YOLO-World: 1.00 / 0.98).
+- cars_n640 on the full 26SE: recall 0.913, precision 0.935, borrowed end-to-end 65.1% (teacher 0.933 / 0.975 / 67.9%);
+  21 ms on 4 CPU threads. Misses are the overexposed 10:24–10:51 stretch → exposure augmentation in cars_n640_v2.
+- 26SE identity chain (num_n320 + recognizer), no abstain: 62–67% top-1, end-to-end 62% (teacher 67.9%). Abstain
+  scoring is being fixed (WP10b). Round 2: 32k proposed panel boxes → numbers_crop_r2 → num_n320_r2, plus more digits.
+- GPU queue: cars_s640 (running) → num_n320_r2 → cars_n640_v2.
 - Number boxes exist for only 2.6k of the 7.4k consensus tracks. Plan: train the number-panel student on them, then let it
   propose boxes for the rest (cheaper than ~5 GPU-h of grounded reads), keeping only boxes whose read matches the consensus.
 
