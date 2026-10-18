@@ -900,3 +900,115 @@ Update to the WP8 section above (which describes the provisional run on `car_ver
   QA on 50 trainable crops: none clearly wrong, ~5 too blurred to read. 24% of the digit crops come from crops that
   were downscaled to ≤ 640 px (big cars), so they could be re-cut at native resolution if that ever matters.
 * ids: 52.8k crops, 7,440 tracks, 133 identities.
+
+## Session 2: number recognizer (WP10)
+
+Code: `students/recog/` (`prep.py` cache, `augment.py` augmentation + synthetic plates, `common.py` CRNN / CTC / roster
+scoring / vote, `train.py`, `evaluate.py`, `window.py` + `eval_window.py` (interim mode without a panel detector),
+`harness_26se.py`, `export_onnx.py`). Runs in `students/runs/recog/<name>/` (gitignored). **All CPU** (6 threads,
+2 loader workers) while WP9 trained on the GPU; ~25-35 s per epoch of 6,000 samples, a run is 30-40 min.
+
+### Model and data
+
+* CRNN: 6 conv layers (VGG style, 32-192 ch) -> (2,1) conv collapse -> BiLSTM 128 -> 11 classes (CTC blank + 0-9).
+  **1.29 M params**, input 32x96 RGB, aspect kept, padded with the border mean. Labels = `text_read` ("06" stays "06");
+  metrics strip leading zeros. 2 rows dropped ("C4" and one text mismatch).
+* `prep.py` re-cuts every digits box from the stored WP4 car crop with 50% context, so the augmentation can jitter the
+  box without black borders: one perspective warp does the box cut / extend (+-12% per side on top of the 10% pad),
+  rotation (gauss sd 7, clipped +-15 deg), perspective and shear; then colour (hue, channel swap, invert, gray, contrast,
+  gamma), mud blotches / dust haze, edge or tube occlusion, motion / Gaussian blur, down-up resampling to 8-22 px,
+  JPEG q15-75, noise. 0.7 ms/sample.
+* **"No number" windows** (random car-crop windows that do not touch a grounded box, empty CTC target) are 20% of each
+  batch. They keep false reads on background at ~4% (greedy non-empty) and roster P >= 0.5 at ~1%, and are what makes
+  the window mode possible at all.
+* CTC needs patience: loss sat at the blank plateau (~2.5) for 7 epochs (~300 steps) before it started reading.
+* Synthetic plates (`augment.render`): 1-3 digit strings (25% leading zero for 1 digit) in 24 Windows fonts, plates in
+  livery colours or none, outline strokes, 20% **hollow / outlined digits**, stencil gaps, letter spacing, real negative
+  windows as background, scaled to 14-60 px digit height, then the same augmentation. Synthetic-only training reaches
+  49% on val (zero real data) but fails on 2-digit numbers (13, 15, 16 near 0).
+* Roster snapping is done in the CTC: `RosterScorer` computes P("n") + P("0n") from the CTC sequence likelihood for every
+  roster number; P(other) = the rest. The track vote is the mean over crops of that posterior (soft vote).
+
+### Results (labels = teacher consensus; val 25SU, test 24SU; selection on val only)
+
+Crop level, 'ok' bucket (box >= 16 px), "acc" = greedy read == number after stripping zeros, "snap" = argmax of the
+roster posterior (24SU / 25SU rosters have only 16 cars, 26SE has 24):
+
+| run | val acc | val snap | test acc | test snap | test track top-1 | test track @ tau 0.6 (cov / prec) |
+|---|---|---|---|---|---|---|
+| real only, seed 0 | 79.7% | 81.6% | 49.7% | 57.3% | 66.2% | 38% / 85.6% |
+| real only, seed 1 | 78.0% | 80.5% | 51.9% | 59.3% | 66.4% | 37% / 90.1% |
+| synthetic only (25 epochs) | 48.9% | 56.3% | 35.3% | 48.1% | 56.2% | 27% / 86.7% |
+| **synth pre-train -> real fine-tune, seed 0 (`syn_ft`, chosen)** | **80.2%** | **82.7%** | **59.9%** | **68.0%** | **76.0%** | **43% / 96.3%** |
+| synth pre-train -> real fine-tune, seed 1 | 80.0% | 81.9% | 60.8% | 66.3% | 75.1% | 45% / 96.5% |
+| synth pre-train -> real + 30% synth | 78.6% | 81.5% | 64.9% | 71.7% | 79.6% | 51% / 97.4% |
+
+* **Synthetic pre-training helps where it matters: +1 point on val, +9.5 points on test** (2 seeds each). The new
+  event's liveries are the hard part and font diversity is what synthetic data adds. Caveat: the hollow-digit option
+  was added after looking at the real-only model's test errors (24SU cars 1 and 16 use outlined digits). Car 1 went
+  49% -> 89%, car 16 stayed at ~25%, so part of the test gain is test-informed. Keeping 30% synthetic during fine-tuning
+  was best on test but worse on val (78.6 vs 80.2), so by the rule `syn_ft` is the model.
+* **The val -> test gap (80 -> 60%) is per livery.** Test per car (snap): 1 89%, 7 94%, 15 80%, 11 77%, 13 76%, 2 74%,
+  9 73%, 6 70%, 4 55%, 3 53%, **16 24%** (96 crops, outlined digits on a triangular panel tilted ~25 deg). One event has
+  only 13-16 cars, so one hard livery moves the event mean by 5-10 points. Training has ~100 (event, livery) pairs
+  and 51 distinct numbers: more events help more than more crops per event.
+* By box height (test acc/snap): 16-24 px 53/60%, 24-32 58/66%, 32-48 56/65%, 48-64 68/76%, 64-96 70/78%; val is
+  44/53% at 16-24 px rising to 90/92% at 64-96 px. Tiny bucket (< 16 px): 52% test (n=21), 39% val (n=18).
+* Digit confusions (same-length reads). Val: 1->7 (serif "1" with a flag), 0->1 (narrow side-plate "0"), 4->6, 1->3.
+  Test: 6->3 and 6->8 (car 6's stylised 6), 0->1 and 0->3, 3->8 (stencil "03"). Length errors: mostly too short (a
+  digit dropped: half-visible "1" at the box edge), 134 short vs 53 long on test.
+* Error sheet (`students/runs/recog/syn_ft/eval/errors_test.jpg`, 40 test errors), by eye: ~10 car 16 (outlined, tilted
+  > 15 deg), ~6 car 6 read 16/8/28 (stylised tail), 3 stencil "03" -> 38/08, 3 "04" -> 14, 3 "13" -> 3 (the grounded box
+  cuts the "1": label box issue), ~8 blurred / dark / too small to read by eye, a few 1 -> 7. On val, several errors are
+  grounded boxes that cover only part of the number (13 -> 3) and one crop that clearly shows "7" for a car labelled 8.
+* **Track level** (test crops are only the grounded crops: 2.0 per track, 441 tracks). Soft vote, abstain below tau,
+  tau picked on val: val 0.6 -> 98.6% at 73% coverage; on test the same tau gives **96.3% [92.6-98.2] at 43%
+  coverage**; tau 0.7 98.2% at 38%; no abstention 76.0%. Majority of greedy reads (session-1 style) 90% coverage /
+  75% precision. The teacher's own track precision is 96.9% vs overlays (WP5), so at matched precision the student
+  covers ~43% of what the teacher labelled, with only 2 crops per track; the deployed system reads ~10-30 frames per pass.
+  These are student-vs-teacher numbers on crops the teacher could read (selection bias towards readable crops).
+
+### Interim mode without a panel detector (`window.py`) and the 26SE harness
+
+* ~1,000-1,400 windows per car crop (crop resized to 320 px high; 3 window heights 30/44/60 px x aspects 1.0/1.6, 60%
+  stride), crop posterior = per number the max over windows. 0.45-0.53 s per car crop with ONNX Runtime (6 threads).
+* Teacher-labelled tracks, 4 car crops each (250 random tracks): val 25SU top-1 70.8%, test 24SU **51.2%**. The max over
+  ~1,000 windows saturates the score (most tracks score > 0.9), so **the vote margin (top - runner-up) is the abstain
+  rule**: margin >= 0.3 (val 19% coverage / 97.9%) gives test 6% / 100%; margin >= 0.2 val 36% / 95.6%, test 17% / 97.7%.
+* Window failures (sheet of best windows on test errors): broadcast lower thirds inside the car crop ("10 - Pelznicke",
+  "16 - Baja SATC", P = 1.00), and confident windows on wheels, grilles, people and sponsor text. Training on "no number"
+  windows is not enough when a crop is searched with 1,000 windows.
+* **26SE (evaluation only, 235 passes with a GT car, the 10 crops the VLM read): top-1 51.9%; margin >= 0.3 (from val)
+  19.6% coverage at 93.5%; margin >= 0.4 7% at 100%.** The VLM teacher on the same passes: 77% / 94.0%. Per car: 4 96%,
+  5 85%, 13 71%, 3 67%; 6 44%, 20 43%, 10 23%; car 1 31% (mud; "1" is the easiest digit to hallucinate from a vertical
+  stroke, so its hits are not real reads). When the VLM abstains the window mode is right on only 17%.
+  Output: `out/eval_recog_syn_ft_window/`. **End-to-end needs the number-panel detector**; the window mode is a code
+  path check, not a usable reader.
+* `harness_26se.py --mode panels --boxes boxes.csv` (any box source) or `--panel-weights <WP9 number net>` runs the real
+  chain: panel boxes -> recognizer on box + 10% -> per-crop max -> vote -> roster 26SE. `--all-crops` reads every saved
+  frame of the pass's tracks (up to `--max-crops`). Smoke-tested with fake boxes only.
+
+### CPU latency (Ryzen 3900X, while WP9 trained on the GPU and its data loader used the CPU)
+
+| runtime | threads | batch 1 (ms / crop) | batch 8 (ms / crop) |
+|---|---|---|---|
+| ONNX Runtime | 1 | **2.6** | 3.0 |
+| ONNX Runtime | 4 | **1.0** | 0.9 |
+| torch | 1 | 8.0 | 5.5 |
+| torch | 4 | 4.4 | 2.0 |
+
+* Preprocessing (resize + pad) 0.05 ms. ONNX opset 17, dynamic batch and width, max |onnx - torch| 1e-5:
+  `students/runs/recog/syn_ft/recog.onnx`. Reading 10-30 number boxes per pass costs < 100 ms per pass on one thread.
+
+### What limits accuracy, and what WP10 needs from the number-panel detector
+
+* Liveries never seen in training (outlined, stencil, stylised digits) and panels tilted beyond +-15 deg. More events
+  (more liveries) and a wider rotation range are the next levers; synthetic fonts already gave +9.5 points.
+* Label boxes: grounded boxes sometimes cut a digit ("13" -> "3"). A panel detector trained on them inherits that, so
+  **pad its boxes by >= 10-15% before reading** (the recognizer was trained on box + 10% with +-12% jitter) and prefer
+  recall of whole panels over tight boxes. The vote copes with an extra box per crop; it cannot fix a cut digit.
+* The detector should give **every number instance of the car** (side plates, firewall, nose; the grounded labels miss
+  ~1 in 5) and **skip broadcast graphics**: in the window mode, lower thirds were the most confident wrong reads.
+* Boxes >= 24 px tall read at 58-90%; 16-24 px at ~50%. Below 16 px reading is not reliable.
+* Thresholds: crop / track posteriors are calibrated per mode. Pick tau (panel mode: score; window mode: margin) on val
+  again once the detector exists. Never on 26SE.
