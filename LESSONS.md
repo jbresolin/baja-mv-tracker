@@ -710,3 +710,48 @@ Comparison table to fill:
 | COCO YOLO11n, untrained (11-09-03 only) | 1280 | - | 15 (24 laps) | 0.58 | 0.93 | 1 | - | 22 |
 | student YOLO11n | 640 | | | | | | | 22 |
 | student YOLO11s | 640 | | | | | | | 49 |
+
+## Session 2: dataset export (WP8)
+
+Code: `teacher/export.py` (`pool` per video: decode + guard + sampling + dedupe -> `datasets/_pool/<id>/`; `build`:
+splits, balancing, YOLO files, README, stats; `qa`: contact sheets in `datasets/_qa/`). CPU only, ≤ 3 workers,
+resumable (`datasets/_state/<id>.pool.done` holds the input mtimes + `POOL_VERSION`, so a changed `labels.parquet`
+re-pools that video by itself; `pool.lock` prevents two runs at once). Outputs and counts: `datasets/README.md`.
+
+* **Frame alignment:** `detect.frame_pipe` with `start = frame_idx / 4` (as crops.py) reproduces the detector's
+  frames. Boxes drawn on exported frames sit exactly on the cars (checked on 24SU_SPP / 19SU sheets).
+* **Splits:** test = 24SU (all), **val = 25SU (whole event, END + DIN)**, train = 19SU, 25BR, 26BR.
+* **Result (verified labels, before grounded boxes):** cars train 26,837 images (25,072 pos, 470 hard neg, 1,295 neg;
+  43,345 boxes), val 9,981, test 7,985. Negative share only 6.6% (2.8% test): the teacher negative pools are small
+  after pHash dedupe, and I did not widen them (QA found missed cars in teacher negatives). Median box h/H 0.14 (train),
+  0.24 (val), 0.13 (test). ids: 52k crops, 7,298 tracks, 133 (event, number) identities. Pool: 8.9 GB of JPEGs.
+  numbers / digits empty until `labels.parquet` carries grounded boxes (re-run: `python teacher/export.py all`).
+* **Poison guard, what QA forced (each found by looking at sheets, kept here so nobody relaxes it):**
+  * Interpolating across fast pans produced boxes between cars; two tracks on one car gave doubled boxes. Fix:
+    interpolate only gaps ≤ 2 frames whose end boxes overlap (IoU ≥ 0.3), label-box NMS (IoU ≥ 0.5), and a longer
+    gap inside a car track blocks its frames.
+  * Low-conf detections of real cars (0.15–0.25, untracked) slipped past a 0.25-only guard. Guard now: untracked
+    ≥ 0.15, detections of unresolved tracks ≥ 0.10.
+  * Nested boxes: "group box ⊃ car + partial of that car" hid a second car when dropped. Rule now uses direct children
+    and coverage; a big outer box with little inside it is ambiguous → frame skipped.
+  * **WP3 `screen_fixed` fires on real cars** (fixed_persistent on a car held in frame; fixed_bg_moving on a car at the
+    edge), and an ego track can **drift onto another car** for a few frames (26BR_DIN PIP inset → car #32). So only
+    bottom-anchored ego boxes (per detection) and graphics inside overlay regions are safe background.
+  * **Ego/graphics-only frames are bad hard negatives:** 4 of 9 sampled onboard "hard negatives" showed a car ahead that
+    the teacher missed. Hard negatives now come only from VLM-verified not-car tracks (road cars, props).
+  * **VLM car check: 'no' is unreliable when the detector is confident.** On the 125 eye-labelled crops of
+    `work/verify_val`, all 8 tracks with score ≤ 0.3 and conf_median ≥ 0.6 were real cars (2 of 4 at 0.5–0.6); a
+    conf-0.92 car hidden behind a person was 'no' in QA. 'no' counts as background only below conf_median 0.50, above
+    it the track is unresolved (~1/3 of the 'no' tracks). Below 0.5 'no' is still wrong on ~4/16 real cars.
+  * The fallback rule before verification (identity or conf_median ≥ 0.40) labelled a tyre, crouching people and parked
+    road cars in 19SU / 25BR (≈ 6–8 wrong boxes in 50 frames): do not train on fallback exports.
+* **Final QA (54 random train frames, 73 boxes, verify rule):** boxes aligned on all; 1 frame with a clearly unlabelled
+  car (26BR_END f002630: dusty car, VLM 'no' at conf 0.32), ~3 frames with an unclear small dark object; 2 doubtful
+  boxes (one group box over two overlapping pit cars, one probable parked road car far away). Earlier verify-rule sample
+  also showed a car hidden behind the leaderboard tower (undetected) and a car far ahead in a teacher negative.
+  ids: 50 crops consistent with the visible number where readable, ~3 poor crops (dust / mostly background).
+* Grounded number boxes (19SU / 24SU, read-only check of `grounded.parquet` `kept`): tight on the digits, in stored-crop
+  pixels as the exporter assumes; ~94% of grounded crops keep a box; many boxes are only 10–15 px tall, so the digits
+  set needs a size filter at training time.
+* Throughput: pool 2–13 min per video with 3 workers (decode of the 1/s candidates at native size + pHash), ~30 min wall
+  for all 9; build ~1 min; disk 8.9 GB (datasets are hardlinks).
