@@ -1,7 +1,7 @@
 """WP5 (CPU): per-track identity labels, negative frames, QA batches and the WP2b/WP4/WP5 summary.
 
   python teacher/labels.py [id ...] [--force]        -> work/<id>/labels.parquet, negatives.parquet, labels.done
-  python teacher/labels.py qa [EV ...] [--n 150] [--floor 8] [--seed 0]   -> out/qa/<EV>_teacher.jsonl
+  python teacher/labels.py qa [EV ...] [--n 150] [--floor 6] [--seed 0]   -> out/qa/<EV>_teacher.jsonl
   python teacher/labels.py summary                   -> data/wp45_summary.csv, data/wp45_height.csv, agreement tables
 
 Per car track (every buggy track of crop_tracks.parquet; identity only for readable ones):
@@ -54,6 +54,7 @@ NEG_RATE = 0.10
 NEG_MIN = 200
 FPS = 4.0
 HBINS = [0, 80, 100, 130, 170, 230, 330, 2000]
+PROP_SHARE = 2 / 3
 
 
 def nn(x):
@@ -94,7 +95,7 @@ def assign_overlays(ct, O, shots):
     out = {}
     if O is None or not len(O):
         return out
-    sf = ct.screen_fixed.astype(bool).to_numpy() | ct.ego_residue.to_numpy(bool)
+    sf = ct.sf_effective.to_numpy(bool) | ct.ego_residue.to_numpy(bool)
     notcar = (ct.car_verified == "no").to_numpy()
     ok = ct[~sf & ~notcar]  # in_overlay is a soft flag (WP3): not excluded
     ok = ok[(ok.nested_in < 0) & (ok.h_px_max >= SIZE_PX) & (ok.edge_touch < EDGE_MAX)]
@@ -214,8 +215,24 @@ def process(row):
             if vd == "no" and g.h_px.max() < VERIFY_NO_MIN_H:
                 vd = "unsure"   # small crops: 'no' is unreliable (validation recall 40% below 60 px)
             vv[int(tid)] = (vd, sc, float(g.h_px.max()))
+    # WP8 recheck: 3 more crops for confident-detector 'no' tracks and for screen_fixed tracks flagged only by the
+    # background-moving rule; majority over all crops of the track (tie -> unsure)
+    V2 = pd.read_parquet(d / "verify2.parquet") if (d / "verify2.parquet").exists() else None
+    sf_vlm = set()
+    ct["rechecked"] = False
+    if V2 is not None and len(V2):
+        first = VF.groupby("track_id").score.apply(list).to_dict() if VF is not None else {}
+        for tid, g in V2.groupby("track_id"):
+            sc_all = (first.get(tid, []) if not bool(g.screen_fixed.iloc[0]) else []) + list(g.score)
+            vv[int(tid)] = (verify.majority(sc_all), round(float(np.mean(sc_all)), 3), float(g.h_px.max()))
+            if bool(g.screen_fixed.iloc[0]):
+                sf_vlm.add(int(tid))
+        ct["rechecked"] = ct.track_id.isin(set(V2.track_id))
+    ct["sf_vlm_decides"] = ct.track_id.isin(sf_vlm)
     ct["car_verified"] = [vv[t][0] if t in vv else ("no" if (s_ or e_) else None)
                           for t, s_, e_ in zip(ct.track_id, ct.screen_fixed.astype(bool), ct.ego_residue)]
+    # screen_fixed tracks whose verdict the VLM decides count as screen_fixed only if the VLM says no
+    ct["sf_effective"] = ct.screen_fixed.astype(bool) & ~(ct.sf_vlm_decides & ct.car_verified.eq("yes"))
     ct["verify_score"] = ct.track_id.map(lambda t: vv[t][1] if t in vv else None)
     C = pd.read_parquet(d / "crops.parquet")
     R = pd.read_parquet(d / "reads.parquet") if (d / "reads.parquet").exists() else pd.DataFrame(
@@ -242,7 +259,7 @@ def process(row):
         v = V.get(tid)
         ov = OV.get(tid)
         lab, src = final_label(v, ov) if r.readable or ov else (None, "none")
-        if r.ego_residue or r.screen_fixed:
+        if r.ego_residue or r.sf_effective:
             lab, src = None, "not_car_flag"
         nb, nbs = {}, {}
         if tid in Cg and lab is not None:
@@ -266,12 +283,13 @@ def process(row):
             label=lab, source=src, number_boxes=jdump(nb), number_boxes_src=jdump(nbs), n_boxes=sum(map(len, nb.values())),
             screen_fixed=bool(r.screen_fixed), in_overlay=bool(r.in_overlay), nested=bool(r.nested_in >= 0),
             ego_residue=bool(r.ego_residue), car_verified=r.car_verified, verify_score=r.verify_score,
+            rechecked=bool(r.rechecked), sf_vlm_decides=bool(r.sf_vlm_decides), sf_effective=bool(r.sf_effective),
             small=bool(r.small), long_static=bool(r.long_static), transition=bool(trans.get(int(r.shot_id), 0)),
             sharp_median=float(sharp.get(tid, np.nan)), ctx=r.ctx))
     L = pd.DataFrame(rows)
     # is_car (for dataset A): the yes/no check, overruled by a roster-number consensus (only Baja cars carry one;
     # the check misses cars occluded by marshals / partial views) and by screen_fixed / ego residue
-    flag = L.screen_fixed | L.ego_residue
+    flag = L.sf_effective | L.ego_residue
     L["is_car"] = np.where(flag, "no", np.where(L.vlm_consensus | L.source.eq("both-agree"), "yes",
                                                  L.car_verified.fillna("unchecked")))
     for c in ("vlm_top", "vlm_runner", "vlm_number", "label"):
@@ -309,7 +327,7 @@ def allocate(sizes, n, floor):
     return alloc
 
 
-def qa(events, n=150, floor=8, seed=0):
+def qa(events, n=150, floor=6, seed=0):
     vids = select_videos()
     out_dir = ROOT / "out" / "qa"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -350,16 +368,25 @@ def qa(events, n=150, floor=8, seed=0):
         if not items:
             print(f"{ev}: no labelled videos")
             continue
+        # strata = shot tag x (proposal / abstained); ~2/3 of the batch goes to tracks with a proposed number so
+        # the precision estimate has n ~ 100, the rest to abstained tracks (coverage / missed reads); weights undo it
         strata = defaultdict(list)
         for it in items:
-            strata[it["shot_tag"]].append(it)
-        alloc = allocate({k: len(s) for k, s in strata.items()}, n, floor)
+            strata[(it["shot_tag"], it["proposed_number"] is not None)].append(it)
+        n_prop_pop = sum(len(v) for k, v in strata.items() if k[1])
+        n_prop = min(n_prop_pop, int(round(n * PROP_SHARE)))
+        n_abst = n - n_prop
+        alloc = {}
+        for flag, nn_, fl in ((True, n_prop, floor), (False, n_abst, max(2, floor // 2))):
+            sub = {k: len(v) for k, v in strata.items() if k[1] == flag}
+            if sub and nn_ > 0:
+                alloc.update(allocate(sub, nn_, fl))
         rng = random.Random(seed)
         out = []
-        for k in sorted(strata):
+        for k in sorted(alloc, key=str):
             pick = rng.sample(strata[k], alloc[k])
             for it in pick:
-                it["stratum"] = k
+                it["stratum"] = f"{k[0]}|{'read' if k[1] else 'noread'}"
                 it["weight"] = round(len(strata[k]) / alloc[k], 4)
             out += pick
         rng.shuffle(out)
@@ -368,8 +395,8 @@ def qa(events, n=150, floor=8, seed=0):
             for it in out:
                 f.write(json.dumps(it, ensure_ascii=False) + "\n")
         nr = sum(it["proposed_number"] is None for it in out)
-        print(f"{ev}: {len(out)} items ({nr} abstained) from {len(items)} tracks -> {dst.relative_to(ROOT)}; "
-              f"strata {dict((k, (len(strata[k]), alloc[k])) for k in sorted(strata))}")
+        print(f"{ev}: {len(out)} items ({nr} abstained) from {len(items)} tracks ({n_prop_pop} with a proposal) -> "
+              f"{dst.relative_to(ROOT)}; strata {dict((f'{k[0]}|{int(k[1])}', (len(strata[k]), alloc[k])) for k in sorted(alloc, key=str))}")
 
 
 # ---------------------------------------------------------------- summary
@@ -455,7 +482,7 @@ def summary():
 def main(argv):
     if argv and argv[0] == "qa":
         a = list(argv[1:])
-        opt = {"--n": 150, "--floor": 8, "--seed": 0}
+        opt = {"--n": 150, "--floor": 6, "--seed": 0}
         for k in list(opt):
             if k in a:
                 i = a.index(k)

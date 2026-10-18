@@ -755,3 +755,124 @@ re-pools that video by itself; `pool.lock` prevents two runs at once). Outputs a
   set needs a size filter at training time.
 * Throughput: pool 2–13 min per video with 3 workers (decode of the 1/s candidates at native size + pHash), ~30 min wall
   for all 9; build ~1 min; disk 8.9 GB (datasets are hardlinks).
+
+## Session 2: teacher labels (WP2b/WP4/WP5)
+
+Code: `teacher/overlay_ids.py` (WP2b), `teacher/crops.py` (WP4 CPU), `teacher/read.py` (WP4 GPU: `plain`, `ground`),
+`teacher/verify.py` (per-track "is it a Baja car" check, added on the manager's request), `teacher/labels.py` (WP5:
+labels, negatives, `qa` batches, `summary`), shared helpers `teacher/idlib.py`. Outputs per video in `work/<id>/`:
+`overlay_ids.parquet` / `overlay_reads.parquet`, `crops/` + `crops.parquet` + `crop_tracks.parquet` + `ctx/`,
+`reads.parquet`, `grounded.parquet`, `vcrops*/` + `verify.parquet` + `verify2.parquet`, `labels.parquet`,
+`negatives.parquet`, `gpu_time.json`. Tables: `data/wp45_summary.csv`, `wp45_height.csv`, `wp45_agreement.csv`.
+QA batches: `out/qa/<EV>_teacher.jsonl`.
+
+### WP2b: identities from broadcast overlays
+
+* Identity overlays exist only in DIN (lower third "#35 Carpoeira Baja", 25BR "16 - FORJA BAJA" + school line) and SPP
+  (heat box "1 - BAJA DE GALPÃO 0 / 9 - PATO BAJA 1"). END streams have none (towers, tickers; 19SU's "lower_third"
+  region is a sponsor-logo slot; 26BR_END's "CARRO 7 | CARRO 9" labels the onboard view). Rule: kind `lower_third` in
+  `overlays.csv` of DIN (one number) / SPP (two numbers) videos.
+* Method: region crop at 1 fps during its visible intervals (± 4 s), segments of unchanged content by a 32×8 dHash
+  (new segment when > 18% of the bits change), one VLM transcription per segment of ≥ 2 samples ("transcribe all of its
+  text"), parse `#N team` / `N - TEAM`, accept only if N is in the roster **and** the team text matches that entry
+  (difflib / token containment ≥ 0.6), merge same-number segments ≤ 20 s apart. 1,787 reads, 8 GPU-min for 4 videos.
+* Gotchas: Qwen often writes "#7\nImperador" on two lines (the parser now joins a bare number with the next line; before
+  that 25SU_DIN had 44/187 accepted reads, after 182/187). Heats must have both numbers accepted. A 6 s merge gap split
+  the heat boxes into many 3 s rows; 20 s fixed it.
+* Validation: sheets `out/overlay_ids_<id>.jpg` (16 random ids per video) all correct by eye. The rejected reads are
+  "none", "COMITÊ TÉCNICO", 26BR_DIN's onboard telemetry ("12.6V / 25Mbps") and logo fragments. Change-detection check
+  (`overlay_ids.py check`): the first and last sample of 30 random segments read like the middle one in 180/180.
+  Result: 228 identity intervals (26BR_DIN 124, 25BR_DIN 38, 25SU_DIN 35, 24SU_SPP 31).
+* **Assigning an overlay to a track is the weak step.** In DIN shots the next cars wait in the queue at the side of the
+  picture while the lower third names the car on the course. Two VLM-overlay conflicts with VLM share 1.0 were exactly
+  this (#49 / #29 in the queue, box glued to the right edge). Rules now: candidate tracks not screen_fixed / ego /
+  verified not-car / nested, h ≥ 60 px, ≥ 1 s inside the interval, edge_touch < 0.8; per shot at most n_numbers
+  candidates on screen at once; a track overlapped by several rows takes the largest overlap and is 'ambiguous' if
+  another number overlaps it ≥ 30% as long. Excluding verified not-car tracks (the road car towed in TRAÇÃO) unblocked
+  several single-car windows. Only 22–72 tracks per DIN video get an overlay identity: few, but independent of mud.
+
+### WP4: crops and reads
+
+* Frame mapping: seeking `detect.frame_pipe` to `frame_idx / 4` reproduces the continuous fps=4 decode bit for bit (any
+  multiple of 0.25 s, not only part boundaries). Boxes redrawn on an independent accurate-seek decode coincide
+  (`out/crops_verify_24SU_SPP.jpg`). So crops decode only the needed spans (5–9 min per video, CPU).
+* Readable tracks: buggy, not screen_fixed, not nested, not ego residue, not in a transition shot, ≥ 3 boxes ≥ 60 px.
+  `in_overlay` is soft (WP3), not excluded. K = 8 per track (pick_crops logic: area ≥ 0.4 × max, 8 time chunks, best
+  rank(sharpness) + rank(area) of 3 decoded candidates per chunk), 5% padding, JPEG q92 ≤ 640 px: 179k crops at 60 px.
+* **Overlay masking:** crops contained ticker / tower / heat-box text with numbers ("18° Gralha Azul" in 19SU's
+  ticker), so visible compact overlay regions (not bracket / inset boxes) are painted gray inside the crop. Crops more
+  than 50% masked are dropped (25BR_END 2,263 and 26BR_END 841 candidates under the tower).
+* **Read rate vs box height** (plain read; calibration sample of 140 tracks per video stratified by height, plus the
+  full run):
+
+| box h (px) | crops: roster number read | crops: = track consensus | tracks: consensus (share ≥ 0.5, ≥ 3 votes) |
+|---|---|---|---|
+| 60–80 | 13% | 6% | 6% (n=160) |
+| 80–100 | 20% | 10% | 12% (n=162) |
+| 100–130 | 30% | 18% | 17% |
+| 130–170 | 44% | 28% | 26% |
+| 170–230 | 53% | 36% | 37% |
+| 230–330 | 64% | 48% | 48% |
+| ≥ 330 | 74% | 61% | 66% |
+
+  Reading becomes useful at ~100 px, and the only overlay disagreement below 100 px was a VLM error on an 82 px car. So
+  the full run read only crops ≥ 100 px of tracks with ≥ 3 such crops (`read.py plain --hmin 100`). Reads of 60–100 px
+  tracks exist only from the calibration sample. Consensus coverage of readable tracks: 7.5% (19SU, wide fixed
+  camera) to 42% (25BR_DIN / 26BR_DIN).
+* Speed: plain read 0.08–0.12 s/crop at batch 6 (faster than WP0's 0.16 because the crops are small; slower while other
+  agents load the CPU). 115k crops = 3.0 GPU-h, calibration included. 10.3–10.8 GB VRAM in total at batch 6, no spill.
+* Grounded read: only on crops whose plain read equals the consensus, 2 per track, largest first, round-robin over
+  video × shot tag. 0.64 s/crop at batch 6 with an idle CPU, 1.1–1.8 s/crop while WP8 used the CPU (launch-bound, as
+  WP0 found). All 7,417 consensus tracks would need 22k crops ≈ 6–9 h, so it was capped (8,000 planned, cut to ≈ 5.5k
+  when CPU contention slowed it): 5,819 kept boxes on 2,607 tracks; 93–97% of grounded crops keep a box with the
+  consensus label; JSON valid 100%. Sample sheet `out/grounded_sample.jpg`: boxes on the digits, many tiny side plates.
+
+### Car verification (manager request; `teacher/verify.py`)
+
+* Prompt "Is this an off-road Baja SAE race buggy (a small single-seat off-road car with an exposed tubular roll cage)?
+  Answer yes or no."; score = P(yes) / (P(yes) + P(no)) from the first token's logits (bimodal). 0.055–0.115 s/crop.
+* Validation: 160 crops (stratified by height and long_static) labelled by eye: 102 cars, 23 not cars, 35 can't tell.
+  At 0.5: **precision 97.5% (78/80), recall 76%**. At ≥ 100 px recall is 54/58 with 0/3 FP; at 45–60 px 6/15; below
+  45 px 2/5. The two FPs: the Baja logo's buggy drawing (score 0.99!) and a 36 px blob. 'no' is unreliable for small
+  crops (labels.py turns a 'no' below 60 px into unsure) and, as WP8 found, for confidently detected cars: of 32 random
+  large 'no' crops, ~17 were real cars, almost all surrounded by marshals or partly visible (the true 'no's: crop
+  sprayer, police car, motorcycle, people, banners).
+* Run: the largest crop of each of 45.7k pool tracks (median box ≥ 30 px, not screen_fixed / ego), plus a 2nd crop for
+  unsure first scores. Then (WP8 request) 3 more crops with 15% padding for the 2,618 'no' tracks with
+  conf_median ≥ 0.5, with a majority over all crops: **663 flip to yes, 615 to unsure, 1,340 stay no**. The 44
+  screen_fixed tracks flagged only by the background-moving rule are decided by the VLM (13 yes, 30 no, 1 unsure).
+  Ego / recurring-graphic screen_fixed tracks stay no.
+* `is_car` in labels.parquet = no for screen_fixed (unless the VLM decides, as above) and for ego residue; yes when the
+  track has a roster-number consensus or an overlay agreement (only Baja cars carry numbers); otherwise the VLM verdict.
+* Ego residue (box > 0.8 H, bottom-anchored, ≥ 50% of a track's boxes, in a shot with a screen_fixed track): only 16
+  tracks (26BR_DIN 12, 26BR_END 3, 24SU_END 1). Most of WP3's missed ego boxes are not that tall (helmet-only views,
+  PIP insets).
+
+### WP5: labels, automatic precision, QA
+
+* **VLM consensus vs overlay identity (the automatic precision estimate): 94/97 = 96.9% (Wilson 95% 91–99%).** Lower
+  thirds 90/93 (25BR 19/21, 25SU 23/23, 26BR 48/49), SPP heats 4/4 (consensus within the announced pair). By height:
+  63/63 at ≥ 330 px, 15/17 at 230–330, 10/10 at 170–230, 0/1 at 80–100. The 3 conflicts: an 82 px car (VLM 12,
+  overlay 16), 25BR #47 vs #33, and 26BR #3 (share 0.62) vs #31, the last probably a partial read of "31". Caveat: the
+  overlay tracks are DIN / SPP close-ups and pits. END wide shots (consensus coverage 7–30%) are not covered by this
+  check; the QA batches are for that.
+* Session-1 rule kept: consensus = roster-snapped majority, share ≥ 0.5 of the crops read and ≥ 3 votes.
+* Negatives: frames with no car detection ≥ 0.10 within ±1 s, outside transitions, ≥ 10 s apart per shot, split evenly
+  over shot tags. Only 3,906 in total (19SU 81, 24SU_END 72): something car-like is detected in nearly every frame of
+  the fixed / race cameras. WP8 found missed cars in teacher negatives, so treat them as weak.
+* QA batches (`out/qa/<EV>_teacher.jsonl`, 150 items each): strata = shot tag × (proposal / abstained), 2/3 of the items
+  with a proposal (n ≈ 100 for the precision interval), floor 6 per tag (3 for abstained), with weights. Crops = the
+  exact files read, number boxes in crop pixels, context frame, per-crop reads. Overlay identity, final label and
+  source go in `meta.hidden`. Checked in `tools/qa/serve.py` (index, /api/batch without hidden fields, images 200,
+  unknown 404).
+* GPU time (2080 Ti): overlay ids 10 min, plain 3.0 h, verify 53 min, grounded ≈ 1.55 h → **≈ 5.6 GPU-h**.
+
+### Open problems for WP8 and later
+
+* Use `is_car` (not `car_verified`) for dataset A. 'no' + high detector confidence after the recheck is still roughly
+  half real cars occluded by people, so keep treating it as unresolved, not as background.
+* Number boxes exist for 2.6k of the 7.4k consensus tracks (cap). The rest needs ~4–6 more GPU-h of grounded reads,
+  best run with the CPU idle (0.64 s/crop vs 1.8).
+* Reads exist only for crops ≥ 100 px (plus the calibration sample at 60–100 px); `small` tracks have no identity.
+* Fragmented tracks of one car vote separately; merging by identity per shot (a WP3 open problem) would raise coverage.
+  Overlay identities are few (≈ 140 tracks). The 26BR originals (Takeout) will need a full re-run (track ids differ).

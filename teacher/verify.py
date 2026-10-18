@@ -17,6 +17,10 @@ flag ego_residue, never a car label, not verified.
 usage (repo root): python teacher/verify.py crops [id ...] [--workers 2] [--force]       (CPU)
                    python teacher/verify.py run [id ...] [--batch 6] [--second]          (GPU, PAUSE honoured)
                    (first pass: largest crop per track; --second: the 2nd crop of tracks with an unsure first score)
+                   python teacher/verify.py recrops [id ...] [--workers 2]  (CPU) + rerun [id ...]  (GPU):
+                     re-ask 3 more crops (15% padding, largest boxes >= 1 s apart) for 'no' tracks with detector
+                     conf_median >= 0.5 and for screen_fixed tracks flagged only by the background-moving rule;
+                     labels.py takes the majority over all crops of those tracks (tie -> unsure)
                    python teacher/verify.py valset [--n 160]       (validation crops + sheets for labelling by eye)
                    python teacher/verify.py valeval <labels.csv>   (precision / recall of the prompt vs eye labels)
 """
@@ -124,6 +128,122 @@ def crops_stage(row):
                 reused=int(V.reused.sum()) if len(V) else 0)
     (d / "vcrops.json").write_text(json.dumps(info))
     return json.dumps(info)
+
+
+# ---------------------------------------------------------------- recheck (WP8 request)
+
+RE_CONF = 0.5     # detector conf_median at or above which a VLM 'no' is re-asked
+RE_N = 3
+RE_PAD = 0.15
+
+
+def recheck_pool(d):
+    """Tracks re-asked on RE_N more crops: (a) first-pass verdict 'no' (mean score <= NO_T) while the detector is
+    confident (conf_median >= RE_CONF): WP8 found these are mostly real cars (occluded by marshals, partial views);
+    (b) screen_fixed tracks flagged only by the background-moving rule (not the ego / recurring-graphic rules)."""
+    tr = pd.read_parquet(d / "tracks.parquet")
+    car = tr[tr.cls == "buggy"].set_index("track_id")
+    V = pd.read_parquet(d / "verify.parquet")
+    m = V.groupby("track_id").score.mean()
+    a = [t for t, sc in m.items() if sc <= NO_T and car.conf_median.get(t, 0) >= RE_CONF]
+    sf = car[car.screen_fixed.astype(bool) & ~car.fixed_persistent.astype(bool) & ~car.fixed_recurrent.astype(bool)]
+    return sorted(set(a) | set(sf.index)), set(sf.index)
+
+
+def recheck_crops(row):
+    import cv2
+    import crops as CR
+    from detect import frame_pipe
+    vid = row["id"]
+    d = wdir(vid)
+    W, H = row["width"], row["height"]
+    ids, sfset = recheck_pool(d)
+    out_dir = d / "vcrops2"
+    out_dir.mkdir(exist_ok=True)
+    for f in out_dir.glob("*.jpg"):
+        f.unlink()
+    used = set(pd.read_parquet(d / "verify.parquet").path)
+    D = pd.read_parquet(d / "dets.parquet")
+    D = D[(D.cls == "buggy") & D.track_id.isin(ids)].copy()
+    D["h"] = D.y2 - D.y1
+    D["area"] = D.h * (D.x2 - D.x1)
+    picks = []
+    for tid, g in D.groupby("track_id"):
+        g = g[g.conf >= 0.25] if (g.conf >= 0.25).sum() >= RE_N else g
+        g = g[~g.apply(lambda r: f"t{int(tid)}_f{int(r.frame_idx)}.jpg" in " ".join(used), axis=1)] if len(g) > RE_N else g
+        got = []
+        for r in g.sort_values("area", ascending=False).itertuples():
+            if all(abs(r.pts - q.pts) >= 1.0 for q in got):
+                got.append(r)
+            if len(got) == RE_N:
+                break
+        picks += got
+    P = pd.DataFrame(picks).drop(columns=["Index"], errors="ignore")
+    regs = CR.mask_regions(d, W, H)
+    rows = []
+    if len(P):
+        by_frame = {f: g for f, g in P.groupby("frame_idx")}
+        for f0, f1 in CR.spans(sorted(by_frame)):
+            for kk, img in frame_pipe(ROOT / row["path"], CR.FPS, W, H, start=f0 / CR.FPS,
+                                      dur=(f1 - f0 + 1) / CR.FPS + 0.5):
+                f = f0 + kk
+                if f > f1:
+                    break
+                if f not in by_frame:
+                    continue
+                vis = CR.visible(regs, f / CR.FPS)
+                for r in by_frame[f].itertuples():
+                    w, h = r.x2 - r.x1, r.y2 - r.y1
+                    win = (int(max(0, r.x1 - RE_PAD * w)), int(max(0, r.y1 - RE_PAD * h)),
+                           int(min(W, r.x2 + RE_PAD * w)), int(min(H, r.y2 + RE_PAD * h)))
+                    c = img[win[1]:win[3], win[0]:win[2]].copy()
+                    if vis:
+                        CR.apply_mask(c, win, vis)
+                    sc = min(1.0, CR.MAX_SIDE / max(c.shape[:2]))
+                    if sc < 1:
+                        c = cv2.resize(c, (max(1, round(c.shape[1] * sc)), max(1, round(c.shape[0] * sc))),
+                                       interpolation=cv2.INTER_AREA)
+                    name = f"t{int(r.track_id)}_f{f}.jpg"
+                    cv2.imwrite(str(out_dir / name), c, [cv2.IMWRITE_JPEG_QUALITY, 92])
+                    rows.append(dict(track_id=int(r.track_id), frame_idx=f, h_px=float(h),
+                                     path=f"work/{vid}/vcrops2/{name}", screen_fixed=int(r.track_id) in sfset))
+    V2 = pd.DataFrame(rows)
+    V2.to_parquet(d / "vcrops2.parquet", index=False)
+    return json.dumps(dict(tracks=len(ids), sf_bg_only=len(sfset), crops=len(V2)))
+
+
+def recheck_run(rows, batch=6):
+    import idlib
+    for row in rows:
+        d = wdir(row["id"])
+        if not (d / "vcrops2.parquet").exists() or (d / "verify2.done").exists():
+            continue
+        V2 = pd.read_parquet(d / "vcrops2.parquet")
+        t0, out = time.time(), []
+        for bj in idlib.batched(V2.to_dict("records"), batch):
+            if idlib.paused():
+                print("PAUSE: stopping cleanly")
+                return 3
+            sc, mass = yes_no_scores([str(ROOT / r["path"]) for r in bj])
+            for r, s_, m_ in zip(bj, sc, mass):
+                out.append(dict(r, score=s_, mass=m_))
+        el = time.time() - t0
+        pd.DataFrame(out, columns=list(V2.columns) + ["score", "mass"]).to_parquet(d / "verify2.parquet", index=False)
+        (d / "verify2.done").write_text(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {len(out)} crops {el:.0f}s\n")
+        gpu = d / "gpu_time.json"
+        g = json.loads(gpu.read_text()) if gpu.exists() else {}
+        g["verify_s"] = g.get("verify_s", 0) + el
+        g["verify2_n"] = len(out)
+        gpu.write_text(json.dumps(g))
+        print(f"{row['id']}: rechecked {len(out)} crops in {el:.0f}s", flush=True)
+    return 0
+
+
+def majority(scores):
+    """WP8 recheck rule: majority of crops with score >= 0.5; a tie -> unsure."""
+    y = sum(1 for x in scores if x >= 0.5)
+    n = len(scores) - y
+    return "yes" if y > n else "no" if n > y else "unsure"
 
 
 # ---------------------------------------------------------------- VLM yes/no
@@ -303,6 +423,14 @@ def main(argv):
     if mode == "valeval":
         valeval(argv[0])
         return 0
+    if mode == "recrops":
+        os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
+        workers, force, ids, rest = cli_ids(argv)
+        run_stage("vcrops2", recheck_crops, select_videos(ids or None), workers=workers, force=force,
+                  requires=("verify",))
+        return 0
+    if mode == "rerun":
+        return recheck_run(select_videos([a for a in argv if not a.startswith("--")] or None))
     if mode == "crops":
         os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")  # "" does not hide the GPU on Windows
         workers, force, ids, rest = cli_ids(argv)
