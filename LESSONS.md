@@ -425,3 +425,171 @@ Code: `teacher/manifest.py`, `shots.py`, `shot_tags.py`, `overlay.py` (+ `shots_
   video; WP3's `track.py` already ignores regions > 6% of the frame.
 * Runtimes (CPU, 3–4 videos in parallel): manifest 10 s; shots 3–17 min per video (26 min wall for all 42 h);
   tags 1–9 min per video; overlays 2–16 min per video (two passes, ~1 h wall for all).
+
+## Session 2: detection + tracking on the streams (WP3)
+
+Code: `teacher/detect.py` (GPU), `teacher/track.py` (CPU), tools in `tools/wp3/` (`calib_sheets.py`, `track_slice.py`,
+`track_qa.py`, `qa_sample.py`, `frag_stats.py`, `summary.py`, `track_loop.sh`). Outputs per video in `work/<id>/`:
+`dets_raw.parquet` + `detect_settings.json` + `detect.done`; `dets.parquet`, `tracks.parquet`, `track_feats.npz`,
+`track_summary.json`, `track.done`; QA sheets in `work/<id>/qa/track_*.jpg`. Calibration data + sheets: `work/calib/`.
+
+### Calibration (3 slices of 20 min = 4,800 frames each, judged by eye on contact sheets)
+
+Slices: 26BR_END 2:00–2:20 (onboard, split screen, PIP, leaderboard), 25SU_DIN 1:00–1:20 (pits, bracket graphics,
+lower thirds), 19SU_END 1:00–1:20 (fixed start-line camera). Counts are car ("off-road buggy") detections ≥ 0.25.
+
+| slice | A dets | B dets (+ absorbing classes) | A-only (lost in B): sample by eye | B-only |
+|---|---|---|---|---|
+| 26BR_END | 3,812 | 4,065 (+car 443, tractor 63, moto 36, pickup 35) | 43: ~25 real buggies relabelled car/pickup/tractor, ~18 FP | 70: mostly onboard ego car + FPs |
+| 25SU_DIN | 5,935 | 5,920 (+car 1,577, tractor 114, moto 90, ATV 25, pickup 9) | 126; 60 seen: ~11 real buggies, ~49 FP (white road sedan, crop sprayer, people) | 57 |
+| 19SU_END | 10,373 | 10,356 (+car 377, pickup 255, moto 50, tractor 12) | 341; 60 seen: ~4 real buggies, ~40 parked pickup, ~15 static tyre | 51 |
+
+* **Prompt set B (A + "pickup truck", "car", "ATV", "tractor", "motorcycle") is not a pure absorber.** It removes real
+  FPs (road sedan, crop sprayer, parked pickup: ~1–3% of car detections) but also relabels real buggies as "car" /
+  "pickup" / "tractor" (visible loss in all 3 slices, worst on 26BR: ~25 of 43) and adds detections of its own (the ego
+  car). Changing the prompt list changes the buggy scores too (YOLO-World text embeddings interact via the per-anchor
+  argmax). Decision rule "any visible recall loss → keep A": **A = ["off-road buggy", "person"]**.
+* Precision of A (100 random car detections ≥ 0.25 per slice): 26BR ~74 real other cars + ~15 onboard ego car + ~11 FP;
+  25SU ~83 real, 17 FP (9 road sedan / crop sprayer, 3 bracket-graphic boxes, 5 other); 19SU ~71 real, ~29 FP (a big
+  tyre lying in the field ~13, a parked pickup ~8, a dark vehicle under a tent ~5, people ~3). Static props and parked
+  road vehicles under a fixed camera are the main FP source; `long_static` marks them (see below), WP5 / VLM must reject.
+* Missed cars (40 random frames per slice, half of them where A and B disagree): cars surrounded by marshals during
+  a recovery (25SU #4 stuck: not detected ≥ 0.25 in 4 of 5 frames even when large and clear), cars behind fences /
+  people in the pits, cars ahead in onboard views at the top of the frame. Far small cars are found well at 1280.
+* **imgsz 960 vs 1280 (19SU, prompt A):** 1280 gives 10,373 car dets vs 9,017; boxes < 60 px 3,931 vs 2,746, < 40 px
+  467 vs 192. 1280-only (1,377): of 60 seen ~22 real (mostly far/small cars), ~35 the static tyre; 960-only (490): of
+  60 seen ~40 real. Net ≈ +500 vs +330 real detections → **keep 1280** (960 is not equal on far cars).
+* Throughput as WP0 measured: 35.2–35.8 img/s at 1280 (8.8–8.9× real time at 4 fps), 55.5 img/s at 960.
+
+### Detection run (`teacher/detect.py`)
+
+* Settings: YOLO-World v2-x fp16, prompts A, imgsz 1280, batch 8, 4 fps (ffmpeg CPU `fps=4` bgr24 pipe), conf ≥ 0.05,
+  NMS IoU 0.7, max_det 300. `frame_idx` = frame of the 4 fps stream, `pts = frame_idx / 4`.
+* Parts of 600 s of video (`dets_raw_parts/part_NNNNN.parquet`), atomic rename; restart resumes after the last
+  contiguous part (tested by killing the process mid-video: the resumed part starts at the exact next frame). `PAUSE`
+  at the repo root → finishes the current part, exit code 3 (tested). Run order = order of ids on the command line.
+  Gotcha: `.venv/Scripts/python.exe` is a launcher that spawns the real interpreter; killing the launcher (e.g.
+  `timeout`) leaves the child running. Kill both PIDs (or use PAUSE).
+* The ultralytics `half` deprecation warning is printed on every predict call; silence via `ultralytics.utils.LOGGER`.
+
+### Tracking (`teacher/track.py`)
+
+* ByteTrack-style two-stage Hungarian matcher per shot and class (car, person; never across a shot boundary):
+  stage 1 vs dets ≥ 0.25 with similarity max(IoU(predicted, det), 0.6 × centre-distance score), the distance score
+  gated at 1.2 × box size and a height ratio ≤ 1.8 (cars move a lot between 4 fps frames in close-ups); stage 2 vs dets
+  0.08–0.25 with IoU ≥ 0.3; new tracks from dets ≥ 0.25; track buffer 12 frames (3 s); constant-velocity prediction.
+  Tracks with ≥ 3 detections are kept (`track_id` -1 otherwise).
+* Fragmentation proxy (`frag_stats.py`: a track that starts ≤ 3 s after another ended, near its end box): with an 8-frame
+  buffer and low threshold 0.10: 11% / 14% / 11% of car tracks (26BR / 25SU / 19SU slices); with 12 frames and 0.08:
+  **8% / 12% / 5%**. The rest are mostly fast PTZ pans (the whole picture jumps) and crowded parked groups where boxes
+  split / merge. Camera-motion compensation would be the next step; WP5 can also merge per identity.
+* `nested_in`: id of a larger coexisting car track containing this one (session-1 double-box rule). 25SU_DIN has many
+  (parked groups produce boxes on groups of cars).
+* Per track: shot, t0/t1, n, conf stats, box size in px and / H, median box, centre MAD, speed, path, size ratio,
+  edge contact, `bg_motion` / `inbox_change` (median mean |ΔI| outside / inside the box between frames 0.5 s apart,
+  from a second CPU decode at 2 fps 192×108 gray), `pos_persist` (share of 4 fps frames with a car detection at the same
+  place), recurrence counts, flags.
+
+### Flags: what worked and what did not
+
+* **`screen_fixed`** = OR of three rules:
+  1. `fixed_persistent` (onboard ego car): bottom-anchored box (y2 ≥ 0.97 H), scene moving (inbox or bg ≥ 8), at the
+     same place in ≥ 20% of the frames of the shot or of ±10 s around it, shot ≥ 10 s, **and** the same place (median
+     IoU ≥ 0.85) with the same look (12×12 patch NCC ≥ 0.3) in ≥ 2 other shots. Then propagated to fragments of the same shot (IoU ≥ 0.6 with a flagged ego box) and to
+     big bottom-anchored boxes elsewhere at a well-established ego place (IoU ≥ 0.7 with ego boxes of ≥ 5 shots).
+  2. `fixed_bg_moving` (graphic over moving video): static box (centre MAD ≤ 1.2% H, height MAD ≤ 4%) with bg_motion ≥
+     10 and ≥ 1.6× inbox_change, seen at the same place in ≥ 2 shots or for ≥ 10 s.
+  3. `fixed_recurrent`: same static place + look (12×12 patch NCC ≥ 0.6, rest of frame NCC < 0.5) in ≥ 4 shots, counting
+     only instances whose surroundings move.
+* Things that failed on the way (kept here so nobody retries them):
+  * The onboard ego car is **not** pixel-stable: per-pixel temporal stability inside its box (share of pixels with
+    median |ΔI| < 2.5 over 0.5 s) was 0.05 on ego tracks, same as on normal cars (vibration, helmet moves, the box
+    covers the view through the cage). Its box is also not very stable (centre MAD 1–3% H) and it is detected only
+    intermittently at conf 0.15–0.35, so the tracker fragments it into many short tracks. What identifies it is
+    geometry: a big bottom-anchored box at the same place shot after shot (26BR: x 290–905 single onboard, 650–1280 right
+    half of the split screen, plus helmet-only variants y1 ≈ 330).
+  * Persistence alone flagged zoomed PTZ close-ups of real cars (25SU_DIN: pits, crop sprayer; 27 tracks, 12/12 sampled
+    were real cars) because they also hold a big bottom-anchored box. Requiring the same place within IoU 0.85 in ≥ 3 shots
+    (the mount is rigid) fixed it there: 25SU_DIN 27 → 1, 26BR_END 219 → 215. **But** on the full run 25BR_END's
+    handheld pit walk (phone-style close-ups of parked cars, all frame-filling and bottom-anchored) still produced a seed,
+    and same-shot propagation then flagged 28 real close-ups (8/8 sampled were real cars with big readable numbers, the
+    best number data there is). Fix: the seed must also *look* the same in the other shots (patch NCC ≥ 0.3 in ≥ 2 other
+    shots; ego pairs median 0.47 on 26BR_END, the close-ups 0.07). Final: 25BR_END 0, 25SU_DIN 0, 26BR_END 211,
+    26BR_DIN 207 (PIP onboard insets, 12/12 sampled correct).
+  * Background-motion threshold 4 flagged parked cars under the 19SU fixed camera (people walking give bg 4–8). Static
+    cameras sit at 1–8, pans / onboard at 12–35 → 10.
+  * A PTZ operator following a small far car keeps it still on screen for 1–3 s with the background moving → rule 2 needs
+    a repeat (≥ 2 shots) or ≥ 10 s.
+  * Recurrence with a "different surroundings" test fails under a fixed camera: people walking or a large overlay elsewhere
+    make the same view look different. Only moving-background instances count now. Consequence: a **graphic over a still
+    picture** (e.g. the corner Baja logo over SPP's static wide shot) is caught only when the camera moves; the rest must
+    come from `in_overlay`.
+* **`in_overlay`**: share of the track's detections with ≥ 60% of the box inside a WP2 overlay region visible at that
+  time (intervals ± 2.5 s). Only compact regions count (≤ 6% of the frame; kinds `bracket_or_fullscreen_graphic`,
+  `inset_or_logo_box` skipped): WP2 boxes are unions of positions, and a bracket / PIP box is mostly live video with real
+  cars in it. With 20% allowed, ~11/12 sampled in_overlay tracks on 24SU_SPP were real cars. Even at 6%, about half of the
+  sampled ones are real cars, because the visibility intervals of the small bracket boxes are too generous; the corner
+  logo hits are right. Treat it as a soft flag until WP2's per-region intervals are tighter. Null when the video had no
+  overlays at tracking time; `python teacher/track.py <id> --reflag` recomputes all flags from the stored features in ~1 min
+  (track.py does this by itself when it finds overlay.done for a video tracked without overlays).
+* **`small`**: median box height < 60 px. **`long_static`** (info): static box for ≥ 20 s (parked cars in the pits,
+  parked road vehicles, a tyre, under a fixed camera): not screen_fixed, but a likely FP / no-number source.
+
+### QA by eye (work/<id>/qa/track_*.jpg, one frame per sampled track)
+
+* 26BR_END `track_ego.jpg`: 12/12 flagged ego are the onboard ego car (single view, split screen, PIP); the cars seen from
+  onboard in the same frames stay unflagged. `track_onboard.jpg`: 12/12 unflagged tracks in shots with an ego track are
+  real cars (incl. cars ahead seen from onboard). `track_bigbottom*.jpg` (unflagged big bottom-anchored boxes):
+  before the ego propagation 7/12 were missed ego; after it ~2–3/12 (the dirty-helmet onboard of the other car, small
+  PIP insets), rest real close-ups. `track_towerzone.jpg`: tracks under the leaderboard tower area are real cars; the
+  tower itself rarely produces car boxes.
+* 25SU_DIN `track_static.jpg`: parked pit cars in static PTZ shots are `long_static` and **not** `screen_fixed`.
+  `track_ego.jpg` shows the (now fixed) close-up false positives.
+* 19SU_END `track_static.jpg`: stopped / parked cars and props near the tent, unflagged. `track_bgfix.jpg`: 5 low-conf
+  junk boxes.
+* 26BR_DIN `track_bgfix.jpg`: the "BAJA" logo with the buggy drawing (top centre, during the DIN tests) is flagged by
+  rules 2+3 and in_overlay: 12/12 sampled bg-moving tracks are that logo. `track_ego.jpg`: 12/12 onboard PIP insets.
+* 24SU_END `track_recur.jpg`: the corner logo (top left) is what `fixed_recurrent` catches.
+* 25BR_END `track_bigbottom_final.jpg`: frame-filling real close-ups, unflagged (also a TV commercial with a road car
+  and a full-screen track map, i.e. FPs WP5 must reject).
+* 24SU_SPP `track_overlay.jpg`: see in_overlay above; the corner logo [106,10,170,71] gives ~18 car tracks, 4 flagged by
+  rule 2 (camera moving), the others only via in_overlay.
+
+### Full run (all 9 active videos, 42.4 h; detect 00:22 → 05:13 = 4.85 h, 35.0–35.3 img/s; tracking ran alongside on CPU)
+
+| video | h | dets (all ≥ 0.05) | car dets ≥ 0.25 | car tracks | tracks / h | person tracks | screen_fixed | in_overlay | small | long_static | detect min | track min |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 19SU_END | 4.68 | 1,994,355 | 171,861 | 6,193 | 1,324 | 13,335 | 0.1% | 0.1% | 52.6% | 5.6% | 31.9 | 10.7 |
+| 24SU_END | 4.58 | 1,279,943 | 150,085 | 8,320 | 1,816 | 20,498 | 0.9% | 1.0% | 35.6% | 1.0% | 31.6 | 10.9 |
+| 24SU_SPP | 1.45 | 525,042 | 21,453 | 1,134 | 784 | 8,479 | 0.4% | 1.7% | 35.3% | 2.5% | 10.1 | 3.5 |
+| 25BR_DIN | 7.05 | 1,021,788 | 50,574 | 2,811 | 399 | 14,018 | 0.0% | 0.0% | 40.0% | 1.8% | 48.0 | 10.7 |
+| 25BR_END | 7.11 | 1,609,091 | 142,482 | 9,997 | 1,407 | 32,010 | 0.0% | 0.0% | 41.5% | 0.2% | 49.2 | 16.4 |
+| 25SU_DIN | 3.30 | 890,722 | 72,976 | 3,817 | 1,157 | 14,769 | 0.0% | 0.0% | 11.9% | 0.6% | 22.4 | 7.2 |
+| 25SU_END | 4.27 | 1,110,493 | 65,099 | 4,516 | 1,057 | 30,712 | 0.0% | 0.0% | 8.2% | 0.3% | 29.4 | 9.2 |
+| 26BR_DIN | 5.68 | 1,434,343 | 132,035 | 5,988 | 1,054 | 24,651 | 9.5% | 6.7% | 23.1% | 2.3% | 38.5 | 9.9 |
+| 26BR_END | 4.29 | 1,155,569 | 90,451 | 7,387 | 1,724 | 27,417 | 2.9% | 0.0% | 31.5% | 0.2% | 28.9 | 8.5 |
+| **total** | **42.4** | **11.0 M** | **897 k** | **50,163** | **1,183** | **185,889** | | | | | **290** | **87** |
+
+Shares are of car tracks. Track minutes = first full tracking pass (tracking + 2 fps feature decode, run while the GPU
+job and WP2 used the CPU); `--reflag` afterwards takes ~1 min per video. Disk: dets_raw + dets ≈ 0.2 GB in total.
+About 19,900 car tracks are unflagged (screen_fixed, in_overlay) with a median box ≥ 100 px (the WP4 crop pool; K = 6–8 crops each ≈ 120–160 k
+crops ≈ 5.5–7 GPU-h of plain reads at WP0's 22 k crops/h, less if the pool is filtered by conf / size / shot tag).
+
+### Open problems for WP4 / WP5
+
+* FPs that no flag removes: road vehicles (sedan, pickup, crop sprayer, a TV commercial), a big tyre and other props under
+  a fixed camera (19SU), people in tight groups, full-screen maps. `long_static` covers part of it; the VLM read ('none'
+  / not a car) and a per-track "is this a baja car" check in WP5 must do the rest. Prompt set B would cut ~1–3% of FPs but
+  costs recall; a cheap alternative is to run the absorbing prompts only on crops of existing tracks.
+* Recall gaps: cars in recovery scenes surrounded by marshals, behind fences in the pits, small cars ahead in onboard
+  views. Store-to-0.05 means WP5 can still use low-conf detections to fill gaps inside tracks.
+* `small` is 8–53% of car tracks (19SU far cars): detector data only.
+* Fragmentation 5–12% of tracks restart near where another ended (fast pans, crowded groups); identity consensus per
+  shot can merge them. `nested_in` marks double boxes (many in pit scenes: boxes on groups of cars).
+* `in_overlay` depends on WP2's region intervals; treat it as soft. Graphics over a still picture are only caught by
+  in_overlay (screen_fixed rules need a moving background or recurrence).
+* Onboard ego recall ~75–80% on 26BR_END by eye (the other car's dirty-helmet onboard and small PIP insets are missed).
+  Ego boxes are bottom-anchored and huge, so a WP4 filter "h_rel > 0.8 and bottom-anchored in a shot with a flagged
+  ego track" would catch most of the rest.
+* Rerun cost if 26BR originals (Takeout) arrive: detect ≈ 7 min per stream-hour at 720p, more at 1080p (decode + resize
+  is still cheap; YOLO runs at imgsz 1280 either way).
