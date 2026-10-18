@@ -1012,3 +1012,21 @@ roster posterior (24SU / 25SU rosters have only 16 cars, 26SE has 24):
 * Boxes >= 24 px tall read at 58-90%; 16-24 px at ~50%. Below 16 px reading is not reliable.
 * Thresholds: crop / track posteriors are calibrated per mode. Pick tau (panel mode: score; window mode: margin) on val
   again once the detector exists. Never on 26SE.
+
+## Session 2: QA review of the teacher labels, 24SU (user, blind, 150 tracks, 19.5 min)
+
+* **Precision of the proposed number: 96.8% [91–99%] (stratum-weighted 97.2%). Wide END shots: 97.6% (n=41).** This agrees
+  with the automatic VLM-vs-overlay check (96.9%, close-ups only), so the teacher's identity labels are ~97% precise on
+  stream footage, wide shots included.
+* Coverage 73%. Of the tracks where the teacher abstained, the reviewer could read 40% [26–56%], so the VLM vote is
+  conservative.
+* Not a car / bad box: 13.3%, concentrated in studio (44%: cars on TV screens) and pits (33%: two cars in one box).
+  Track shots: 10–12%.
+* Number boxes flagged wrong: 13.3% of the items that have boxes.
+* By box height: 100–130 px gives only 1/3 correct (n=3, weak evidence); ≥130 px is ~100%. Reads near the 100 px floor
+  are borderline.
+* Effect: `export.py build --only cars` dropped 14 test frames (8,167 → 8,153). Train and val are unchanged.
+* **Number variety (user's concern, confirmed):** digits/ids cover only 51/53 distinct numbers out of the 89 used across 60
+  events (1–99). Every val/test number also occurs in train, so the WP10 test scores do not measure unseen numbers. WP10's
+  24SU errors were style-driven (outlined, stylised and stencil digits). The existing data cannot fix this: the ids set has
+  only 2 numbers more than digits. The fix is a pretrained scene-text recognizer, digit splicing (WP10b) and more events.
