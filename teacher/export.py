@@ -17,8 +17,9 @@ usage (repo root, CPU only; CUDA_VISIBLE_DEVICES is forced empty):
   python teacher/export.py all [--workers 3] [...]           (pool + build + qa)
 
 Track status (car tracks of tracks.parquet; labels.parquet from WP5 when present):
-  bg    screen_fixed or ego residue (onboard ego car, graphics), or car_verified == 'no': never labelled, does not block
-        the frame (the box stays in the picture as background).
+  bg    ego residue, screen_fixed with a bottom-anchored median box (onboard ego car) or inside an overlay region
+        (graphic), or car_verified == 'no': never labelled, does not block the frame (stays in the picture as
+        background). Other screen_fixed tracks are unres: WP3's rule also fires on real cars held still in frame.
   car   car_verified == 'yes' and not in_overlay (in_overlay & yes -> unres: the corner logo has a buggy drawing).
   unres car_verified == 'unsure', or not checked, or anything else -> a frame where such a box (conf >= 0.25) is
         visible is not exported.
@@ -38,7 +39,8 @@ Dataset A (cars), per 4 fps frame:
   poison guard  every buggy detection with conf >= 0.25 must be a 'car' or 'bg' track, or be covered by a label box
                 (IoU >= 0.5 or >= 80% of it inside one: duplicate / partial box of a labelled car). Otherwise the frame
                 is skipped. Frames of transition shots and within EDGE_S of a shot boundary are skipped.
-  kinds         pos (>= 1 label box), hardneg (no label box, >= 1 'bg' box >= 0.25: road cars, tyre, ego car, logo),
+  kinds         pos (>= 1 label box), hardneg (no label box, >= 1 VLM-verified not-car box >= 0.25: road cars, props;
+                not the ego car / graphics: those frames often hold cars ahead that the teacher missed),
                 neg (work/<id>/negatives.parquet: no car detection >= 0.10 within +-1 s).
   sampling      <= 1 frame per second per shot for pos (the frame with the most confident labels in each 1 s bin),
                 <= 1 per HARDNEG_S for hardneg, then perceptual-hash dedupe per video (64-bit DCT pHash; a frame is a
@@ -66,7 +68,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import DATA, ROOT, select_videos, wdir  # noqa: E402
 from detect import frame_pipe  # noqa: E402  (the exact decode detect.py used; frame k of the pipe = frame_idx k)
 
-POOL_VERSION = 4        # bump when the pool rules change: every video is redone on the next `pool`
+POOL_VERSION = 5        # bump when the pool rules change: every video is redone on the next `pool`
 DS = ROOT / "datasets"
 POOL = DS / "_pool"
 STATE = DS / "_state"
@@ -92,10 +94,12 @@ SPAN_GAP = 24           # frames: decode spans merged when closer (as crops.py)
 JPEG_Q = 90
 FB_CONF, FB_CONF_STATIC, TINY_CONF = 0.40, 0.50, 0.50
 EGO_H = 0.8
+EGO_Y2 = 0.95           # screen_fixed tracks whose median box bottom is this low are the onboard ego car
 NUM_MIN_CAR_H = 60      # numbers_full: other labelled cars at least this tall must have number boxes too
 DIGIT_PAD = 0.10
 ID_SOURCES = ("both-agree", "vlm", "overlay", "heat-vlm-weak")
 DEFAULT_VAL = ("25SU",)
+TAG_CAP_EXEMPT = {"track_wide"}   # the target domain (fixed trackside camera) is never cut by the tag cap
 HBINS = [0, 0.02, 0.05, 0.1, 0.2, 0.4, 0.7, 1.01]
 
 
@@ -145,8 +149,17 @@ def track_status(d, row):
         v = cv.iloc[i] if cv is not None else None
         v = None if v is None or (isinstance(v, float) and v != v) or v is pd.NA else v
         has_lab = not pd.isna(lab.iloc[i])
-        if bool(r.screen_fixed) or tid in ego:
-            st, why = "bg", "screen_fixed" if bool(r.screen_fixed) else "ego_residue"
+        if tid in ego:
+            st, why = "bg", "ego_residue"
+        elif bool(r.screen_fixed):
+            # WP3's screen_fixed has false positives on real cars (a car held in frame by the PTZ / onboard). Only the
+            # ego car (bottom-anchored) and graphics (inside an overlay region) are safe background; others block.
+            if r.y2_med >= EGO_Y2 * row["height"]:
+                st, why = "bg", "screen_fixed_ego"
+            elif io[i]:
+                st, why = "bg", "screen_fixed_overlay"
+            else:
+                st, why = "unres", "screen_fixed_other"
         elif v == "no":
             st, why = "bg", "verified_no"
         elif v == "yes":
@@ -273,6 +286,9 @@ def frame_table(d, row, S):
     D = D[D.cls == "buggy"].drop(columns="cls")
     shots = pd.read_csv(d / "shots.csv")
     st = S.set_index("track_id").status.to_dict()
+    vno = set(S.track_id[S.why == "verified_no"])
+    egot = set(S.track_id[S.why.isin(["screen_fixed_ego", "ego_residue"])])
+    ego_y2 = EGO_Y2 * row["height"]
     lab, holes = label_boxes(D, S)
     gst = D.track_id.map(lambda t: st.get(int(t), "none") if t >= 0 else "none").to_numpy()
     G = D.assign(st=gst)
@@ -315,8 +331,12 @@ def frame_table(d, row, S):
             for r in g.itertuples():
                 if r.st == "car":
                     continue
-                if r.st in ("bg", "low"):
-                    n_bg += 1
+                if r.st == "bg" and r.track_id in egot and r.y2 < ego_y2:
+                    pass   # an ego track whose box left the bottom edge here: the tracker drifted onto another car
+                elif r.st in ("bg", "low"):
+                    # only a VLM-verified not-car makes a hard negative (flag-based bg frames, e.g. onboard views,
+                    # often contain cars ahead that the teacher missed)
+                    n_bg += int(r.track_id in vno and r.conf >= GUARD_CONF)
                     continue
                 db = (r.x1, r.y1, r.x2, r.y2)
                 covered = False
@@ -511,7 +531,7 @@ def pool_video(row, allow_unlabelled=False):
             r = P.iloc[i]
             grp = "pos" if r.kind == "pos" else "neg"
             is_dup = False
-            if r.src != "numbers" and kept_idx[grp]:
+            if f not in NB and kept_idx[grp]:   # frames with number boxes are never dropped as duplicates
                 ki = np.array(kept_idx[grp])
                 dist = popcount64(hv[ki] ^ h)
                 for j in ki[dist <= PHASH_T]:
@@ -576,7 +596,23 @@ def _pool_one(row, allow_unlabelled):
 
 
 def pool(ids=None, workers=3, force=False, allow_unlabelled=False):
+    """One pool run at a time (datasets/_state/pool.lock holds the PID; a stale lock from a killed run must be deleted
+    by hand)."""
     STATE.mkdir(parents=True, exist_ok=True)
+    lock = STATE / "pool.lock"
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        raise SystemExit(f"another pool run holds {lock} ({lock.read_text().strip()}); delete it if that run is dead")
+    os.write(fd, f"pid {os.getpid()} {time.strftime('%Y-%m-%d %H:%M:%S')}".encode())
+    os.close(fd)
+    try:
+        _pool(ids, workers, force, allow_unlabelled)
+    finally:
+        lock.unlink(missing_ok=True)
+
+
+def _pool(ids, workers, force, allow_unlabelled):
     todo = []
     for r in select_videos(ids or None):
         d = wdir(r["id"])
@@ -651,7 +687,8 @@ def share_cap(counts, share):
 
 def balance_train(P, max_share, tag_share, max_train, rng):
     """P: pos rows of the train split -> the selected subset. 1) per video, no shot tag above tag_share of the video
-    (only when >= 2 tags hold >= 5% each; the cap never goes below 25% of the video); 2) no video above max_share of
+    (only when >= 2 tags hold >= 5% each; the cap never goes below 25% of the video; track_wide, the target domain,
+    is exempt); 2) no video above max_share of
     the split; 3) optional global size cap, proportional. Random within each (video, tag) cell."""
     parts = []
     for vid, g in P.groupby("video"):
@@ -661,7 +698,8 @@ def balance_train(P, max_share, tag_share, max_train, rng):
         else:
             cap = len(g)
         for t, gg in g.groupby(g.tag.fillna("none")):
-            parts.append(gg.sample(min(len(gg), cap), random_state=rng.randint(0, 1 << 30)))
+            c = len(gg) if t in TAG_CAP_EXEMPT else cap
+            parts.append(gg.sample(min(len(gg), c), random_state=rng.randint(0, 1 << 30)))
     P = pd.concat(parts)
     vc = P.video.value_counts()
     cap = share_cap(list(vc), max_share)
@@ -681,6 +719,11 @@ def load_pools(sp):
             continue
         X = pd.read_parquet(p)
         X = X[X.kept]
+        have = {p.name for p in (POOL / vid / "frames").glob("*.jpg")}
+        miss = ~X.image.isin(have)
+        if miss.any():
+            log(f"{vid}: {int(miss.sum())} pooled images missing on disk, skipped (re-run pool --force {vid})")
+            X = X[~miss]
         X["video"] = vid
         X["event"] = r["event"]
         X["split"] = sp.get(r["event"], "train")
@@ -1012,7 +1055,7 @@ Rules (details in the `teacher/export.py` docstring):
   bigger label box is a partial box (dropped).
 * Sampling: <= 1 positive frame per second per shot (best label confidence in the bin), hard negatives <= 1 per 5 s per
   shot, pHash dedupe per video (<= {PHASH_T} of 64 bits AND same label boxes, IoU >= {DUP_IOU}). Train is balanced: no video
-  above {st['max_share']:.0%} of train, no shot tag above {st['tag_share']:.0%} of a video's frames. Negatives
+  above {st['max_share']:.0%} of train, no shot tag above {st['tag_share']:.0%} of a video's frames (track_wide, the target domain, exempt). Negatives
   = {st['neg_frac']:.0%} of each split, half hard negatives (only verified not-car boxes in frame: road cars, props, ego
   car, logos) and half `negatives.parquet` frames (no detection >= 0.10 within +-1 s).
 
