@@ -593,3 +593,120 @@ crops ≈ 5.5–7 GPU-h of plain reads at WP0's 22 k crops/h, less if the pool i
   ego track" would catch most of the rest.
 * Rerun cost if 26BR originals (Takeout) arrive: detect ≈ 7 min per stream-hour at 720p, more at 1080p (decode + resize
   is still cheap; YOLO runs at imgsz 1280 either way).
+
+## Session 2: students + 26SE harness (WP9)
+
+Code: `students/train_det.py`, `students/eval_26se.py`, `students/bench_cpu.py`; `lapvision/det.py` got a student mode.
+Runs in `students/runs/` (gitignored), harness outputs in `out/eval_<name>/`. No GPU was used (the VLM labeller had it).
+
+### Environment gotchas
+
+* **`CUDA_VISIBLE_DEVICES=` (empty) does not hide the GPU on Windows.** Windows drops an empty env var when a process
+  starts, and torch then reports `is_available() == True` with `device_count() == 0`. Use `CUDA_VISIBLE_DEVICES=-1`
+  (then `is_available()` is False). The students scripts pick the device with `device_count() > 0`.
+* **ultralytics sets `OMP_NUM_THREADS=1` on import if it is unset.** If ultralytics is imported before torch, torch CPU
+  inference runs on one thread. Import torch first (the students scripts do) or set the thread count explicitly.
+* **ffmpeg raw output duplicates frames after a frame-dropping filter.** `select=not(mod(n,2))` piped as rawvideo came out
+  at 60 frames/s again (CFR padding), which doubled the time axis of the tracks. Use `framestep=N` (keeps input frames
+  0, N, 2N, ..., checked pixel by pixel) and `-fps_mode passthrough`.
+* `onnx`, `onnxslim`, `onnxruntime 1.31` and `openvino 2026.4.1` install cleanly with pip on Python 3.13 (no existing package
+  changed; added to `requirements.txt`). `albumentations` was **not** installed: it pulls `opencv-python-headless`
+  next to `opencv-python`. The blur / JPEG augmentation is a small cv2 transform in `train_det.py` instead.
+* `yolo11n.pt` / `yolo11s.pt` are in `weights/` (ultralytics' `weights_dir`, so `YOLO("yolo11n.pt")` finds them from any cwd).
+
+### train_det.py
+
+* YOLO11n/s, imgsz 640 (or 960), AMP, batch by size (n640 64, s640 32, n960 24, s960 16: estimates for 11 GB minus the
+  desktop; check nvidia-smi in epoch 1, or `--batch 0.7` = AutoBatch at 70% of free VRAM), early stopping (patience 25),
+  `--hours` budget, `--resume`, `--fraction` subsets, `--cache ram`. After training it evaluates `best.pt` on the
+  data.yaml `test` split if there is one (`eval_test.json`; also `--test-only`).
+* Augmentation: mosaic (closed for the last 10 epochs), HSV (h 0.015, s 0.6, v 0.45: mud, washed-out exposure), scale 0.5,
+  translate 0.1, horizontal flip only (no vertical flip, no rotation / shear / perspective), plus `Degrade` (p 0.3: Gaussian
+  blur, horizontal motion blur 5-15 px, JPEG q 25-70, or down-up scaling 0.4-0.7).
+* Gotcha: a transform inserted once into `dataset.transforms` disappears when `close_mosaic` rebuilds the pipeline. It must
+  live in `build_transforms` (a module-level `YOLODataset` subclass, which also lets Windows spawn workers unpickle the
+  dataset). Checked: after pickling and `close_mosaic` the pipeline still ends `..., Degrade, Format`.
+* CPU smoke test on a throwaway 40-frame set cut from `out/world_1129` boxes (deleted afterwards with its runs; nothing was
+  trained on 26SE for real): 1-2 epochs run, mosaic and degrade visible in `train_batch*.jpg`. Killing a run after epoch 1
+  and `--resume` continued at epoch 2 with the same args. The `--test-only` path was checked on 4 stream frames.
+
+### eval_26se.py: the benchmark harness
+
+* Same stages and thresholds as session 1: 5 fps timeline (frames scaled to 1920x1080, conf 0.15) -> foreground events
+  (vehicle conf > 0.3, h > 0.2 H, bottom > 0.4 H, gap 2.5 s, +-1.5 s pad) -> ByteTrack at ~30 fps on the events only ->
+  `passes.build()` -> time-only greedy matching to `contagem_volta` (+80 s, +-6 s on t0) after 09:18:30. Per-file breakdown,
+  false-pass and missed-lap lists. Identity is optional and borrowed: each pass takes the VLM vote of the YOLO-World pass
+  that overlaps it most in time (IoU >= 0.3), scored with the id-preferring match of `analyze.py`.
+* `lapvision/det.py`: `Detector(name, mode=None)`. Auto mode = 'world' if the name says so, 'coco' for an 80-class COCO
+  model, otherwise 'student' (vehicle classes = every class except `person` / `number`, so a 2-class `car`+`number` net
+  only feeds `car` boxes into the pass logic). Existing callers behave as before.
+* The GT window is fixed by the selected files (09:18:30-12:10:10 for all four), not by the first / last detected pass
+  as in `analyze.py`, so a weak detector cannot shrink its own GT. For the YOLO-World and COCO runs it gives the same 252 laps.
+* **Validation (CPU, metrics from the existing tracks): exact reproduction.** `--from-tracks out/world_*`: 241 passes,
+  235 matched, recall **0.9325**, precision **0.9751**, 6 false passes, 17 missed; last file 63/63 laps, 64 passes
+  (1.00 / 0.984). Borrowed identity on itself: 182 read, 94.0% right, end-to-end 67.9%, share >= 0.5 98.7% at 65%, all equal to
+  WP0. `--from-tracks out/crops_*` (COCO YOLO11x): 230 / 219, 0.869 / 0.952, per-file recall 0.99 / 0.83 / 0.83 / 0.79
+  (= session 1). The time-only match finds the same 235 pairs as the id-preferring one.
+* **End-to-end check on CPU, all three stages**, COCO YOLO11n (pretrained, untrained on baja cars) at 1280 on file 11-09-03
+  (20.7 min, 24 laps; `out/eval_coco_n1280_cpu/`): 15 passes, **recall 0.58**, precision 0.93 (COCO YOLO11x 0.83 / 1.00,
+  YOLO-World 0.875 / 1.00). A tiny COCO model is not usable as is; a trained student is needed. 21 events, 157 s of tracking
+  windows. Speed on the loaded CPU (8 threads): timeline 9 img/s (687 s), tracking 7.2 frames/s (652 s).
+* **Run time of a full evaluation.** Footage 10,816 s = 54 k timeline frames at 5 fps. Tracking windows (YOLO-World
+  events): 476 + 473 + 312 + 466 = **1,727 s, about 52 k frames at 30 fps**. CPU decode measured while the other agents loaded
+  the CPU: timeline (`fps=5` + scale) 5.8x real time for the 4K file and 7x for 1080p60; full-rate decode 2.3-3.9x.
+  * GPU (estimate, not measured: no GPU in this session): timeline decode-bound, 25-30 min (YOLO11n/s at 640 does hundreds
+    of img/s at batch 16); tracking 10-15 min (decode overlaps the ~10 ms per `track()` call). **About 40 min per detector.**
+  * CPU only (a student at 640 costs ~25% of the YOLO11n@1280 above): **about 1-1.5 h per detector**, so student
+    evaluations can run on the CPU while the GPU trains the next model.
+  * Cheaper: `--track-fps 15` halves stage 2; `--files 1129` (40 min, 63 laps, the session-1 YOLO-World 1.00 / 0.98 file)
+    for a quick look (~10 min on GPU). Decode is the floor, so `--tl-fps` below 5 saves little and risks missed events.
+
+### bench_cpu.py: CPU latency (proxy for the laptop)
+
+Ryzen 9 3900X (Zen 2, 2019), **while the VLM labeller and WP8's export kept the CPU at 50-95%**: worker processes at high
+priority, 3 interleaved rounds of 60 frames, fastest round reported (rounds differed by up to 1.7x). Per frame: letterbox
+of a real 1080p frame + forward + NMS. RAM = peak working set of the whole process (the ONNX / OpenVINO workers import only
+numpy, cv2 and the runtime). Results: `students/runs/bench/*.json`.
+
+| model | input | ONNX RT 1 thr | ONNX RT 4 thr | OpenVINO 1 thr | OpenVINO 4 thr | torch 4 thr | peak RAM (ORT / OV) |
+|---|---|---|---|---|---|---|---|
+| YOLO11n | 640x640 | 104 ms | 52 ms | 109 ms | 54 ms | 99 ms | 176 / 173 MB |
+| YOLO11n | **384x640** | 50 ms | **22 ms** | 49 ms | **21 ms** | 42 ms | 138 / 157 MB |
+| YOLO11s | 640x640 | 287 ms | 114 ms | 290 ms | 112 ms | 191 ms | 278 / 238 MB |
+| YOLO11s | **384x640** | 135 ms | **49 ms** | 143 ms | **48 ms** | 86 ms | 207 / 216 MB |
+
+* **Export with a 16:9 input (`--imgsz 384x640`).** A square 640 input is 44% padding for a 1080p frame; the rectangular
+  export halves the cost. It is the same object scale as training at 640 (long side 640), so no retraining is needed, and
+  ultralytics' own `.pt` predict already letterboxes to 384x640 (which is what `eval_26se.py` measures).
+* YOLO11n at 384x640 meets the <= 50 ms target even on one thread of this loaded CPU; YOLO11s needs ~4 threads. RAM is far
+  below 1 GB (< 0.3 GB). ONNX Runtime and OpenVINO are on par here; OpenVINO may win on an Intel laptop and offers INT8
+  (NNCF calibration, not tried). The torch path is ~2x slower and costs ~0.6 GB RAM (the torch import alone is ~0.5 GB).
+* Pre-processing (resize + letterbox of a 1080p frame) is 4-8 ms; less if the capture runs at 720p.
+
+### Training plan for when the GPU is free (not run)
+
+Time estimates are **scaled from published numbers, not measured**: YOLOv5 README (V100, COCO 118 k images, 300 epochs:
+v5n 1 day, v5s 2 days, i.e. ~410 / ~205 img/s), scaled by GFLOPs (YOLO11n 6.5 vs v5n 4.5, YOLO11s 21.5 vs v5s 16.5) and
+x0.75 for a 2080 Ti vs a V100 with AMP: **YOLO11n@640 ~200-250 img/s, YOLO11s@640 ~110-130 img/s**, @960 x0.44 (n ~100,
+s ~55 img/s). The 3900X data loader (8 workers, mosaic) should keep up at 640. Per 10 k training images and epoch:
+n640 ~45 s, s640 ~85 s, plus ~10% validation. Run 0 calibrates this.
+
+0. Calibration (~15 min): `train_det.py --data datasets/cars/data.yaml --model yolo11n.pt --name calib --epochs 3
+   --fraction 0.25` -> img/s and VRAM (nvidia-smi); then delete the run.
+1. `--model yolo11n.pt --imgsz 640 --epochs 100 --patience 20 --name cars_n640`: with 40 k images ~5.5 h (early stopping
+   usually ends it sooner).
+2. `--model yolo11s.pt --imgsz 640 --epochs 100 --patience 20 --hours 10 --name cars_s640`: with 40 k images ~10 h.
+3. Only if 24SU shows a small-car gap that matters for the PTZ use case: `n960` (~2.3x n640). Not needed for the start
+   line (passing cars are > 0.2 H, >= 77 px at a 384 px input height).
+4. After each run: `eval_26se.py --name <run> --weights students/runs/<run>/weights/best.pt` (GPU ~40 min, or CPU ~1-1.5 h
+   in parallel with the next training) and `bench_cpu.py --weights ... --imgsz 384x640`. Never tune on 26SE.
+
+Comparison table to fill:
+
+| detector | input | 24SU held-out: mAP50 / mAP50-95 vs teacher labels | 26SE passes | recall | precision | false passes | end-to-end (borrowed ids) | CPU ms (ORT 4 thr, 384x640) |
+|---|---|---|---|---|---|---|---|---|
+| YOLO-World v2-x (teacher) | 1280 | reference | 241 | 0.933 | 0.975 | 6 | 67.9% | GPU only |
+| COCO YOLO11x | 1280 | - | 230 | 0.869 | 0.952 | 11 | 62.7% (own VLM reads) | - |
+| COCO YOLO11n, untrained (11-09-03 only) | 1280 | - | 15 (24 laps) | 0.58 | 0.93 | 1 | - | 22 |
+| student YOLO11n | 640 | | | | | | | 22 |
+| student YOLO11s | 640 | | | | | | | 49 |

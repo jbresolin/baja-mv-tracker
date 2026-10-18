@@ -12,3 +12,8 @@ pandas==3.0.6
 pillow==12.3.0
 lap==0.5.13
 # external tools on PATH: ffmpeg/ffprobe (NVDEC/NVENC build), yt-dlp (for the stream downloads)
+# students/bench_cpu.py (WP9/WP11 CPU export + latency): ONNX Runtime and OpenVINO, both pip-clean on Python 3.13
+onnx==1.23.2
+onnxslim==0.1.98
+onnxruntime==1.31.0
+openvino==2026.4.1
