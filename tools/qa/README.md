@@ -27,6 +27,11 @@ Reviewing rules (agreed 2026-10-18):
 - **Two cars in one box** (the box spans both cars in most crops; check the context frame): `3`, even if one car's
   number is readable and matches. The box is a wrong detector label, and the track's identity is ambiguous. If the box sits on
   one car and a neighbour only peeks in at the edge or overlaps in a crop or two, judge that one car normally.
+- **`B` (number boxes wrong)**: only for a drawn box that would teach something wrong: a box on something that is not the
+  race number (sponsor, overlay text, shirt, wheel), on a different number than the proposal, or one that cuts off digits.
+  Do **not** press it for crops without a box (boxes come from the grounded read, run on only 2–3 crops of some tracks),
+  for an unboxed second number on the car (known gap), or for a slightly loose or shifted box that still contains all the
+  digits (the recognizer pads and jitters boxes).
 - The small text in each crop's corner is the VLM teacher's raw read of that crop ("none" = it saw no legible number).
   Green means it equals the proposal, orange means it differs. The proposal is their majority, snapped to the roster
   (leading zeros ignored: "04" = 4).
