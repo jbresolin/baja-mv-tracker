@@ -1,7 +1,7 @@
 """WP4 step 1 (CPU): pick K crops per readable car track and cut them from the video -> work/<id>/crops/,
 work/<id>/crops.parquet, work/<id>/crop_tracks.parquet, work/<id>/ctx/ (context frames), crops.done
 
-Readable tracks (tracks.parquet from WP3): cls buggy, not screen_fixed, not in_overlay, not nested in a larger
+Readable tracks (tracks.parquet from WP3): cls buggy, not screen_fixed, not nested in a larger
 coexisting box (same car, the outer track is read), not in a transition shot, and >= MIN_CAND detections whose box is
 >= H_MIN px high (720p source). If WP3 left in_overlay null (track.py ran before overlay.done), it is computed here
 with track.py's own overlay_flag().
@@ -17,7 +17,8 @@ crops.parquet: track_id, shot_id, frame_idx, pts, x1..y2 (det box, src px), cx1.
   scale (file px per src px), cw, ch (file size), h_px, conf, sharp, chunk, path (repo-relative, forward slashes)
 crop_tracks.parquet: every car track with readable (bool), reason (why not), n_cand, n_crops, h_cand_max, ctx path
 
-usage (repo root): python teacher/crops.py [id ...] [--workers 2] [--force] [--hmin 60] [--k 8]
+usage (repo root): python teacher/crops.py [id ...] [--workers 2] [--force] [--hmin 60] [--k 8] [--update]
+                   (--update: add crops for tracks that became readable since the last run -> crops_update.done)
                    python teacher/crops.py verify <id> [--n 12]    (redraw boxes on freshly decoded frames -> sheet)
 """
 import json
@@ -26,7 +27,7 @@ import sys
 import time
 from pathlib import Path
 
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")  # "" does not hide the GPU on Windows
 import cv2  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
@@ -109,8 +110,11 @@ def select(d, row, hmin=H_MIN, k=K):
     reason = np.full(len(car), "", object)
     reason[car.screen_fixed.to_numpy(bool)] = "screen_fixed"
     io = car.in_overlay.map(lambda v: bool(v) if v is not None and v == v else False).to_numpy(bool)
-    reason[(reason == "") & io] = "in_overlay"
+    car["in_overlay_soft"] = io  # soft flag (WP3: ~half of the in_overlay tracks are real cars): carried, not excluded
     reason[(reason == "") & (car.nested_in.to_numpy() >= 0)] = "nested"
+    from verify import ego_residue  # noqa: E402
+    ego, _ = ego_residue(d, H)
+    reason[(reason == "") & car.track_id.isin(ego).to_numpy()] = "ego_residue"
     reason[(reason == "") & car.shot_id.isin(trans).to_numpy()] = "transition"
     car["reason"] = reason
     dets = pd.read_parquet(d / "dets.parquet")
@@ -194,16 +198,24 @@ def finalize(tid, cands, thumbs, d, vid, W, H):
     return rows, f"work/{vid}/ctx/t{tid}.jpg"
 
 
-def process(row, hmin=H_MIN, k=K):
+def process(row, hmin=H_MIN, k=K, update=False):
+    """update=True: keep the existing crops and only add tracks that became readable since (re-flagged tracks.parquet,
+    in_overlay made soft); crops.parquet / crop_tracks.parquet are rewritten with the union."""
     vid = row["id"]
     d = wdir(vid)
     W, H = row["width"], row["height"]
     t0 = time.time()
     car, P, recomputed = select(d, row, hmin, k)
-    for sub in ("crops", "ctx"):  # a re-run replaces the previous crop set entirely
-        (d / sub).mkdir(exist_ok=True)
-        for f in (d / sub).glob("*.jpg"):
-            f.unlink()
+    old = None
+    if update and (d / "crops.parquet").exists():
+        old = pd.read_parquet(d / "crops.parquet")
+        old_ct = pd.read_parquet(d / "crop_tracks.parquet")
+        P = P[~P.track_id.isin(old.track_id)]
+    else:
+        for sub in ("crops", "ctx"):  # a re-run replaces the previous crop set entirely
+            (d / sub).mkdir(exist_ok=True)
+            for f in (d / sub).glob("*.jpg"):
+                f.unlink()
     last = P.groupby("track_id").frame_idx.max()
     by_frame = {f: g for f, g in P.groupby("frame_idx")}
     ends = {}
@@ -248,17 +260,21 @@ def process(row, hmin=H_MIN, k=K):
     if live:
         raise RuntimeError(f"{len(live)} tracks not finalised (decode ended early?)")
     C = pd.DataFrame(rows)
+    n_new = len(C)
+    if old is not None:
+        C = pd.concat([old, C], ignore_index=True)
+        ctx = {**old_ct.dropna(subset=["ctx"]).set_index("track_id").ctx.to_dict(), **ctx}
     C.to_parquet(d / "crops.parquet", index=False)
     car["ctx"] = car.track_id.map(ctx)
     car["n_crops"] = car.track_id.map(C.groupby("track_id").size() if len(C) else {}).fillna(0).astype(int)
     keep = ["track_id", "shot_id", "t0", "t1", "n", "conf_max", "h_px_median", "h_px_max", "h_cand_max", "n_cand",
-            "n_crops", "readable", "reason", "screen_fixed", "in_overlay", "nested_in", "small", "long_static", "ctx"]
+            "n_crops", "readable", "reason", "screen_fixed", "in_overlay", "in_overlay_soft", "nested_in", "small", "long_static", "ctx"]
     ct = car[keep].copy()
     ct["in_overlay"] = ct.in_overlay.map(lambda v: None if v is None or v != v else bool(v))
     ct.to_parquet(d / "crop_tracks.parquet", index=False)
     tm = (d / "tracks.parquet").stat().st_mtime
     info = dict(video=vid, hmin=hmin, k=k, car_tracks=int(len(car)), readable=int(car.readable.sum()),
-                reasons={str(a): int(b) for a, b in car.reason.value_counts().items()}, crops=int(len(C)),
+                reasons={str(a): int(b) for a, b in car.reason.value_counts().items()}, crops=int(len(C)), new_crops=n_new,
                 decoded_frames=n_dec, mask_regions=len(regs), masked_dropped=n_masked_drop, in_overlay_recomputed=recomputed, tracks_mtime=tm,
                 runtime_s=round(time.time() - t0, 1))
     (d / "crops.json").write_text(json.dumps(info, indent=1))
@@ -322,6 +338,10 @@ def main(argv):
     hmin, k = opt["--hmin"], opt["--k"]
     workers, force, ids, rest = cli_ids(argv)
     rows = select_videos(ids or None)
+    if "--update" in rest:
+        run_stage("crops_update", process, rows, workers=workers, force=force, requires=("crops",), hmin=hmin, k=k,
+                  update=True)
+        return
     run_stage("crops", process, rows, workers=workers, force=force, requires=("track",), hmin=hmin, k=k)
 
 

@@ -41,7 +41,7 @@ FPS = 1.0
 PAD = 4.0
 HAMMING = 0.18
 MIN_SEG = 2
-MERGE_GAP = 6.0
+MERGE_GAP = 20.0   # s; segments between two reads of the same content that were too short to read do not split it
 MIN_MATCH = 0.6
 BATCH = 4
 MODES = {"DIN": "single", "SPP": "heat"}
@@ -129,8 +129,14 @@ def parse_ids(raw, roster):
     out = []
     if not raw or raw.strip().lower().startswith("none"):
         return out
-    for line in re.split(r"[\n\r]+", raw):
-        line = line.strip().strip("*`")
+    lines = [x.strip().strip("*`").strip() for x in re.split(r"[\n\r]+", raw)]
+    joined = []
+    for x in lines:  # "#7" / "Imperador" on two lines -> "#7 Imperador"
+        if joined and re.fullmatch(r"#?\s*\d{1,3}\s*[-–—:|.]?", joined[-1]):
+            joined[-1] = joined[-1] + " " + x
+        else:
+            joined.append(x)
+    for line in joined:
         for m in LINE_RE.finditer(line):
             num = int(m.group(1))
             team = re.sub(r"\s+\d{1,2}\s*$", "", m.group(2)).strip()  # trailing heat score
@@ -139,6 +145,41 @@ def parse_ids(raw, roster):
             sc = idlib.team_score(team, ent) if ent else 0.0
             out.append((num, team, ent["equipe"] if ent else None, sc))
     return out
+
+
+def build_ids(d, roster):
+    """(Re-)parse overlay_reads.parquet and merge consecutive segments with the same accepted numbers
+    -> overlay_ids.parquet. A heat needs both numbers accepted, a lower third exactly one."""
+    RR = pd.read_parquet(d / "overlay_reads.parquet")
+    rows, upd = [], []
+    for reg, G in RR.groupby("region"):
+        cur = None
+        for r in G.sort_values("t0").itertuples():
+            ids = parse_ids(r.raw, roster)
+            acc = sorted({n for n, _, rt, sc in ids if rt is not None and sc >= MIN_MATCH})
+            upd.append((r.Index, json.dumps([[n, tt, rt, sc] for n, tt, rt, sc in ids], ensure_ascii=False), acc))
+            nums = tuple(acc)
+            if len(nums) != (1 if r.mode == "single" else 2):
+                cur = None
+                continue
+            sc = min([x[3] for x in ids if x[0] in nums] or [0.0])
+            if cur and cur["numbers"] == list(nums) and r.t0 - cur["t1"] <= MERGE_GAP:
+                cur["t1"] = r.t1
+                cur["n_reads"] += 1
+                cur["match"] = min(cur["match"], sc)
+            else:
+                cur = dict(region=int(reg), mode=r.mode, t0=r.t0, t1=r.t1, numbers=list(nums),
+                           teams=[roster[n]["equipe"] for n in nums], raw=r.raw, match=sc, n_reads=1, crop=r.crop)
+                rows.append(cur)
+    for i, pj, acc in upd:
+        RR.at[i, "parsed"] = pj
+        RR.at[i, "numbers"] = acc
+    RR.to_parquet(d / "overlay_reads.parquet", index=False)
+    df = pd.DataFrame(rows, columns=["region", "mode", "t0", "t1", "numbers", "teams", "raw", "match", "n_reads",
+                                     "crop"])
+    df["dur"] = df.t1 - df.t0
+    df.to_parquet(d / "overlay_ids.parquet", index=False)
+    return df
 
 
 def process(row, batch=BATCH, dry=False):
@@ -187,39 +228,12 @@ def process(row, batch=BATCH, dry=False):
                                   crop=str(p.relative_to(ROOT)).replace("\\", "/"), raw=raw,
                                   parsed=json.dumps([[n, tt, rt, sc] for n, tt, rt, sc in ids], ensure_ascii=False),
                                   numbers=[a[0] for a in acc]))
-        # merge consecutive segments with the same accepted numbers
-        cur = None
-        for r in sorted(reads_all, key=lambda r: r["t0"]):
-            if r["region"] != R["region"]:
-                continue
-            nums = tuple(r["numbers"])
-            if R["mode"] == "single" and len(nums) != 1:
-                nums = ()
-            if R["mode"] == "heat" and len(nums) not in (1, 2):
-                nums = ()
-            if not nums:
-                cur = None
-                continue
-            ids = json.loads(r["parsed"])
-            sc = min([x[3] for x in ids if x[0] in nums] or [0.0])
-            teams = [roster[n]["equipe"] for n in nums]
-            if cur and cur["numbers"] == list(nums) and r["t0"] - cur["t1"] <= MERGE_GAP:
-                cur["t1"] = r["t1"]
-                cur["n_reads"] += 1
-                cur["match"] = min(cur["match"], sc)
-            else:
-                cur = dict(region=R["region"], mode=R["mode"], t0=r["t0"], t1=r["t1"], numbers=list(nums),
-                           teams=teams, raw=r["raw"], match=sc, n_reads=1, crop=r["crop"])
-                rows.append(cur)
     if dry:
         return f"dry: {n_samples} samples"
-    df = pd.DataFrame(rows, columns=["region", "mode", "t0", "t1", "numbers", "teams", "raw", "match", "n_reads",
-                                     "crop"])
-    df["dur"] = df.t1 - df.t0
-    df.to_parquet(d / "overlay_ids.parquet", index=False)
     pd.DataFrame(reads_all).to_parquet(d / "overlay_reads.parquet", index=False)
+    df = build_ids(d, roster)
     info = dict(regions=len(regs), samples=n_samples, reads=n_reads, ids=len(df),
-                accepted_reads=int(sum(1 for r in reads_all if r["numbers"])), decode_s=round(t_dec),
+                accepted_reads=int(pd.read_parquet(d / "overlay_reads.parquet").numbers.map(len).gt(0).sum()), decode_s=round(t_dec),
                 vlm_s=round(t_vlm), distinct_numbers=int(len({n for x in df.numbers for n in x})) if len(df) else 0)
     (d / "overlay_ids.json").write_text(json.dumps(info, indent=1))
     return json.dumps(info)
@@ -287,6 +301,18 @@ def check(vid, n=30, seed=0, batch=BATCH):
 
 
 def main(argv):
+    if argv and argv[0] == "reparse":
+        for row in select_videos(argv[1:] or None):
+            d = wdir(row["id"])
+            if (d / "overlay_reads.parquet").exists():
+                df = build_ids(d, idlib.load_roster(row["event"]))
+                info = json.loads((d / "overlay_ids.json").read_text())
+                RR = pd.read_parquet(d / "overlay_reads.parquet")
+                info.update(ids=len(df), accepted_reads=int(RR.numbers.map(len).gt(0).sum()),
+                            distinct_numbers=int(len({n for x in df.numbers for n in x})) if len(df) else 0)
+                (d / "overlay_ids.json").write_text(json.dumps(info, indent=1))
+                print(row["id"], info)
+        return 0
     if argv and argv[0] in ("sheet", "check"):
         (sheet if argv[0] == "sheet" else check)(argv[1])
         return 0

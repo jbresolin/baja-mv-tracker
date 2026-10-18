@@ -18,6 +18,12 @@ Per car track (every buggy track of crop_tracks.parquet; identity only for reada
                   else no label (candidates kept in ovl_numbers).
   number boxes    grounded.parquet boxes whose label equals the consensus, per crop (crop pixels) and mapped back to
                   source-frame pixels (number_boxes_src).
+Car check (teacher/verify.py): car_verified = yes / no / unsure from the mean yes-probability of 1-2 crops (>= 0.7 yes,
+  <= 0.3 no; a 'no' on crops < 60 px becomes unsure); screen_fixed and ego_residue tracks are 'no'; None = not checked
+  (median box < 30 px). Ego residue / screen_fixed tracks never get an identity label (source not_car_flag).
+  is_car = 'no' for screen_fixed / ego residue, 'yes' when the track has a roster-number consensus or an overlay
+  agreement (the yes/no check misses cars surrounded by marshals), else car_verified ('unchecked' below 30 px).
+  Flags come from the current tracks.parquet (in_overlay is soft and carried, not used to drop tracks).
 Negatives: 4 fps frames with no buggy detection (conf >= NEG_CONF) in the frame and +-1 s, outside transition shots and
   >= 1 s from a shot boundary; at most one per NEG_SPACING s per shot; total NEG_RATE x frames-with-cars per video,
   split evenly over shot tags (leftover redistributed), so no tag dominates.
@@ -34,9 +40,13 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import DATA, ROOT, cli_ids, run_stage, select_videos, wdir  # noqa: E402
 import idlib  # noqa: E402
+import verify  # noqa: E402
 
+VERIFY_NO_MIN_H = 60
 SIZE_PX = 60
 MIN_OVL_S = 1.0
+EDGE_MAX = 0.8
+AMBIG = 0.3
 NEG_CONF = 0.10
 NEG_WIN = 4          # frames (+-1 s at 4 fps)
 NEG_SPACING = 10.0   # s
@@ -74,14 +84,21 @@ def concurrency(iv):
 
 
 def assign_overlays(ct, O, shots):
-    """-> {track_id: dict(numbers, mode, n_tracks, match, ovl_t0, ovl_t1)}"""
+    """-> {track_id: dict(numbers, mode, n_tracks, match, ovl_t0, ovl_t1, ambiguous)}
+
+    Candidates: not screen_fixed / ego residue / verified 'no' / nested, h_px_max >= SIZE_PX, >= MIN_OVL_S inside the
+    overlay interval, and not glued to a frame edge (edge_touch < EDGE_MAX: in DIN shots the cars waiting in the queue
+    at the side of the picture are what the lower third does NOT announce). Per overlay row and shot, assigned only if
+    at most n_numbers candidates are on screen at once. A track overlapped by several rows takes the row with the
+    largest overlap; it is 'ambiguous' when a row with other numbers overlaps it >= AMBIG x as long."""
     out = {}
     if O is None or not len(O):
         return out
-    io = ct.in_overlay.map(lambda v: bool(v) if v is not None and v == v else False).to_numpy(bool)
-    sf = ct.screen_fixed.astype(bool).to_numpy()
-    ok = ct[~sf & ~io]
-    ok = ok[(ok.nested_in < 0) & (ok.h_px_max >= SIZE_PX)]
+    sf = ct.screen_fixed.astype(bool).to_numpy() | ct.ego_residue.to_numpy(bool)
+    notcar = (ct.car_verified == "no").to_numpy()
+    ok = ct[~sf & ~notcar]  # in_overlay is a soft flag (WP3): not excluded
+    ok = ok[(ok.nested_in < 0) & (ok.h_px_max >= SIZE_PX) & (ok.edge_touch < EDGE_MAX)]
+    hits = {}
     for o in O.itertuples():
         nums = [int(x) for x in o.numbers]
         cap = 1 if o.mode == "single" else 2
@@ -92,14 +109,16 @@ def assign_overlays(ct, O, shots):
             if concurrency(list(zip(g.t0, g.t1))) > cap:
                 continue
             for r in g.itertuples():
-                prev = out.get(int(r.track_id))
-                if prev and prev["numbers"] != nums:
-                    prev["ambiguous"] = True
-                    continue
-                if prev:
-                    continue
-                out[int(r.track_id)] = dict(numbers=nums, mode=o.mode, n_tracks=len(g), match=float(o.match),
-                                            ovl_t0=float(o.t0), ovl_t1=float(o.t1), ambiguous=False)
+                hits.setdefault(int(r.track_id), []).append(
+                    (float(r.inside), dict(numbers=nums, mode=o.mode, n_tracks=len(g), match=float(o.match),
+                                           ovl_t0=float(o.t0), ovl_t1=float(o.t1), ambiguous=False)))
+    for tid, h in hits.items():
+        h.sort(key=lambda x: -x[0])
+        best = h[0][1]
+        other = [x for x in h[1:] if x[1]["numbers"] != best["numbers"]]
+        if other and other[0][0] >= AMBIG * h[0][0]:
+            best["ambiguous"] = True
+        out[tid] = best
     return out
 
 
@@ -179,6 +198,25 @@ def process(row):
     roster = idlib.load_roster(ev)
     shots = pd.read_csv(d / "shots.csv")
     ct = pd.read_parquet(d / "crop_tracks.parquet")
+    # current WP3 flags (track.py --reflag may have run after crops.py; track ids are stable)
+    tr = pd.read_parquet(d / "tracks.parquet").set_index("track_id")
+    for c in ("screen_fixed", "in_overlay", "long_static", "small", "nested_in", "edge_touch"):
+        ct[c] = ct.track_id.map(tr[c]).to_numpy()
+    ct["in_overlay"] = ct.in_overlay.map(lambda v: bool(v) if v is not None and v == v else False)
+    ct["h_rel_median"] = ct.track_id.map(tr.h_rel_median)
+    ego, _ = verify.ego_residue(d, row["height"])
+    ct["ego_residue"] = ct.track_id.isin(ego)
+    VF = pd.read_parquet(d / "verify.parquet") if (d / "verify.parquet").exists() else None
+    vv = {}
+    if VF is not None and len(VF):
+        for tid, g in VF.groupby("track_id"):
+            vd, sc = verify.verdict(list(g.score))
+            if vd == "no" and g.h_px.max() < VERIFY_NO_MIN_H:
+                vd = "unsure"   # small crops: 'no' is unreliable (validation recall 40% below 60 px)
+            vv[int(tid)] = (vd, sc, float(g.h_px.max()))
+    ct["car_verified"] = [vv[t][0] if t in vv else ("no" if (s_ or e_) else None)
+                          for t, s_, e_ in zip(ct.track_id, ct.screen_fixed.astype(bool), ct.ego_residue)]
+    ct["verify_score"] = ct.track_id.map(lambda t: vv[t][1] if t in vv else None)
     C = pd.read_parquet(d / "crops.parquet")
     R = pd.read_parquet(d / "reads.parquet") if (d / "reads.parquet").exists() else pd.DataFrame(
         columns=["path", "track_id", "frame_idx", "raw", "num"])
@@ -204,6 +242,8 @@ def process(row):
         v = V.get(tid)
         ov = OV.get(tid)
         lab, src = final_label(v, ov) if r.readable or ov else (None, "none")
+        if r.ego_residue or r.screen_fixed:
+            lab, src = None, "not_car_flag"
         nb, nbs = {}, {}
         if tid in Cg and lab is not None:
             for c in Cg[tid].itertuples():
@@ -224,22 +264,31 @@ def process(row):
             ovl_n_tracks=ov["n_tracks"] if ov else 0, ovl_match=ov["match"] if ov else None,
             ovl_ambiguous=bool(ov["ambiguous"]) if ov else False,
             label=lab, source=src, number_boxes=jdump(nb), number_boxes_src=jdump(nbs), n_boxes=sum(map(len, nb.values())),
-            screen_fixed=bool(r.screen_fixed), in_overlay=r.in_overlay, nested=bool(r.nested_in >= 0),
+            screen_fixed=bool(r.screen_fixed), in_overlay=bool(r.in_overlay), nested=bool(r.nested_in >= 0),
+            ego_residue=bool(r.ego_residue), car_verified=r.car_verified, verify_score=r.verify_score,
             small=bool(r.small), long_static=bool(r.long_static), transition=bool(trans.get(int(r.shot_id), 0)),
             sharp_median=float(sharp.get(tid, np.nan)), ctx=r.ctx))
     L = pd.DataFrame(rows)
+    # is_car (for dataset A): the yes/no check, overruled by a roster-number consensus (only Baja cars carry one;
+    # the check misses cars occluded by marshals / partial views) and by screen_fixed / ego residue
+    flag = L.screen_fixed | L.ego_residue
+    L["is_car"] = np.where(flag, "no", np.where(L.vlm_consensus | L.source.eq("both-agree"), "yes",
+                                                 L.car_verified.fillna("unchecked")))
     for c in ("vlm_top", "vlm_runner", "vlm_number", "label"):
         L[c] = L[c].astype("Int64")
     L.to_parquet(d / "labels.parquet", index=False)
     N, n_avail, pos_frames = negatives(d, shots)
     N.to_parquet(d / "negatives.parquet", index=False)
     rd = L[L.readable]
-    both = L[L.vlm_consensus & L.ovl_numbers.notna() & (L.ovl_mode == "single")]
+    both = L[L.vlm_consensus & L.ovl_numbers.notna() & (L.ovl_mode == "single") & ~L.ovl_ambiguous]
     info = dict(video=vid, car_tracks=len(L), readable=int(L.readable.sum()), read=int((L.n_read > 0).sum()),
                 consensus=int(rd.vlm_consensus.sum()), overlay=int(L.ovl_numbers.notna().sum()),
                 both_single=len(both), agree_single=int((both.source == "both-agree").sum()),
                 labels=int(L.label.notna().sum()), sources={str(k): int(v) for k, v in L.source.value_counts().items()},
-                boxes=int(L.n_boxes.sum()), negatives=len(N), neg_available=n_avail, pos_frames=int(pos_frames))
+                boxes=int(L.n_boxes.sum()), negatives=len(N), neg_available=n_avail, pos_frames=int(pos_frames),
+                verified={str(k): int(v) for k, v in L.car_verified.fillna("none").value_counts().items()},
+                is_car={str(k): int(v) for k, v in L.is_car.value_counts().items()},
+                ego_residue=int(L.ego_residue.sum()))
     (d / "labels.json").write_text(json.dumps(info, indent=1))
     return json.dumps(info)
 
@@ -336,7 +385,7 @@ def summary():
         oi = json.loads((d / "overlay_ids.json").read_text()) if (d / "overlay_ids.json").exists() else {}
         N = pd.read_parquet(d / "negatives.parquet")
         rd = L[L.readable]
-        both = L[L.vlm_consensus & L.ovl_numbers.notna()]
+        both = L[L.vlm_consensus & L.ovl_numbers.notna() & ~L.ovl_ambiguous]
         bs = both[both.ovl_mode == "single"]
         bh = both[both.ovl_mode == "heat"]
         rows.append(dict(video=v["id"], event=v["event"], car_tracks=len(L), readable=len(rd),
@@ -347,6 +396,10 @@ def summary():
                          both_heat=len(bh), agree_heat=int((bh.source == "both-agree").sum()),
                          labels=int(L.label.notna().sum()), boxes_kept=int(L.n_boxes.sum()),
                          tracks_with_boxes=int((L.n_boxes > 0).sum()), negatives=len(N),
+                         verified_yes=int((L.car_verified == "yes").sum()), verified_no=int((L.car_verified == "no").sum()),
+                         verified_unsure=int((L.car_verified == "unsure").sum()),
+                         is_car_yes=int((L.is_car == "yes").sum()), is_car_no=int((L.is_car == "no").sum()),
+                         gpu_verify_min=round(g.get("verify_s", 0) / 60, 1),
                          gpu_plain_min=round(g.get("plain_s", 0) / 60, 1),
                          gpu_ground_min=round(g.get("ground_s", 0) / 60, 1),
                          gpu_ovl_min=round(oi.get("vlm_s", 0) / 60, 1)))
@@ -362,7 +415,7 @@ def summary():
             hrows.append(dict(video=v["id"], event=v["event"], level="crop", hbin=str(hb), n=len(gg),
                               read_any=int(gg.num.notna().sum()), read_roster=int(gg.in_roster.sum()),
                               eq_consensus=int(gg.eq_cons.sum()), eq_label=int(gg.eq_label.sum())))
-        rd = rd.assign(hb=pd.cut(rd.h_cand_max, HBINS))
+        rd = rd[rd.n_read > 0].assign(hb=pd.cut(rd.h_cand_max, HBINS))  # tracks that were read
         for hb, gg in rd.groupby("hb", observed=True):
             hrows.append(dict(video=v["id"], event=v["event"], level="track", hbin=str(hb), n=len(gg),
                               read_any=int((gg.vlm_top.notna()).sum()), read_roster=int(gg.vlm_top.notna().sum()),

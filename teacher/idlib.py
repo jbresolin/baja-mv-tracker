@@ -128,7 +128,7 @@ def reader(dtype="fp16"):
         if str(LV) not in sys.path:
             sys.path.insert(0, str(LV))
         from vlm import Reader  # noqa: E402
-        dev = "cuda" if os.environ.get("CUDA_VISIBLE_DEVICES", "x") != "" else "cpu"
+        dev = "cuda" if os.environ.get("CUDA_VISIBLE_DEVICES", "x") not in ("", "-1") else "cpu"
         import torch
         if dev == "cuda" and not torch.cuda.is_available():
             dev = "cpu"

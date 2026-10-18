@@ -88,14 +88,14 @@ def plain(rows, batch=4, sample=None, hmin=None):
         if not (d / "crops.done").exists():
             log(f"{vid}: no crops.done, skip")
             continue
-        if (d / "reads.done").exists() and not sample and not hmin:
-            log(f"{vid}: reads done, skip")
-            continue
         try:
             C = todo_crops(d, hmin, sample)
             done = load_parts(d)
             have = set(done.path) if len(done) else set()
             C = C[~C.path.isin(have)].sort_values(["track_id", "frame_idx"])
+            if not len(C) and (d / "reads.done").exists():
+                log(f"{vid}: reads done, nothing new, skip")
+                continue
             log(f"{vid}: {len(C)} crops to read ({len(have)} already read), batch {batch}")
             buf, t0, nb = [], time.time(), 0
             recs = C.to_dict("records")
@@ -119,12 +119,12 @@ def plain(rows, batch=4, sample=None, hmin=None):
             total_n += len(recs)
             if recs:
                 log(f"{vid}: read {len(recs)} crops in {el:.0f}s ({el / max(len(recs), 1):.3f} s/crop)")
-            if not sample and not hmin:
+            if not sample:
                 R = load_parts(d)
                 R["num"] = R["num"].astype("Int64")
                 R = R.drop_duplicates("path", keep="last")
                 R.to_parquet(d / "reads.parquet", index=False)
-                (d / "reads.done").write_text(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {len(R)} reads\n")
+                (d / "reads.done").write_text(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {len(R)} reads, hmin {hmin}\n")
             gpu = d / "gpu_time.json"
             g = json.loads(gpu.read_text()) if gpu.exists() else {}
             g["plain_s"] = g.get("plain_s", 0) + el
