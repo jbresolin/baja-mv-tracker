@@ -23,6 +23,14 @@ bad box · `4` can't tell · `B` toggle "number boxes wrong" (sent with the next
 `Backspace` undo the last verdict and go back to that item (repeatable) · click a crop to zoom.
 For an item **without** a proposed number, `1` means "agreed, no readable number" and `2` means "readable: type it".
 
+Reviewing rules (agreed 2026-10-18):
+- **Two cars in one box** (the box spans both cars in most crops; check the context frame): `3`, even if one car's
+  number is readable and matches. The box is a wrong detector label, and the track's identity is ambiguous. If the box sits on
+  one car and a neighbour only peeks in at the edge or overlaps in a crop or two, judge that one car normally.
+- The small text in each crop's corner is the VLM teacher's raw read of that crop ("none" = it saw no legible number).
+  Green means it equals the proposal, orange means it differs. The proposal is their majority, snapped to the roster
+  (leading zeros ignored: "04" = 4).
+
 The header shows progress, the running precision with its Wilson 95% interval, coverage, not-car / unsure counts and an
 ETA from the median time per item.
 
