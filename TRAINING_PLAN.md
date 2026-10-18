@@ -222,6 +222,11 @@ over. Turing: train with AMP fp16 (no bf16); YOLO11n/s at 640 with batch ~32 fit
   ≈ 2.5k per GPU-hour. Decode is bound by kernel-launch overhead on Windows, so cost ≈ output tokens × 125 ms ÷ batch.
 - So the whole teacher run fits in one night, and the GPU conflict below only matters if many more streams arrive.
 
+**Final models:** once the design and thresholds are chosen on val/test, retrain the deployed students on all 5 stream
+events (train + val + test). That adds the SU teams' liveries; it adds no new numbers. 26SE stays the external benchmark.
+Future events' start-line recordings, which come with human lap counts and so carry per-pass identity labels, become
+training data. Keep recording the start line at every event, NTP-synced.
+
 **Held-out split (proposal, decided at G2):** test = 24SU (END + SPP); train/val = 19SU, 25BR, 25SU, 26BR. 19SU stays in
 training because its fixed start-line camera is the closest footage to the target.
 
