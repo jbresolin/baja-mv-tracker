@@ -223,3 +223,132 @@ matched GT car), and running counts. The `--condensed` variant keeps only ±4 s 
   * the onboard ego car, which stays in the same screen position for the whole shot;
   * people's shirts printed with numbers (marshals and team members, e.g. "29", "2");
   * a road car in one DIN test (TRAÇÃO tows it).
+
+## Session 2: environment, fp16 and throughput on the 2080 Ti (WP0)
+
+Teacher PC (Ryzen 3900X, RTX 2080 Ti 11 GB, Windows 11 / WDDM), torch 2.11 cu128, transformers 5.20.1, ultralytics 8.4.181.
+Bench scripts: `tools/bench/` (`decode.py`, `yolo.py`, `vlm_fp16.py`, `grounding_probe.py`). Logs in `out/bench_*.txt`,
+`out/fp16_check*`, `out/grounding_probe*`. **Caveat for all timings:** the WP2 agent's `shots.py` (4 workers + ffmpeg) kept
+the CPU at 100% the whole time, so CPU-side numbers are pessimistic.
+
+### CPU regression (`analyze.py`)
+
+* COCO dirs (`crops_*`): recall **0.869**, VLM coverage **76%** (167/219), accuracy **94.6%**, share ≥ 0.5 → 98.6% at 67%
+  coverage, EasyOCR 46% / 89%, end-to-end **62.7%**: all as recorded. Two small differences: **230 passes, not 232, and
+  precision 0.952, not 0.94** (219 matched in both). The 2 extra session-1 passes were false ones that the current pass rules
+  (probably the later "nested boxes" merge) now merge. Per car the same, except car 10 now 8/13 (was 7/13).
+* The session-1 `out/passes_all.csv` / `per_car.csv` were already the YOLO-World run. The re-run reproduces them byte for
+  byte. Backups: `out/passes_all.session1.csv`, `out/per_car.session1.csv`; COCO re-run: `out/passes_all.coco_s2.csv`.
+* **New: whole-race YOLO-World v2-x numbers** (after 09:18:30, 252 human laps; `world_*`):
+
+| | COCO YOLO11x | YOLO-World v2-x |
+|---|---|---|
+| passes / matched | 230 / 219 | 241 / 235 |
+| pass recall / precision | 0.869 / 0.952 | **0.933 / 0.975** |
+| VLM coverage / accuracy | 76% / 94.6% | 77% (182/235) / **94.0%** |
+| VLM share ≥ 0.5 | 98.6% at 67% | **98.7% at 65%** |
+| EasyOCR coverage / accuracy | 46% / 89% | 45% / 91.5% |
+| end-to-end (lap with right number) | 62.7% | **67.9%** |
+| median click → enter frame | +0.47 s | +0.35 s |
+
+  * Per car: car 1 is now detected 32/34 times (COCO 26), but read 4/32. Car 20 29/37 (4 wrong: "7" ×3, "2"), car 6 17/25
+    (wrong: "8" ×2, "11", "100"), car 10 8/13, car 15 5/10, car 16 6/9. 4, 5, 9, 11, 14, 22 are perfect, 3 is 16/18, 13 is 19/21.
+  * 6 unmatched passes. 3 are long stationary tracks (11:30:09 at the start of the last file, 09:37:10, 10:20:56; 400–1200
+    frames each), and 1 is the 11:05:46 pass that COCO also has (read 7).
+  * `analyze.py` snaps to the SQL `equipe` table, which includes the test entries 99/100. One wrong read ("100" for car 6)
+    exists only because of that. The roster file `rosters/26SE.csv` (1–24) is the better snap set.
+
+### VLM in fp16 (Qwen3-VL-4B-Instruct, the plain read)
+
+* **`torch.cuda.is_bf16_supported()` returns True on the 2080 Ti** because it counts emulation. Use
+  `is_bf16_supported(including_emulation=False)` (False here). `lapvision/vlm.py` now takes `Reader(dtype=..., attn=...)`, env
+  `LAPVISION_VLM_DTYPE=fp16|bf16|fp32|auto`, and `read_passes.py --dtype=`. Default `auto` = bf16 only with native support
+  (Ampere+), fp16 on Turing, fp32 on CPU.
+* **fp16 passes.** 500 crops stratified from `out/world_*/reads.csv` (300 stored numbers, 200 'none'), batch 8, compared
+  with the stored bf16 reads from the RTX 5080: **99.2% identical parsed reads** (496/500), 99.0% identical raw text, 100% on the
+  'none' crops. No empty, NaN or garbage outputs (the 2 non-numeric-looking outputs, "1256420" and "17001", match the stored
+  bf16 ones). The 4 differences: 111→11, 08→89, 220→none, 30→38. After roster snapping, only 2 votes move (one more 11, one
+  less 8). No fix (sdpa, fp32 vision tower, fp32) was needed. Attention is sdpa (the default).
+* **The 4B model barely fits.** Weights are 8.88 GB in fp16 and the desktop takes 0.6–1.8 GB of the 11 GB. Plain read, crops
+  ≤ 640 px:
+
+| batch | s/crop | torch peak | nvidia-smi total (incl. desktop) |
+|---|---|---|---|
+| 1 | 0.28–0.29 | 9.08 GB | 9.8 GB |
+| 2 | 0.19 | 9.15 GB | 9.9 GB |
+| 4 | 0.16–0.165 | 9.37–9.40 GB | 10.2 GB |
+| 6 | 0.15 | 9.65 GB | 10.6 GB |
+| 8 | 0.16–0.18 (once 0.39) | 9.85–9.89 GB | 10.6–10.7 GB |
+
+  Batch 8 sits at the edge, and one of three batch-8 runs was 2.4× slower (probably a spill into shared memory). **Use batch
+  4–6.** That is ~2× slower than the RTX 5080 (0.085 s/crop at batch 8).
+* **Why it is slow: Python/launch-bound, not GPU-bound.** One decode step (1 token) takes **120–130 ms**, but the GPU is busy
+  only ~21 ms of it. The rest is ~2,600 kernel launches per step at ~30–45 µs each (WDDM plus the busy CPU). Raising the process
+  priority did not help. The cost per step is the same at batch 1 and batch 4, so **cost ≈ generated tokens × 125 ms / batch**,
+  plus prefill. The plain read generates ~3 tokens, so it is cheap. Long outputs (grounding) are expensive.
+* Tried a static KV cache plus `torch.compile(backend="cudagraphs")` through `generate(cache_implementation="static",
+  compile_config=...)`. It allocated 7.2 GB of **shared** (system) memory, crawled, and was killed after 12 min. Inductor
+  needs triton, which is not installed (`triton-windows` would be needed). **Not solved.** A hand-captured CUDA graph of the
+  decode step at fixed batch and length is the remaining option if the grounded read is ever needed at scale.
+* Tip for the user: in the NVIDIA Control Panel, set "CUDA – Sysmem Fallback Policy" to "Prefer No Sysmem Fallback" for
+  python.exe. A VRAM overflow then fails loudly (OOM) instead of silently running 10× slower.
+
+### Grounding probe (Qwen3-VL-4B, fp16): boxes are 0–1000 relative
+
+* Prompt (works first time, 20/20 valid JSON):
+  `Locate every race number painted on the off-road race car(s) in this image (firewall panel, side plates, nose). Output a
+  JSON list, one entry per number: [{"bbox_2d": [x1, y1, x2, y2], "label": "<digits>"}]. Output [] if no number is legible.`
+  Output: `[{"bbox_2d": [158, 335, 266, 438], "label": "22"}]`, sometimes wrapped in a ```json fence.
+* **Coordinate convention: relative 0–1000 of the image** (x / 1000 · W, y / 1000 · H), confirmed by eye
+  (`out/grounding_probe/sheet_p0.jpg`, `p0_*.jpg`: green = 0–1000, red / blue = absolute-pixel readings, which are clearly wrong).
+  It is **not** Qwen2.5-VL's absolute pixels.
+* On 20 clearly readable crops (high-agreement passes, one per pass, 15 cars): **25/25 boxes sit on a real number and are
+  tight.** The label equals the car on 20/20 crops ("08" → 8), with no other number. About 5 secondary instances were missed
+  (a side plate or the firewall of the same car). So it is precise but not exhaustive per crop.
+* **The grounded read cannot replace the plain read.** On a mixed sample of 120 crops (60% numeric / 40% 'none' plain reads;
+  108 with a GT pass), crop-level precision against the GT car is **plain 0.93 (55/59) vs grounded 0.78 (52/67)**. Where the
+  plain read says 'none', the grounded prompt still answers 11 times, and only 1 is right ("1", "11", "12", "100": hallucinated on
+  mud). Agreement between the two is 85%.
+* **Cost:** ~36 generated tokens, so **4.5–5.1 s/crop at batch 1 and 1.3–1.46 s/crop at batch 4**, ~9× the plain read.
+
+### Decode (720p30 H.264, `youtube/25SU_END.mp4`, 300 s segment)
+
+| decoder | rate | to `-f null` | piped to numpy (bgr24) |
+|---|---|---|---|
+| CPU (libavcodec, auto threads) | full 30 fps | 3,070 fps (102× RT) | 200 fps (6.7× RT) |
+| CPU | fps=4 | 100× RT | **190 fps, 47× RT** |
+| `-hwaccel cuda` | full | 1,000 fps (33× RT) | 237 fps (7.9× RT) |
+| `-hwaccel cuda` | fps=4 | 34× RT | 132 fps, 33× RT |
+
+* At these bitrates the 12-core CPU decodes faster than NVDEC with copy-back. Decoding is never the bottleneck at 2–4 fps,
+  and the full-rate pipe is limited by the 2.7 MB/frame copy, not by decoding. CUDA decode is still useful to keep CPU free
+  for other jobs.
+
+### Detector throughput (fp16, 720p frames from RAM, conf 0.15)
+
+| model | imgsz | batch 1 | batch 8 | batch 16 | torch peak (b16) |
+|---|---|---|---|---|---|
+| YOLO-World v2-x ["off-road buggy","person"] | 960 | 27 img/s | 54 img/s | 55 img/s | 1.4 GB |
+| YOLO-World v2-x | 1280 | 29 img/s | 36 img/s | 36 img/s | 2.4 GB |
+| YOLO11x COCO | 960 | | 63 img/s | 61 img/s | 1.6 GB |
+| YOLO11x COCO | 1280 | | 41 img/s | 43 img/s | 2.8 GB |
+
+* End to end (ffmpeg fps=4 pipe → reader thread → batch 8 YOLO-World @1280): **35 img/s = 8.9× real time** with CPU decode,
+  8.3× with CUDA decode. This matches the from-RAM number, so decode overlaps completely.
+* VRAM is not an issue for YOLO (≤ 4 GB as nvidia-smi sees it at 1280 / batch 16). ultralytics 8.4 warns that `half=` is
+  deprecated in favour of `quantize`. It still works.
+* **Detection time over the 42.4 h of streams** (152,650 s): YOLO-World @1280: **4.7 h at 4 fps, 2.4 h at 2 fps**. @960:
+  3.1 h / 1.6 h. YOLO11x @1280: 4.0 h / 2.0 h. Tracking adds little. This is well under the TRAINING_PLAN guess (10–15 h).
+* VLM budget for WP4: plain read ≈ 0.16 s/crop at batch 4–6, so **~22,000 crops per GPU-hour**. The grounded read
+  manages ~2,500 crops per hour.
+* ultralytics' `weights_dir` setting points to `D:\video_baja\weights`, so the CLIP `ViT-B-32.pt` now also exists there
+  (downloaded by `tools/bench/yolo.py`). It is the same file as `lapvision/weights/clip/ViT-B-32.pt`.
+
+### Recommendations for WP3 / WP4
+
+* WP3: YOLO-World v2-x fp16, **imgsz 1280, batch 8, 4 fps** (4.7 h for the current streams, so the 2 vs 4 fps question can be
+  decided on label quality alone). 960 is 1.5× faster, but small far cars are the reason to keep 1280. Check at G1.
+  Use CPU decode (ffmpeg `fps=4` pipe).
+* WP4: plain read in **fp16, batch 4** (6 if the desktop is idle). Never 8 on this card while the desktop is in use.
+* Grounded read: **only for boxes, never for identity.** Run it on 2–3 crops of tracks that already have a plain-read
+  consensus, and keep a box only if its label equals the consensus (as WP5 planned). Coordinates are 0–1000 relative to the crop.

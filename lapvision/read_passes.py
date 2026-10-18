@@ -1,6 +1,7 @@
 """Stage 4: build passes from tracks.csv, pick the best crops per pass, read numbers.
 
-usage: python read_passes.py <crops_dir> [k] [--no-easyocr]
+usage: python read_passes.py <crops_dir> [k] [--no-easyocr] [--dtype=fp16|bf16|fp32|auto]
+(--dtype overrides env LAPVISION_VLM_DTYPE; default auto = bf16 on Ampere+, fp16 on Turing)
 writes <crops_dir>/passes.csv and <crops_dir>/reads.csv
 """
 import sys
@@ -37,7 +38,9 @@ def main():
     jobs = [j for j in jobs if j["path"] not in done]
 
     from vlm import Reader
-    vr = Reader()
+    dt = next((a.split("=", 1)[1] for a in sys.argv if a.startswith("--dtype=")), None)
+    vr = Reader(dtype=dt)
+    print("VLM dtype", vr.dtype, flush=True)
     easy = None
     if use_easy:
         import easyocr
