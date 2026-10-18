@@ -200,8 +200,9 @@ M3/M4    train students; evaluate on 26SE + held-out events
 G3       student vs teacher on 26SE good enough? → WP11
 ```
 
-Conflict: the teacher run and student training both want the GPU. Either pause the queue for training (`PAUSE`), or
-train on another machine (the RTX 5080 PC from session 1?) while the teacher keeps running. To be decided before M2.
+**Decided:** all training also runs on this PC's 2080 Ti (the user's preference; the RTX 5080 PC is only a fallback if
+something proves impossible here). Training runs after the teacher. If more streams arrive later, use `PAUSE` to hand the GPU
+over. Turing: train with AMP fp16 (no bf16); YOLO11n/s at 640 with batch ~32 fits in 11 GB.
 
 **Throughput (measured in WP0, LESSONS.md):**
 - Detection: YOLO-World v2-x fp16 @1280 batch 8 runs at 35 img/s end to end (8.9× real time at 4 fps). **42.4 h of streams =
@@ -225,7 +226,7 @@ training because its fixed start-line camera is the closest footage to the targe
 ## Open questions for the user
 
 1. ~~Rosters~~: answered, see Inputs. Still open: which code do videos without an event get (off-season, team videos)?
-2. Is the RTX 5080 PC available for student training during the teacher run?
+2. ~~RTX 5080 for training~~: answered, train on the 2080 Ti here.
 3. Roughly how many stream-hours and events, and which codec are the downloads coming in as?
 4. Later (WP11): which laptop is the target, and how does the lap app accept a machine `fonte` (API, or direct DB insert into
    `contagem_passagem`)? What interface does the PTZ tracker expect?
