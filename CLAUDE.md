@@ -31,7 +31,10 @@ no bf16) + 64 GB RAM, available for weeks.
   Always apply that before comparing with the GT. One wrong conclusion in session 1 came from skipping it.
 - Evaluate only after 09:18:30 (the camera was being set up before that).
 - COCO detectors are unreliable on baja cars (muddy cars come out as "bear"/"cow"). Use YOLO-World v2-x prompted
-  "off-road buggy" (last file: recall 1.00, precision 0.98), or the trained student.
+  "off-road buggy", or the trained student. Whole race after 09:18:30: recall 0.933, precision 0.975, end-to-end 67.9%
+  (COCO: 0.87 / 0.95 / 62.7%).
+- On the 2080 Ti (this PC) the VLM runs in **fp16**: 99.2% identical to bf16. `torch.cuda.is_bf16_supported()` wrongly says True
+  (emulation), and `vlm.py` checks native support. Don't batch the VLM above 6 here (11 GB, desktop uses ~1.8 GB).
 - Number reading: Qwen3-VL-4B-Instruct on ~10 crops per pass, majority vote snapped to the event roster
   (≈94–96% accurate when it answers; abstains on mud). Car #1 is unreadable (mud), which is a re-ID problem.
 - Pass rules: one car = one count. Merge tracks that re-start where the last box ended (<10 s), and merge coexisting

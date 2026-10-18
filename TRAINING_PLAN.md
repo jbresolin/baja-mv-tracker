@@ -112,8 +112,10 @@ precision check of the VLM consensus wherever both exist; (3) dataset D (re-ID).
 
 - YOLO-World v2-x, prompts `["off-road buggy", "person"]` as in `lapvision/det.py`. Calibration option for G1: extra
   absorbing classes (`"pickup truck"`, `"ATV"`, `"tractor"`, `"car"`) to cut false positives on pit and service vehicles.
-- Sampling 4 fps (G1 compares it with 2 fps), ByteTrack per shot with `track_buffer` adapted to the low fps. Keep tracks with
-  ≥ 3 detections. Store every detection, also low-confidence ones (WP5 decides).
+- Settings from WP0: fp16, imgsz 1280, batch 8, 4 fps, CPU decode through an ffmpeg `fps=4` pipe.
+- Two steps, so the GPU step doesn't depend on shots: (1) GPU: raw per-frame detections for every video → `dets_raw.parquet`;
+  (2) CPU: tracking per shot on the stored detections (ByteTrack or an IoU tracker, `track_buffer` adapted to 4 fps) →
+  `dets.parquet` with track ids. Keep tracks with ≥ 3 detections. Store every detection down to conf 0.05; WP5 decides.
 - The detector was only validated on the side-on start line. Close-ups where the car fills or overflows the frame are
   new, and the G1 QA must look at them specifically.
 
@@ -121,9 +123,11 @@ precision check of the VLM consensus wherever both exist; (3) dataset D (re-ID).
 
 - Per track, K = 6–8 crops (large, sharp, spread in time: `lapvision/passes.pick_crops`), only from boxes ≥ ~100 px high
   (smaller cars are still detector data but have no readable number). Crops are cut at native resolution with 5% padding.
-- VLM pass: (a) the plain read from `lapvision/vlm.py`; (b) the **grounded** read, "every race number visible, with
-  its bounding box", as JSON. Qwen3-VL reportedly uses 0–1000 relative coordinates (Qwen2.5-VL used absolute pixels).
-  Verify on ~20 hand-checked crops before trusting it. G1 decides whether (b) alone is enough, which halves the VLM cost.
+- VLM pass (**decided in WP0**): (a) the plain read from `lapvision/vlm.py` (fp16, batch 4–6) on all K crops → identity;
+  (b) the **grounded** read only on 2–3 crops of tracks that already have a consensus, purely to get number boxes.
+  Keep a box only if its label equals the consensus. The grounded read cannot replace (a): its precision is 0.78 vs 0.93,
+  it reads numbers on crops where (a) says 'none', and it is ~9× slower. Prompt and format in LESSONS.md (WP0):
+  `bbox_2d` in **0–1000 relative** crop coordinates.
 - Stage-batched: WP3 runs over a batch of videos, then WP4 over the same batch, so the GPU never holds both models.
 
 ### WP5 · Consensus labels + auto-roster (CPU)
@@ -197,10 +201,12 @@ G3       student vs teacher on 26SE good enough? → WP11
 Conflict: the teacher run and student training both want the GPU. Either pause the queue for training (`PAUSE`), or
 train on another machine (the RTX 5080 PC from session 1?) while the teacher keeps running. To be decided before M2.
 
-**Throughput guess (replaced by WP0 numbers):** YOLO-World x fp16 on the 2080 Ti ~10–20 img/s (720p source, imgsz 1280,
-never upscaled beyond that), so at 4 fps ~3–5× real time. The current 42 h of streams ≈ 10–15 h of detection + a few hours
-of VLM: **one night**. Training can wait until the run finishes, so the GPU conflict below only matters if many more streams
-arrive.
+**Throughput (measured in WP0, LESSONS.md):**
+- Detection: YOLO-World v2-x fp16 @1280 batch 8 runs at 35 img/s end to end (8.9× real time at 4 fps). **42.4 h of streams =
+  4.7 GPU-h at 4 fps** (2.4 h at 2 fps). CPU decode beats NVDEC here and is never the bottleneck.
+- VLM: the plain read is ~0.16 s/crop at batch 4–6, ≈ 22k crops per GPU-hour. The grounded read is ~1.4 s/crop at batch 4,
+  ≈ 2.5k per GPU-hour. Decode is bound by kernel-launch overhead on Windows, so cost ≈ output tokens × 125 ms ÷ batch.
+- So the whole teacher run fits in one night, and the GPU conflict below only matters if many more streams arrive.
 
 **Held-out split (proposal, decided at G2):** test = 24SU (END + SPP); train/val = 19SU, 25BR, 25SU, 26BR. 19SU stays in
 training because its fixed start-line camera is the closest footage to the target.

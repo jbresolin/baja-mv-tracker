@@ -224,6 +224,23 @@ matched GT car), and running counts. The `--condensed` variant keeps only ±4 s 
   * people's shirts printed with numbers (marshals and team members, e.g. "29", "2");
   * a road car in one DIN test (TRAÇÃO tows it).
 
+## Session 2: QA review tool (WP6)
+
+* `tools/qa/` (stdlib server + vanilla-JS page, see `tools/qa/README.md` for the item format WP5 must emit):
+  `make_batch.py` (session-1 test batch), `serve.py` (127.0.0.1, verdicts appended + fsynced to `<batch>.verdicts.jsonl`
+  per keypress, resume on reload), `report.py` (precision / coverage / not-a-car / missed reads with Wilson 95% CIs per event,
+  shot tag or any `meta.<key>`; GT comparison when `meta.hidden.gt_car` exists), `simulate_gt.py` (test harness).
+* Session-1 test batch: 150 of the 241 YOLO-World passes after 09:18:30, stratified by file × read/no-read
+  (35 no-read). Votes reproduce `passes_all.csv` `vlm_car` except one pass: `analyze.py` snaps to the SQL `equipe` table,
+  which includes the test entries 99/100, while the batch snaps to `rosters/26SE.csv` (cars 1–24). Pass 73 of `world_0909`
+  voted "100" (2/10) and becomes "no read" with the roster file.
+* With answers simulated from the GT (and 6 deliberate reviewer mistakes), GT precision of proposed numbers on the sample is
+  96.4% [91–99] (n=112), the report shows the reviewer's 92.0% and lists the 5 false alarms. With n≈110 judged items the
+  Wilson interval is about ±5 points, so ~150 items per event separates "~95%" from "~85%" but not 95% from 98%. Per shot
+  tag the intervals are much wider: stratify with a floor per tag and read the tag rows as rough.
+* Layout checked with headless Edge at 1366×768 and 1100×700 (`msedge --headless=new --screenshot`); keyboard flow tested by
+  dispatching key events into a scratch copy of the page. 10 crops fit a 4×3 / 5×2 grid at laptop size.
+
 ## Session 2: environment, fp16 and throughput on the 2080 Ti (WP0)
 
 Teacher PC (Ryzen 3900X, RTX 2080 Ti 11 GB, Windows 11 / WDDM), torch 2.11 cu128, transformers 5.20.1, ultralytics 8.4.181.
