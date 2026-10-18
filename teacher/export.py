@@ -10,7 +10,7 @@ files) can be redone in seconds with other settings:
             (images are hardlinks into the pool / work dirs, so a rebuild costs no disk).
   qa     -> datasets/_qa/<dataset>_sheet*.jpg: ~50 random training images per dataset with the labels drawn.
 
-usage (repo root, CPU only; CUDA_VISIBLE_DEVICES is forced empty):
+usage (repo root, CPU only; CUDA_VISIBLE_DEVICES is forced to -1, torch is never imported):
   python teacher/export.py pool [id ...] [--workers 3] [--force] [--allow-unlabelled]
   python teacher/export.py build [--val 25SU] [--neg-frac 0.12] [--max-share 0.3] [--tag-share 0.5] [--max-train N]
   python teacher/export.py qa [--n 50]
@@ -59,7 +59,7 @@ import time
 import traceback
 from pathlib import Path
 
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"   # Windows drops empty env vars; -1 hides the GPU
 import cv2  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
@@ -747,10 +747,39 @@ def write_yaml(root, names):
     (root / "data.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def load_qa():
+    """WP6 review verdicts on the WP5 teacher batches (out/qa/<EV>_teacher*.verdicts.jsonl; item_id =
+    <video>:<shot>:<track>; last record per item wins, 'undo' clears it). -> {(video, track): verdict}. Never 26SE."""
+    out = {}
+    for p in sorted((ROOT / "out" / "qa").glob("*_teacher*.verdicts.jsonl")):
+        if p.name.startswith("26SE"):
+            continue
+        last = {}
+        for ln in p.read_text(encoding="utf-8").splitlines():
+            try:
+                r = json.loads(ln)
+            except ValueError:
+                continue
+            last[r["item_id"]] = r.get("verdict")
+        for k, v in last.items():
+            parts = k.split(":")
+            if v and v != "undo" and len(parts) == 3:
+                out[(parts[0], int(parts[2]))] = v
+    return out
+
+
 def build_cars(A, neg_frac, max_share, tag_share, max_train, seed):
     rng = random.Random(seed)
     root = DS / "cars"
     reset_dir(root)
+    QV = load_qa()
+    A = A.copy()
+    tr = A.boxes.map(lambda s: [int(b[4]) for b in json.loads(s)])
+    A["qa_verdicts"] = [",".join(f"{t}:{QV[(v, t)]}" for t in ts if (v, t) in QV) for v, ts in zip(A.video, tr)]
+    bad = A.qa_verdicts.str.contains("not_car")
+    if bad.any():
+        log(f"cars: {int(bad.sum())} pooled frames dropped: a labelled track was judged not_car in QA")
+    A = A[~bad]
     sel = []
     for split in ("train", "val", "test"):
         X = A[A.split == split]
@@ -775,7 +804,7 @@ def build_cars(A, neg_frac, max_share, tag_share, max_train, seed):
         (root / "labels" / r.split / (Path(r.image).stem + ".txt")).write_text("\n".join(lines) + ("\n" if lines else ""))
         recs.append(dict(image=f"images/{r.split}/{r.image}", split=r.split, event=r.event, video=r.video,
                          frame_idx=int(r.frame_idx), pts=float(r.pts), shot_id=int(r.shot_id), tag=r.tag, kind=r.kind,
-                         n_boxes=len(lines), n_interp=int(r.n_interp)))
+                         n_boxes=len(lines), n_interp=int(r.n_interp), qa_verdicts=r.qa_verdicts))
     write_yaml(root, ["car"])
     I = pd.DataFrame(recs)
     I.to_csv(root / "index.csv", index=False)
@@ -901,6 +930,7 @@ def build_digits(sp):
 def build_ids(sp):
     root = DS / "ids"
     reset_dir(root)
+    QV = load_qa()
     recs = []
     for r in select_videos():
         vid = r["id"]
@@ -918,8 +948,9 @@ def build_ids(sp):
         for t in L.itertuples():
             tid = int(t.track_id)
             st = S.status.get(tid, "unres")
-            if st == "bg":
-                continue   # verified not-a-car / ego / graphic: never an identity
+            qv = QV.get((vid, tid))
+            if st == "bg" or qv in ("wrong", "not_car"):
+                continue   # verified not-a-car / ego / graphic, or rejected in QA: never an identity
             g = Cg.get(tid)
             kind = "wp4"
             if g is None or not len(g):
@@ -936,9 +967,9 @@ def build_ids(sp):
                 recs.append(dict(image=rel.as_posix(), split=split, event=r["event"], number=int(t.label),
                                  source=t.source, video=vid, track=tid, shot=int(t.shot_id),
                                  time=round(int(c.frame_idx) / FPS, 2), crop_kind=kind, car_status=st,
-                                 h_px=round(float(c.h_px), 1)))
+                                 h_px=round(float(c.h_px), 1), qa=qv or ""))
     D = pd.DataFrame(recs, columns=["image", "split", "event", "number", "source", "video", "track", "shot", "time",
-                                    "crop_kind", "car_status", "h_px"])
+                                    "crop_kind", "car_status", "h_px", "qa"])
     D.to_csv(root / "labels.csv", index=False)
     return D
 
@@ -1050,7 +1081,13 @@ Rules (details in the `teacher/export.py` docstring):
   picture as background (hard negatives). Overlays are not masked; graphic boxes are simply not labelled.
 * Poison guard: a frame is exported only if every buggy detection >= 0.25 in it is a `car` / `bg` track or is covered by
   a label box (IoU >= 0.5, or >= 80% inside: duplicate / partial box). Unsure / unchecked / in-overlay-but-yes tracks
-  and stray detections block the frame. Transition shots and +-0.5 s around shot boundaries are skipped.
+  and stray detections block the frame. Transition shots and +-0.5 s around shot boundaries are skipped. Unresolved
+  boxes are never grayed out: such frames are dropped. Stricter than the 0.25 rule: detections of unresolved tracks
+  block from conf 0.10, untracked detections from 0.15, and a gap > 0.5 s inside a car track blocks its frames.
+* Test (24SU, all of it) follows exactly the same rules: its labels are teacher labels (verified tracks), not hand
+  labels. `index.csv` column `qa_verdicts` lists WP6 review verdicts (`track:verdict`) of the labelled tracks in a frame
+  when a judged `out/qa/<EV>_teacher*.verdicts.jsonl` exists; frames with a track judged `not_car` are dropped.
+* No 26SE (benchmark) frame is ever exported: only `data/videos.csv` streams are read.
 * Nested label boxes: a box containing >= 2 other label boxes is a group box (dropped); a box inside exactly one
   bigger label box is a partial box (dropped).
 * Sampling: <= 1 positive frame per second per shot (best label confidence in the bin), hard negatives <= 1 per 5 s per
