@@ -1030,3 +1030,8 @@ roster posterior (24SU / 25SU rosters have only 16 cars, 26SE has 24):
   events (1–99). Every val/test number also occurs in train, so the WP10 test scores do not measure unseen numbers. WP10's
   24SU errors were style-driven (outlined, stylised and stencil digits). The existing data cannot fix this: the ids set has
   only 2 numbers more than digits. The fix is a pretrained scene-text recognizer, digit splicing (WP10b) and more events.
+* **Number ceiling of the current footage:** the 5 events' rosters together contain only **59 distinct numbers (1–62)**,
+  and the labels already cover 53 of them. The 6 never labelled are 40, 45, 46, 52, 56 and 62, all BR cars. Holding out
+  25SU (val) and 24SU (test) costs no number variety, because all their numbers also occur in train. 26SE adds none
+  either (1–24). Numbers above 62 never occur in any stream we have, so the recognizer **must** generalise to unseen digit
+  combinations. This is a property of the events, not of the pipeline (user, 2026-10-18: all live streams are in).
