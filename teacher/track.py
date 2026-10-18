@@ -27,7 +27,8 @@ Flags:
                fixed camera returns the surrounding scene is the same (ring correlation high), so it is no graphic.
   in_overlay   >= 50% of the track's detections lie mostly (>= 60% of box area) inside an overlay region that is
                visible at that time (overlays.csv). Null when the video has no overlays yet; `--reflag` fills it later.
-               Regions covering > 40% of the frame (full-screen graphics) are ignored.
+               Regions covering > 6% of the frame and the kinds bracket_or_fullscreen_graphic / inset_or_logo_box
+               (bounding boxes of sparse layouts, mostly live video inside) are ignored.
 
 usage (repo root): python teacher/track.py [id ...] [--force] [--reflag] [--no-people]
 """
@@ -55,10 +56,13 @@ MIN_SIM = 0.15
 MIN_LEN = 3
 SMALL_PX = 60
 LONG_STATIC_S = 20.0
+OVL_MAX_AREA = 0.06    # overlay regions larger than this share of the frame are ignored (WP2 boxes are unions of positions)
+OVL_SKIP_KINDS = {"bracket_or_fullscreen_graphic", "inset_or_logo_box"}
 # screen_fixed
 STATIC_C = 0.012      # centre MAD / frame height
 STATIC_H = 0.04       # relative MAD of box height
 BG_MIN = 10.0         # median |dI| outside the box (gray levels, 192x108, 0.5 s apart); static cameras: 1-8
+BGFIX_S = 10.0        # s; or the same place in >= 2 shots
 BG_RATIO = 1.6        # bg_motion / inbox_change
 RECUR_MIN = 4         # distinct shots
 RECUR_IOU = 0.7
@@ -69,7 +73,9 @@ PERSIST_MIN = 0.2     # share of frames with a car box at the track's place
 PERSIST_SHOT_S = 10.0
 PERSIST_WIN = 10.0
 PERSIST_SHOTS = 3      # distinct shots with the same persistent box
-PLACE_IOU = 0.6       # median-box IoU for "same place" across shots (ego rule)
+PLACE_IOU = 0.85      # median-box IoU for "same place" across shots (ego seeds: the mount is rigid)
+FRAG_IOU = 0.6        # IoU with a flagged ego box of the same shot (ego fragments)
+EGO_PLACE_IOU, EGO_PLACE_SHOTS = 0.7, 5
 BOTTOM = 0.97          # y2 / frame height for 'anchored on the bottom edge'     # s around the track for the local persistence
 SCENE_MIN = 8.0       # inbox_change / bg_motion that counts as 'the scene moves'
 DEC_FPS, DW, DH = 2.0, 192, 108
@@ -391,7 +397,9 @@ def load_overlays(d, W, H):
     o = pd.read_csv(p)
     regs = []
     for r in o.itertuples():
-        if (r.x2 - r.x1) * (r.y2 - r.y1) > 0.4 * W * H:
+        # the region boxes are bounding boxes; for sparse layouts (brackets, picture-in-picture insets, big towers)
+        # most of the box is live video with real cars in it, so only compact graphics count
+        if (r.x2 - r.x1) * (r.y2 - r.y1) > OVL_MAX_AREA * W * H or str(r.kind) in OVL_SKIP_KINDS:
             continue
         iv = []
         for s in str(r.intervals).split(";"):
@@ -438,6 +446,32 @@ def same_place_shots(tr, cand):
     return out
 
 
+def ego_fragments(tr, cand):
+    out = pd.Series(False, index=tr.index)
+    ego = tr[tr.fixed_persistent]
+    for sid, g in tr[cand].groupby("shot_id"):
+        e = ego[ego.shot_id == sid]
+        if e.empty:
+            continue
+        M = iou(g[["x1_med", "y1_med", "x2_med", "y2_med"]].to_numpy(), e[["x1_med", "y1_med", "x2_med", "y2_med"]].to_numpy())
+        out[g.index[M.max(axis=1) >= FRAG_IOU]] = True
+    return out
+
+
+def ego_places(tr, cand):
+    out = pd.Series(False, index=tr.index)
+    ego = tr[tr.fixed_persistent]
+    c = tr[cand]
+    if ego.empty or c.empty:
+        return out
+    M = iou(c[["x1_med", "y1_med", "x2_med", "y2_med"]].to_numpy(),
+            ego[["x1_med", "y1_med", "x2_med", "y2_med"]].to_numpy()) >= EGO_PLACE_IOU
+    sh = ego.shot_id.to_numpy()
+    for j, ix in enumerate(c.index):
+        out[ix] = len(set(sh[M[j]])) >= EGO_PLACE_SHOTS
+    return out
+
+
 def flags(d, tr, feats, sig, regs, shots, H=720):
     tr = tr.merge(feats, on="track_id", how="left")
     car = tr.cls == "buggy"
@@ -452,9 +486,20 @@ def flags(d, tr, feats, sig, regs, shots, H=720):
     cand = car & (tr.pos_persist >= PERSIST_MIN) & (sdur >= PERSIST_SHOT_S) & scene_moves & (tr.y2_med >= BOTTOM * H)
     tr["persist_shots"] = same_place_shots(tr, cand)
     tr["fixed_persistent"] = cand & (tr.persist_shots >= PERSIST_SHOTS)
+    # short / low-persistence fragments of the same ego box: bottom-anchored, scene moving, and at the place of a
+    # flagged ego track of the same shot
+    frag = car & scene_moves & (tr.y2_med >= BOTTOM * H) & ~tr.fixed_persistent
+    tr["fixed_persistent"] |= ego_fragments(tr, frag)
+    # ... and in shots without a flagged ego track (short onboard shots): a big bottom-anchored box at a well-established
+    #    ego place (IoU >= EGO_PLACE_IOU with ego boxes of >= EGO_PLACE_SHOTS distinct shots)
+    tr["fixed_persistent"] |= ego_places(tr, frag & ~tr.fixed_persistent & (tr.h_rel_median >= 0.4))
     # 2) a box that does not move at all while the scene around it moves and its own content does not (graphic)
     moving_bg = (tr.bg_motion >= BG_MIN) & (tr.bg_motion >= BG_RATIO * tr.inbox_change.fillna(0))
-    tr["fixed_bg_moving"] = car & tr.static_box & moving_bg.fillna(False)
+    #    and is not a one-off: same place in >= 2 shots, or >= BGFIX_S long (a PTZ operator following a small far car
+    #    can hold it still on screen for a couple of seconds)
+    cand2 = car & tr.static_box & moving_bg.fillna(False)
+    tr["bgfix_shots"] = same_place_shots(tr, cand2)
+    tr["fixed_bg_moving"] = cand2 & ((tr.bgfix_shots >= 2) | ((tr.t1 - tr.t0) >= BGFIX_S))
     # 3) the same place + look recurring over different scenes in many shots
     tr["recur_shots"] = recurrence(tr, sig)
     tr["fixed_recurrent"] = car & (tr.recur_shots >= RECUR_MIN)

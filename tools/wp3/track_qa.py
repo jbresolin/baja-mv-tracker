@@ -1,7 +1,8 @@
 """WP3 QA: frame strips with car tracks and flags drawn.
 
 usage: python tools/wp3/track_qa.py <video_id> <dets.parquet> <tracks.parquet> <t0> <t1> <out.jpg> [--n=12]
-                                    [--cols=3] [--people]
+                                    [--cols=3] [--people] [--tracks=id,id,...]
+  --tracks: one frame per listed track (its middle detection) instead of the time window.
   n frames evenly spaced in [t0, t1] (seconds, snapped to the 4 fps detection grid).
   Car tracks: red = screen_fixed (P persistent/ego, B static over moving background, R recurrent), magenta =
   in_overlay, orange = small, green = other. Label: track id, flags, conf. Untracked car dets >= 0.25: thin gray.
@@ -34,7 +35,12 @@ def main():
     d = pd.read_parquet(dp)
     tr = pd.read_parquet(tp).set_index("track_id")
     n, cols = arg("n", 12), arg("cols", 3)
-    fis = np.unique(np.round(np.linspace(t0, t1, n) * 4).astype(int))
+    if arg("tracks", ""):  # one frame per listed track: its middle detection (t0/t1 ignored)
+        ids = [int(x) for x in arg("tracks", "").split(",")]
+        cd = d[d.track_id.isin(ids)].sort_values("frame_idx")
+        fis = [int(g.frame_idx.iloc[len(g) // 2]) for _, g in cd.groupby("track_id")]
+    else:
+        fis = np.unique(np.round(np.linspace(t0, t1, n) * 4).astype(int))
     row = select_videos([vid], active_only=False)[0]
     cap = cv2.VideoCapture(str(ROOT / row["path"]))
     tiles = []
@@ -57,13 +63,13 @@ def main():
                 fl += "B"
             if t.get("fixed_recurrent", False):
                 fl += "R"
-            if t.get("in_overlay") is True:
+            if t.get("in_overlay") in (True, 1) and t.get("in_overlay") is not None:
                 fl += "O"
             if t.get("small", False):
                 fl += "s"
             if t.get("nested_in", -1) >= 0:
                 fl += "n"
-            c = COLS["fixed"] if t.get("screen_fixed", False) else COLS["ovl"] if t.get("in_overlay") is True else \
+            c = COLS["fixed"] if t.get("screen_fixed", False) else COLS["ovl"] if t.get("in_overlay") in (True, 1) and t.get("in_overlay") is not None else \
                 COLS["small"] if t.get("small", False) else COLS["ok"]
             if r.cls == "person":
                 c = (255, 200, 0)
