@@ -110,8 +110,10 @@ precision check of the VLM consensus wherever both exist; (3) dataset D (re-ID).
 
 ### WP3 · Car detection + tracking (GPU, teacher stage 1)
 
-- YOLO-World v2-x, prompts `["off-road buggy", "person"]` as in `lapvision/det.py`. Calibration option for G1: extra
-  absorbing classes (`"pickup truck"`, `"ATV"`, `"tractor"`, `"car"`) to cut false positives on pit and service vehicles.
+- **Done** (4.85 GPU-h, 50k car tracks). YOLO-World v2-x, prompts `["off-road buggy", "person"]`. The absorbing classes
+  were tested and rejected: they relabel real buggies as car/pickup/tractor. 1280 px was kept, because 960 loses far cars.
+  Precision at conf ≥ 0.25 is only ~71–83% real cars, so **every track gets a VLM yes/no car check in WP4/WP5**, and the
+  detector dataset is built from verified tracks only.
 - Settings from WP0: fp16, imgsz 1280, batch 8, 4 fps, CPU decode through an ffmpeg `fps=4` pipe.
 - Two steps, so the GPU step doesn't depend on shots: (1) GPU: raw per-frame detections for every video → `dets_raw.parquet`;
   (2) CPU: tracking per shot on the stored detections (ByteTrack or an IoU tracker, `track_buffer` adapted to 4 fps) →
