@@ -1,6 +1,13 @@
 # Training plan: distil a laptop-sized car detector + number reader
 
-Status: **work packages defined, nothing started** (session 2, 2026-10-17). Read `LESSONS.md` first.
+Status (2026-10-18): **teacher done.** WP0–WP6 and WP8 are done (each agent's section in LESSONS.md has the numbers).
+- Labels: 7.4k consensus tracks. VLM vs overlay identity agree 96.9% (DIN/SPP close-ups).
+- Datasets: being re-exported from the final labels. Car set ≈ 45k frames.
+- Waiting on: the user's QA review of `out/qa/<EV>_teacher.jsonl`, and WP9 training on the 2080 Ti.
+- Number boxes exist for only 2.6k of the 7.4k consensus tracks. Plan: train the number-panel student on them, then let it
+  propose boxes for the rest (cheaper than ~5 GPU-h of grounded reads), keeping only boxes whose read matches the consensus.
+
+Read `LESSONS.md` first.
 The previous version of this file (session 1) is merged in here, so nothing from it was dropped.
 
 This file is the brief for every agent. Each work package (WP) states its inputs, outputs and done criteria. Agents
