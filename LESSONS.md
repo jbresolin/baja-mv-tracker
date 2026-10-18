@@ -1035,3 +1035,110 @@ roster posterior (24SU / 25SU rosters have only 16 cars, 26SE has 24):
   25SU (val) and 24SU (test) costs no number variety, because all their numbers also occur in train. 26SE adds none
   either (1–24). Numbers above 62 never occur in any stream we have, so the recognizer **must** generalise to unseen digit
   combinations. This is a property of the events, not of the pipeline (user, 2026-10-18: all live streams are in).
+
+## Session 2: students trained on the GPU (WP9, continued)
+
+Data: `datasets/cars` (final): train 27,455 (6.4% negatives), val 25SU 10,331, test 24SU 8,167 (8,153 after the 24SU QA
+pruning). All runs AMP fp16 on the 2080 Ti, `students/runs/<name>/`. ultralytics writes `labels/*.cache` next to the
+dataset labels (the only write into `datasets/`).
+
+### Calibration and the real training speed (replaces the published-number estimate in the plan above)
+
+* YOLO11n @640, batch 64: **8.3-8.4 GB** torch (9.3 GB with the desktop), fits. Train **3.4 it/s = ~220 img/s** with
+  WP8 using the CPU at the same time (calibration with a lighter CPU load: 4.4 it/s = 280 img/s). GPU utilisation ~75-80%
+  during training, so it is partly **data-loader bound** (8 workers, CPU 60-85% busy). Validation of the 10,331 val
+  images ~37 s. **One epoch = ~165 s**; the estimate (200-250 img/s) was right.
+* YOLO11s @640, batch 32: 7.9 GB, 3.0-4.1 it/s (190-260 img/s), ~260-400 s per epoch depending on the CPU load.
+* Calibration (3 epochs on 25% of train) already reached test mAP50 0.81: the teacher labels are easy to fit.
+
+### cars_n640 (YOLO11n, 640, 100 epochs max, patience 20)
+
+* Early-stopped at epoch 71 (best 51), **3.3 h**. Val (25SU) mAP50 0.846 / mAP50-95 0.660 at best; test (24SU) **mAP50
+  0.924, mAP50-95 0.742** (P 0.912, R 0.853). After the 24SU QA pruning (14 frames with a not_car track dropped):
+  0.924 / 0.742, unchanged (`--test-only`; the pre-pruning numbers are in `eval_test_before_qa_prune.json`). The val
+  mAP dipped in epochs 2-5 (warm-up of a fine-tuned head, SGD lr 0.01 chosen by `optimizer=auto`) and recovered by 8.
+* **26SE, full footage on the GPU (`out/eval_cars_n640/`): 246 passes, recall 0.913, precision 0.935** (YOLO-World
+  0.933 / 0.975). Per file recall 0.97 / 0.81 / 0.875 / 1.00 (YOLO-World 0.97 / 0.87 / 0.875 / 1.00). Borrowed identity:
+  175 read, 93.7% right, end-to-end 65.1% (teacher 67.9%).
+* **Misses: 22, and every lap YOLO-World missed is also missed by the student** (17 shared). The 5 student-only misses
+  (`out/eval_cars_n640/strips/`): 4 are in the **10:24-10:51 overexposed stretch** (nearly white frames; YOLO-World
+  still boxes the car at 0.3-0.9, the student gives nothing above 0.15), and 1 (car 4, 10:55:39) is two cars passing
+  ~1.5 s apart that end up in one pass (the student detected both; a pass-merge case). Washed-out frames are rare in the
+  broadcast training data: an **overexposure augmentation** (gamma / additive brightening + contrast loss) is the
+  obvious next lever. Not added to s640, so that n and s stay comparable.
+* False passes 16 (YOLO-World 6): the same long stationary tracks as the teacher (start of the last file, 09:37,
+  10:20), plus **end-of-race clutter 12:04-12:09** (cars stopped at the line among people: 6) and 0.2-0.4 s blips of
+  6-11 frames (5). A minimum pass duration / frame count would remove the blips; not tuned (26SE is the benchmark).
+* Early check (epoch-32 snapshot, CPU, last file only): 65 passes, recall 0.984, precision 0.954; so 20 more epochs
+  mostly sharpened precision.
+* **Full 26SE evaluation on the GPU took 31 min** (estimate was ~40): timeline 53 img/s on the 4K file and 69-71 img/s on
+  1080p (NVDEC, decode-bound), tracking 50-54 frames/s, tracking windows 1,803 s. CPU only (4 threads, while training
+  ran on the GPU): last file 715 s timeline + 1,050 s tracking, i.e. ~1.9 h for the whole race.
+* CPU latency of the trained model (ONNX, 384x640, 1080p input, CPU loaded by other jobs, high priority): **ONNX 45 ms
+  (1 thread) / 21 ms (4 threads)**, OpenVINO 45 / 20 ms, peak RAM 137-154 MB. Same as the pretrained YOLO11n.
+* Gotcha fixed: `bench_cpu.py` crashed when NMS returned nothing (empty index list became a float array); the bench
+  frame has no car in it, which is fine for latency.
+
+### Number-panel detector (`datasets/numbers_crop`, class `number`, car crops <= 640 px)
+
+Train 3,095 / val 1,118 (25SU) / test 851 (24SU). Known label noise: ~1/3 of crops show a second number without a box,
+which depresses recall and mAP. Crops median ~370-560 px wide; label boxes median 37 px high (val 53), 6.5% < 16 px.
+
+| run | val mAP50 / 50-95 | test mAP50 / 50-95 | epochs (best) | time |
+|---|---|---|---|---|
+| `num_n320` (YOLO11n, 320, batch 128) | 0.743 / 0.351 | 0.542 / 0.203 | 94 (64) | 12 min |
+| `num_n416` (YOLO11n, 416, batch 96) | 0.742 / 0.363 | 0.557 / 0.211 | 101 (71) | 20 min |
+
+* Big val -> test gap, as for the WP10 recognizer (24SU liveries). 416 is not clearly better (+1.5 points), so
+  **`num_n320` is the model** (cheaper per crop).
+* Chain on val, `students/panel_val.py` (400 teacher-labelled 25SU tracks, 4 crops each, recognizer `syn_ft`): the
+  detector threshold matters more than the input size. At conf 0.25, 31% of crops get no box and track top-1 is 75%;
+  **at conf 0.1, 11% of crops get no box and top-1 is 86%** (416: 88%). Extra box padding of 5% per side (on top of the
+  recognizer's own 10%) adds ~1 point; 10% is no better. Picked on val: **conf 0.1, pad 0.05**. The val curve never
+  reaches 97% precision (it tops out at ~95-96%): tau 0.6 71% coverage / 94.4%, **tau 0.8 43% / 95.4%** (chosen = the
+  lowest tau with >= 95% on val), tau 0.9 39% / 95.5%. With the grounded boxes WP10 had 98.6% at 73%, so the detector's
+  boxes cost ~4 points of precision at the same coverage.
+* What it gets wrong (val sheet `students/runs/num_n320/panel_val_sheet.jpg`): it **fires on numbers printed on people's
+  shirts** ("96", "153") inside car crops, and misses some large clear numbers (car 7 side panel, car 14, car 9 rear),
+  i.e. the missing-box label noise shows up as missed recall. No broadcast-graphic hits in that sample.
+* CPU cost per car crop at 320 (ONNX, loaded CPU): **30 ms (1 thread) / 19 ms (4 threads)**, OpenVINO 35 / 20 ms, RAM
+  ~110-140 MB. Ten crops per pass is ~0.3 s on one thread; fine for lap counting.
+
+### 26SE identity chain: car crops -> num_n320 -> recognizer -> vote (evaluation only)
+
+`students/panel_boxes.py` (boxes at conf 0.1, pad 0.05, on exactly the harness's crops) -> `students/recog/harness_26se.py
+--mode panels --boxes ... --tau 0.8`. 235 passes with a GT car, 252 laps; outputs `out/eval_recog_syn_ft_panels[_all]/`.
+
+| crops per pass | tau | coverage | precision | end-to-end (of 252 laps) |
+|---|---|---|---|---|
+| the 10 VLM crops | 0 (no abstain) | 100% | 62.6% | 58.3% |
+| the 10 VLM crops | **0.8 (val)** | 28% | **95.5%** | 25.0% |
+| all crops (<= 30) | 0 | 100% | 66.8% | 62.3% |
+| all crops (<= 30) | 0.8 (val) | 16% | 100% | 15.1% |
+| all crops (<= 30) | 0.3 (info only) | 51% | 98.3% | 46.4% |
+| VLM teacher (10 crops) | - | 77% | 94.0% | 67.9% |
+
+* With no abstention the chain is close to the teacher's end-to-end (62% vs 68%), but its confidence is weak: at the
+  val-picked tau it answers only 16-28% of passes. **tau does not transfer between crop counts**: the track score is
+  the mean over crops of the per-crop max posterior, and crops with no box add zeros, so 30 crops per pass score lower
+  than the 4 crops per track of the val run (at 30 crops, tau 0.3-0.5 already gives 98-100%). Fix for WP10: vote over
+  crops that have a box (or weight by box count), and pick tau on val with the same number of crops per track as
+  deployment. Not tuned here on 26SE.
+
+### Second-round box proposals (report only, `students/panel_propose.py`)
+
+On the crops of teacher-labelled tracks of the **train** events (19SU, 25BR, 26BR) that have no grounded box: num_n320
+at conf 0.1, boxes >= 16 px, recognizer read == track consensus with P >= 0.5. **29,756 crops -> 47,041 boxes proposed
+-> 32,425 accepted on 21,698 crops of 4,318 / 4,715 tracks** (4,888 dropped as < 16 px). That is ~9x the current
+3.5 k train boxes. Caveat: it only adds boxes the current detector already finds and the recognizer can read (easy
+panels); the hard ones (missed panels, unreadable liveries) stay missing. `out/panel_proposals_num_n320.csv`.
+
+### Comparison table (filled so far)
+
+| detector | input | 24SU test mAP50 / 50-95 vs teacher labels | 26SE passes | recall | precision | false passes | end-to-end (borrowed ids) | CPU ms ORT 1 / 4 thr (384x640) |
+|---|---|---|---|---|---|---|---|---|
+| YOLO-World v2-x (teacher) | 1280 | reference | 241 | 0.933 | 0.975 | 6 | 67.9% | GPU only |
+| COCO YOLO11x | 1280 | - | 230 | 0.869 | 0.952 | 11 | 62.7% (own VLM) | - |
+| COCO YOLO11n, untrained (11-09-03 only) | 1280 | - | 15 (24 laps) | 0.58 | 0.93 | 1 | - | 50 / 22 |
+| **student YOLO11n (`cars_n640`)** | 640 | **0.924 / 0.742** | 246 | **0.913** | 0.935 | 16 | 65.1% | **45 / 21** |
+| student YOLO11s (`cars_s640`) | 640 | (training) | | | | | | 135 / 49 (pretrained) |

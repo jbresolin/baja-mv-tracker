@@ -76,7 +76,7 @@ def postprocess(y, conf=0.25, iou=0.7):
     b, s, cls = p[k, :4], s[k], cls[k]
     xywh = np.c_[b[:, 0] - b[:, 2] / 2, b[:, 1] - b[:, 3] / 2, b[:, 2], b[:, 3]]
     idx = cv2.dnn.NMSBoxes(xywh.tolist(), s.tolist(), conf, iou) if len(s) else []
-    idx = np.array(idx).reshape(-1)
+    idx = np.array(idx, dtype=int).reshape(-1)
     return xywh[idx], s[idx], cls[idx]
 
 
@@ -150,9 +150,15 @@ def worker(fmt, path, threads, imgsz, n, warm, frame_path, priority="normal"):
                 model_delta_mb=round((peak - base) / 2**20), base_mb=round(base / 2**20))
 
 
+def model_name(weights):
+    """'students/runs/cars_n640/weights/best.pt' -> 'cars_n640_best'; 'weights/yolo11n.pt' -> 'yolo11n'."""
+    w = Path(weights)
+    return "%s_%s" % (w.parent.parent.name, w.stem) if w.stem in ("best", "last") else w.stem
+
+
 def export(weights, imgsz, formats):
     from ultralytics import YOLO
-    d = BENCH / Path(weights).stem / str(imgsz)
+    d = BENCH / model_name(weights) / str(imgsz)
     imgsz = list(hw(imgsz))
     d.mkdir(parents=True, exist_ok=True)
     w = d / Path(weights).name
@@ -228,7 +234,7 @@ def main():
     except ImportError:
         cpu = {}
     res = dict(weights=str(a.weights), imgsz=a.imgsz, when=time.strftime("%Y-%m-%d %H:%M:%S"), **cpu, results=rows)
-    out = BENCH / ("%s_%s_%s.json" % (Path(a.weights).stem, a.imgsz, a.priority))
+    out = BENCH / ("%s_%s_%s.json" % (model_name(a.weights), a.imgsz, a.priority))
     out.write_text(json.dumps(res, indent=1))
     import pandas as pd
     print(pd.DataFrame(rows)[["format", "threads", "pre_ms", "inf_ms", "post_ms", "total_ms", "total_p90_ms",
