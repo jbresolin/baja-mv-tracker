@@ -20,11 +20,19 @@ every track, how much the picture changes outside its box (bg_motion, i.e. camer
 
 Flags:
   small        median box height < SMALL_PX source pixels (detector data only, no number reading).
-  screen_fixed box static in screen coordinates (centre MAD and height spread tiny) while the scene behind it moves
-               (bg_motion high and >> inbox_change), OR the same static box (same place, same look) recurs in
-               >= RECUR_MIN different shots over different scene content (graphic / logo / onboard ego car).
-               A parked car in a static shot is NOT flagged: the background does not move there, and when the same
-               fixed camera returns the surrounding scene is the same (ring correlation high), so it is no graphic.
+  screen_fixed = fixed_persistent | fixed_bg_moving | fixed_recurrent (cars only):
+    fixed_persistent  onboard ego car. Seeds: big bottom-anchored box (y2 >= BOTTOM*H) while the scene moves, at the same
+                      place in >= PERSIST_MIN of the frames of its shot (or of +-PERSIST_WIN s), shot >= PERSIST_SHOT_S,
+                      and the same place (IoU >= PLACE_IOU) + look (patch NCC >= PERSIST_LOOK) in >= PERSIST_SHOTS-1
+                      other shots (the mount is rigid; handheld / PTZ close-ups of real cars fail the look test).
+                      Then propagated to other bottom-anchored fragments of the same shot (IoU >= FRAG_IOU with a seed)
+                      and to big bottom-anchored boxes at an established ego place (EGO_PLACE_IOU, EGO_PLACE_SHOTS).
+    fixed_bg_moving   static box (centre MAD <= STATIC_C*H, height MAD <= STATIC_H) while bg_motion >= BG_MIN and
+                      >= BG_RATIO * inbox_change (graphic over moving video), at the same place in >= 2 shots or for
+                      >= BGFIX_S (a PTZ operator can hold a small far car still for a few seconds).
+    fixed_recurrent   the same static place + look in >= RECUR_MIN shots, counting only instances whose surroundings move.
+    A parked car under a static camera is NOT flagged (bg_motion of static cameras is 1-8); `long_static` marks it.
+  long_static  (info) static box for >= LONG_STATIC_S: parked cars, parked road vehicles, props under a fixed camera.
   in_overlay   >= 50% of the track's detections lie mostly (>= 60% of box area) inside an overlay region that is
                visible at that time (overlays.csv). Null when the video has no overlays yet; `--reflag` fills it later.
                Regions covering > 6% of the frame and the kinds bracket_or_fullscreen_graphic / inset_or_logo_box
@@ -72,6 +80,7 @@ PERSIST_IOU = 0.7
 PERSIST_MIN = 0.2     # share of frames with a car box at the track's place
 PERSIST_SHOT_S = 10.0
 PERSIST_WIN = 10.0
+PERSIST_LOOK = 0.3     # patch NCC for 'looks the same' (ego seeds)
 PERSIST_SHOTS = 3      # distinct shots with the same persistent box
 PLACE_IOU = 0.85      # median-box IoU for "same place" across shots (ego seeds: the mount is rigid)
 FRAG_IOU = 0.6        # IoU with a flagged ego box of the same shot (ego fragments)
@@ -433,6 +442,22 @@ def overlay_flag(d, tr, regs):
     return (s >= 0.5).astype(object), s
 
 
+def same_place_look(tr, cand, sig):
+    """Number of other shots with a candidate at the same place (IoU >= PLACE_IOU) that also looks the same (12x12 patch
+    NCC >= PERSIST_LOOK). The ego car looks the same shot after shot (helmet, cage: median NCC ~0.45 on 26BR_END);
+    handheld / PTZ close-ups of different cars that fill the frame the same way do not (~0.07 on 25BR_END)."""
+    out = pd.Series(0, index=tr.index, dtype=np.int64)
+    c = tr[cand & tr.track_id.isin(list(sig))]
+    if len(c) < 2:
+        return out
+    M = iou(*(2 * [c[["x1_med", "y1_med", "x2_med", "y2_med"]].to_numpy()])) >= PLACE_IOU
+    ids, sh = c.track_id.to_numpy(), c.shot_id.to_numpy()
+    for a, ix in enumerate(c.index):
+        ok = {sh[b] for b in np.flatnonzero(M[a] & (sh != sh[a])) if _ncc(sig[ids[a]][0], sig[ids[b]][0]) >= PERSIST_LOOK}
+        out[ix] = len(ok)
+    return out
+
+
 def same_place_shots(tr, cand):
     """For each candidate track: number of distinct shots with a candidate track at the same place (median IoU)."""
     out = pd.Series(0, index=tr.index, dtype=np.int64)
@@ -485,7 +510,8 @@ def flags(d, tr, feats, sig, regs, shots, H=720):
     #    a big bottom-anchored box for a while, but not at the same place shot after shot)
     cand = car & (tr.pos_persist >= PERSIST_MIN) & (sdur >= PERSIST_SHOT_S) & scene_moves & (tr.y2_med >= BOTTOM * H)
     tr["persist_shots"] = same_place_shots(tr, cand)
-    tr["fixed_persistent"] = cand & (tr.persist_shots >= PERSIST_SHOTS)
+    tr["persist_look_shots"] = same_place_look(tr, cand, sig)
+    tr["fixed_persistent"] = cand & (tr.persist_look_shots >= PERSIST_SHOTS - 1)
     # short / low-persistence fragments of the same ego box: bottom-anchored, scene moving, and at the place of a
     # flagged ego track of the same shot
     frag = car & scene_moves & (tr.y2_med >= BOTTOM * H) & ~tr.fixed_persistent
