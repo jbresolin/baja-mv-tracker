@@ -1,0 +1,14 @@
+# Python 3.13. Install torch first from the CUDA index matching the GPU, e.g.:
+#   pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu128
+# (cu128 wheels cover Turing/RTX 2080 Ti (sm_75) through Blackwell/RTX 5080 (sm_120).)
+ultralytics==8.4.181
+clip @ git+https://github.com/ultralytics/CLIP.git   # needed by YOLO-World set_classes()
+transformers==5.20.1
+accelerate==1.15.0
+easyocr==1.7.2
+opencv-python
+numpy==2.5.2
+pandas==3.0.6
+pillow==12.3.0
+lap==0.5.13
+# external tools on PATH: ffmpeg/ffprobe (NVDEC/NVENC build), yt-dlp (for the stream downloads)

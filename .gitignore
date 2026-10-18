@@ -1,0 +1,16 @@
+# media and generated data
+*.mkv
+*.mp4
+*.webm
+*.pt
+youtube/
+out/
+work/
+datasets/
+students/runs/
+# environments
+.venv/
+.venv_old/
+__pycache__/
+*.pyc
+PAUSE
