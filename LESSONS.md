@@ -876,3 +876,27 @@ QA batches: `out/qa/<EV>_teacher.jsonl`.
 * Reads exist only for crops ≥ 100 px (plus the calibration sample at 60–100 px); `small` tracks have no identity.
 * Fragmented tracks of one car vote separately; merging by identity per shot (a WP3 open problem) would raise coverage.
   Overlay identities are few (≈ 140 tracks). The 26BR originals (Takeout) will need a full re-run (track ids differ).
+
+## Session 2: dataset export (WP8), final run on the final labels
+
+Update to the WP8 section above (which describes the provisional run on `car_verified`; its counts are superseded here).
+
+* Positive rule is now WP5's **`is_car`**: a roster-number consensus or an overlay agreement overrides the VLM car-check
+  misses. The remaining VLM 'no' with conf_median ≥ 0.5 stays unresolved (blocks the frame), unsure stays unresolved,
+  and `sf_effective` replaces `screen_fixed`. 1,176 of 26BR_END's 5,192 car tracks are cars through an identity.
+* **datasets/cars is final** (POOL_VERSION 7). Images train / val / test: 27,455 / 10,331 / 8,167 (previous build
+  26,837 / 9,981 / 7,985). Boxes: 45,103 / 14,584 / 14,931. Negative share: 6.4% / 6.0% / 2.7%. QA on 54 random train
+  frames (90 boxes): all aligned, no clearly unlabelled car, ~2 unclear small objects, 1 doubtful box (a foreground
+  vehicle). `build --only numbers,digits,ids` leaves `datasets/cars` untouched.
+* **numbers_crop:** 5,064 crops (train 3,095 / val 1,118 / test 851) with 5,819 boxes on 2,607 tracks.
+  **numbers_full:** 1,221 frames (730 / 347 / 144) with 1,505 number boxes. Only ~25% of the frames that hold a grounded
+  crop pass both the car guard and the "every other labelled car ≥ 60 px also has number boxes" rule. Label noise seen
+  in QA: roughly a third of the crops show a second number of the same car (side plate / nose) without a box. Cars
+  shown on a studio TV screen are labelled (car + number) in a few DIN frames.
+* **digits:** 5,819 crops, 51 distinct numbers. Number-box height (stored-crop px) is 5/25/50/75/95% = 16 / 26 / 40 /
+  57 / 86. **Boxes < 16 px (284, 4.9%) go to `images/tiny/<split>/`** (bucket = tiny); trainable: 3,503 / 1,178 / 861.
+  **Leading zeros:** side plates show "06" while the consensus is 6. 11.7% of the grounded reads start with "0", so
+  `labels.csv` has `text_read` (the grounded string) next to `text`; they differ beyond leading zeros on only 2 crops.
+  QA on 50 trainable crops: none clearly wrong, ~5 too blurred to read. 24% of the digit crops come from crops that
+  were downscaled to ≤ 640 px (big cars), so they could be re-cut at native resolution if that ever matters.
+* ids: 52.8k crops, 7,440 tracks, 133 identities.

@@ -13,6 +13,7 @@ files) can be redone in seconds with other settings:
 usage (repo root, CPU only; CUDA_VISIBLE_DEVICES is forced to -1, torch is never imported):
   python teacher/export.py pool [id ...] [--workers 3] [--force] [--allow-unlabelled]
   python teacher/export.py build [--val 25SU] [--neg-frac 0.12] [--max-share 0.3] [--tag-share 0.5] [--max-train N]
+                                 [--only cars,numbers,digits,ids]   (the others stay untouched on disk)
   python teacher/export.py qa [--n 50]
   python teacher/export.py all [--workers 3] [...]           (pool + build + qa)
 
@@ -20,7 +21,9 @@ Track status (car tracks of tracks.parquet; labels.parquet from WP5 when present
   bg    ego residue, screen_fixed with a bottom-anchored median box (onboard ego car) or inside an overlay region
         (graphic), or car_verified == 'no': never labelled, does not block the frame (stays in the picture as
         background). Other screen_fixed tracks are unres: WP3's rule also fires on real cars held still in frame.
-  car   car_verified == 'yes' and not in_overlay (in_overlay & yes -> unres: the corner logo has a buggy drawing).
+  car   is_car == 'yes' (WP5: car_verified, overruled to yes by a roster-number consensus / overlay agreement) and not
+        in_overlay unless the yes comes from an identity (in_overlay & VLM yes -> unres: the logo has a buggy drawing).
+        Labels without is_car fall back to car_verified.
   unres car_verified == 'unsure', or not checked, or anything else -> a frame where such a box (conf >= 0.25) is
         visible is not exported.
   Fallback when the video has no verification yet (labels.parquet without car_verified, or verify.done missing):
@@ -68,7 +71,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import DATA, ROOT, select_videos, wdir  # noqa: E402
 from detect import frame_pipe  # noqa: E402  (the exact decode detect.py used; frame k of the pipe = frame_idx k)
 
-POOL_VERSION = 6        # bump when the pool rules change: every video is redone on the next `pool`
+POOL_VERSION = 7        # bump when the pool rules change: every video is redone on the next `pool`
 DS = ROOT / "datasets"
 POOL = DS / "_pool"
 STATE = DS / "_state"
@@ -98,6 +101,7 @@ EGO_H = 0.8
 EGO_Y2 = 0.95           # screen_fixed tracks whose median box bottom is this low are the onboard ego car
 NUM_MIN_CAR_H = 60      # numbers_full: other labelled cars at least this tall must have number boxes too
 DIGIT_PAD = 0.10
+DIGIT_MIN_H = 16        # number boxes shorter than this (stored-crop px) go to digits/images/tiny/<split>/
 ID_SOURCES = ("both-agree", "vlm", "overlay", "heat-vlm-weak")
 DEFAULT_VAL = ("25SU",)
 TAG_CAP_EXEMPT = {"track_wide"}   # the target domain (fixed trackside camera) is never cut by the tag cap
@@ -139,8 +143,20 @@ def track_status(d, row):
         ego = set(L.index[L.ego_residue.astype(bool)])
     else:
         ego = ego_residue(d, tr, row["height"])
-    cv = L.car_verified.reindex(car.track_id) if L is not None and "car_verified" in L.columns else None
+    # positive rule: WP5's is_car (= car_verified overruled to yes by a roster-number consensus / overlay agreement, no
+    # for screen_fixed / ego); older labels without it: car_verified
+    col = "is_car" if L is not None and "is_car" in L.columns else (
+        "car_verified" if L is not None and "car_verified" in L.columns else None)
+    cv = L[col].reindex(car.track_id).replace({"unchecked": None}) if col else None
     verified_video = (d / "verify.done").exists() and cv is not None and cv.isin(["yes", "unsure"]).any()
+    if L is not None and "sf_effective" in L.columns:
+        sfe = L.sf_effective.reindex(car.track_id).fillna(False).astype(bool).to_numpy()
+    else:
+        sfe = car.screen_fixed.astype(bool).to_numpy()
+    idyes = np.zeros(len(car), bool)
+    if L is not None and "vlm_consensus" in L.columns:
+        idyes = (L.vlm_consensus.reindex(car.track_id).fillna(False).astype(bool)
+                 | L.source.reindex(car.track_id).eq("both-agree")).to_numpy()
     lab = L.label.reindex(car.track_id) if L is not None else pd.Series(pd.NA, index=car.track_id)
     src = L.source.reindex(car.track_id) if L is not None else pd.Series(None, index=car.track_id, dtype=object)
     io = car.in_overlay.map(lambda v: bool(v) if v is not None and v == v else False).to_numpy(bool)
@@ -152,9 +168,10 @@ def track_status(d, row):
         has_lab = not pd.isna(lab.iloc[i])
         if tid in ego:
             st, why = "bg", "ego_residue"
-        elif bool(r.screen_fixed):
+        elif sfe[i]:
             # WP3's screen_fixed has false positives on real cars (a car held in frame by the PTZ / onboard). Only the
             # ego car (bottom-anchored) and graphics (inside an overlay region) are safe background; others block.
+            # (sf_effective: screen_fixed tracks the VLM re-checked as a car are no longer flagged.)
             if r.y2_med >= EGO_Y2 * row["height"]:
                 st, why = "bg", "screen_fixed_ego"
             elif io[i]:
@@ -163,10 +180,13 @@ def track_status(d, row):
                 st, why = "unres", "screen_fixed_other"
         elif v == "no" and r.conf_median >= NO_CONFLICT_CONF:
             # detector confident, VLM says no: on the eye-labelled set (work/verify_val) all 8 such tracks with
-            # conf_median >= 0.6 were real cars (occluded / odd views), 2 of 4 at 0.5-0.6. Conflict -> unresolved.
+            # conf_median >= 0.6 were real cars (occluded / odd views), 2 of 4 at 0.5-0.6; after WP5's 3-crop recheck
+            # the remaining 'no' are still ~half real cars. Conflict -> unresolved.
             st, why = "unres", "verified_no_conflict"
         elif v == "no":
             st, why = "bg", "verified_no"
+        elif v == "yes" and idyes[i]:
+            st, why = "car", "identity_yes"     # roster-number consensus / overlay agreement: a Baja car
         elif v == "yes":
             st, why = ("unres", "overlay_yes") if io[i] else ("car", "verified_yes")
         elif v == "unsure":
@@ -903,6 +923,18 @@ def build_digits(sp):
             continue
         split = sp.get(r["event"], "train")
         C = pd.read_parquet(d / "crops.parquet").set_index("path")
+        # the grounded read's own string per box ("06" where the plate shows a leading zero; text = the integer)
+        G = pd.read_parquet(d / "grounded.parquet") if (d / "grounded.parquet").exists() else None
+        gl = {g.path: json.loads(g.boxes) for g in G.itertuples()} if G is not None else {}
+
+        def read_text(path, box):
+            best, txt = 1e9, ""
+            for e in gl.get(path, []):
+                if len(e) == 5:
+                    dd = sum(abs(float(a) - float(b)) for a, b in zip(e[1:], box))
+                    if dd < best:
+                        best, txt = dd, str(e[0])
+            return txt if best < 4 else ""
         for t in L.itertuples():
             if pd.isna(t.label) or not t.number_boxes or t.number_boxes == "{}":
                 continue
@@ -920,14 +952,18 @@ def build_digits(sp):
                     if c - a < 4 or e - b < 4:
                         continue
                     name = f"{vid}_{Path(p).stem}_n{k}.jpg"
-                    (root / "images" / split).mkdir(parents=True, exist_ok=True)
-                    cv2.imwrite(str(root / "images" / split / name), im[b:e, a:c], [cv2.IMWRITE_JPEG_QUALITY, 95])
-                    recs.append(dict(image=f"images/{split}/{name}", text=str(int(t.label)), split=split,
+                    bh = float(y2 - y1)
+                    bucket = "ok" if bh >= DIGIT_MIN_H else "tiny"
+                    rel = Path("images") / (split if bucket == "ok" else f"tiny/{split}") / name
+                    (root / rel).parent.mkdir(parents=True, exist_ok=True)
+                    cv2.imwrite(str(root / rel), im[b:e, a:c], [cv2.IMWRITE_JPEG_QUALITY, 95])
+                    recs.append(dict(image=rel.as_posix(), text=str(int(t.label)),
+                                     text_read=read_text(p, (x1, y1, x2, y2)), split=split, bucket=bucket,
                                      event=r["event"], video=vid, track_id=int(t.track_id),
                                      frame_idx=int(C.loc[p, "frame_idx"]), source=t.source, w=c - a, h=e - b,
-                                     crop_scale=round(float(C.loc[p, "scale"]), 3)))
-    D = pd.DataFrame(recs, columns=["image", "text", "split", "event", "video", "track_id", "frame_idx", "source", "w",
-                                    "h", "crop_scale"])
+                                     box_h=round(bh, 1), crop_scale=round(float(C.loc[p, "scale"]), 3)))
+    D = pd.DataFrame(recs, columns=["image", "text", "text_read", "split", "bucket", "event", "video", "track_id", "frame_idx",
+                                    "source", "w", "h", "box_h", "crop_scale"])
     D.to_csv(root / "labels.csv", index=False)
     return D
 
@@ -983,13 +1019,28 @@ def du(p):
     return sum(f.stat().st_size for f in p.rglob("*") if f.is_file()) if p.exists() else 0
 
 
-def build(val_events=DEFAULT_VAL, neg_frac=0.12, max_share=0.3, tag_share=0.5, max_train=0, seed=0):
+def build(val_events=DEFAULT_VAL, neg_frac=0.12, max_share=0.3, tag_share=0.5, max_train=0, seed=0, only=None):
+    """only: subset of {cars, numbers, digits, ids}; the others are left on disk untouched (their stats are read back)."""
+    only = set(only or ("cars", "numbers", "digits", "ids"))
     sp = splits_of(set(val_events))
     A, infos = load_pools(sp)
-    I, Hd = build_cars(A, neg_frac, max_share, tag_share, max_train, seed)
-    NS = build_numbers(A, sp, seed)
-    DG = build_digits(sp)
-    ID = build_ids(sp)
+    if "cars" in only:
+        I, Hd = build_cars(A, neg_frac, max_share, tag_share, max_train, seed)
+    else:
+        I = pd.read_csv(DS / "cars" / "index.csv")
+        X = I[I.kind == "pos"].merge(A[["video", "frame_idx", "boxes", "H"]], on=["video", "frame_idx"], how="left")
+        Hd = pd.DataFrame([(r.split, (min(b[3], r.H) - max(b[1], 0)) / r.H) for r in X.itertuples()
+                           if isinstance(r.boxes, str) for b in json.loads(r.boxes)], columns=["split", "h"])
+        Hd["bin"] = pd.cut(Hd.h, HBINS).astype(str)
+    empty = {"numbers_crop": pd.DataFrame(columns=["split", "track_id", "video", "n_boxes"]),
+             "numbers_full": pd.DataFrame(columns=["split", "n_numbers"])}
+    if "numbers" in only:
+        NS = build_numbers(A, sp, seed)
+    else:
+        NS = {k: (pd.read_csv(DS / k / "index.csv") if (DS / k / "index.csv").exists() and
+                  (DS / k / "index.csv").stat().st_size > 5 else v) for k, v in empty.items()}
+    DG = build_digits(sp) if "digits" in only else pd.read_csv(DS / "digits" / "labels.csv")
+    ID = build_ids(sp) if "ids" in only else pd.read_csv(DS / "ids" / "labels.csv")
     st = dict(splits=sp, val_events=list(val_events), neg_frac=neg_frac, max_share=max_share, tag_share=tag_share,
               max_train=max_train, videos=infos)
     st["cars"] = dict(
@@ -1007,7 +1058,10 @@ def build(val_events=DEFAULT_VAL, neg_frac=0.12, max_share=0.3, tag_share=0.5, m
                               boxes=int(NC.n_boxes.sum()) if len(NC) else 0)
     st["numbers_full"] = dict(images=NF.groupby("split").size().to_dict() if len(NF) else {},
                               numbers=int(NF.n_numbers.sum()) if len(NF) else 0)
-    st["digits"] = dict(images=DG.groupby("split").size().to_dict() if len(DG) else {},
+    st["digits"] = dict(images=DG.groupby(["split", "bucket"]).size().unstack(fill_value=0).to_dict("index")
+                        if len(DG) and "bucket" in DG else {},
+                        box_h_quantiles=[round(float(x), 1) for x in DG.box_h.quantile([0.05, 0.25, 0.5, 0.75, 0.95])]
+                        if len(DG) and "box_h" in DG else [],
                         strings=int(DG.text.nunique()) if len(DG) else 0,
                         h_quantiles=[int(x) for x in DG.h.quantile([0.05, 0.5, 0.95])] if len(DG) else [])
     st["ids"] = dict(images=ID.groupby("split").size().to_dict() if len(ID) else {},
@@ -1135,8 +1189,13 @@ Quantiles (5/25/50/75/95%): {st['cars']['box_h_quantiles']}
 
 ## C. digits (`digits/images/<split>/*.jpg` + `digits/labels.csv`)
 
-Number-box crops (+10% padding, cut from the stored crop) with `text` = the track's consensus number. Images:
-{st['digits']['images']}, distinct strings: {st['digits']['strings']}, height px (5/50/95%): {st['digits']['h_quantiles']}.
+Number-box crops (+10% padding, cut from the stored crop) with `text` = the track's consensus number. Number boxes
+shorter than {DIGIT_MIN_H} px (stored-crop pixels) are unreadable at that size and go to `images/tiny/<split>/`
+(`bucket` = tiny in labels.csv): keep them out of training or use them only as a hard bucket. `text_read` = the
+grounded read's own string for that box: side plates often show a leading zero ("06") that `text` (the integer
+consensus) drops, so a recognizer should be trained on `text_read` when it equals `text` up to leading zeros. Images per split and
+bucket: {st['digits']['images']}, distinct strings: {st['digits']['strings']}, number-box height px (5/25/50/75/95%):
+{st['digits'].get('box_h_quantiles')}, crop height px (5/50/95%): {st['digits']['h_quantiles']}.
 
 ## D. ids (`ids/images/<split>/<event>/<number>/*.jpg` + `ids/labels.csv`)
 
@@ -1244,6 +1303,8 @@ def qa(n=50, seed=1):
         if not len(I):
             continue
         I = I[I.split == "train"] if (I.split == "train").any() else I
+        if "bucket" in I.columns:
+            I = I[I.bucket == "ok"]
         pick = I.sample(min(n, len(I)), random_state=seed)
         tiles = []
         for r in pick.itertuples():
@@ -1279,6 +1340,7 @@ def main(argv):
     max_share = opt("--max-share", 0.3, float)
     tag_share = opt("--tag-share", 0.5, float)
     max_train = opt("--max-train", 0, int)
+    only = opt("--only", "cars,numbers,digits,ids")
     n = opt("--n", 50, int)
     force = "--force" in a
     allow = "--allow-unlabelled" in a
@@ -1286,7 +1348,8 @@ def main(argv):
     if mode in ("pool", "all"):
         pool(ids, workers, force, allow)
     if mode in ("build", "all"):
-        build(tuple(x for x in val.split(",") if x), neg_frac, max_share, tag_share, max_train)
+        build(tuple(x for x in val.split(",") if x), neg_frac, max_share, tag_share, max_train,
+              only=[x for x in only.split(",") if x])
     if mode in ("qa", "all"):
         qa(n)
     return 0
