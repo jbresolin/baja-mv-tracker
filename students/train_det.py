@@ -81,26 +81,52 @@ class Degrade:
         return labels
 
 
+class Washout:
+    """Over-exposure: optional brightening gamma, then a blend towards white (contrast loss), then partial desaturation.
+    Targets the washed-out fixed-camera look (26SE 10:24-10:51: mean luminance ~235, 5th percentile ~160), which never
+    occurs in the broadcast training frames (3,000 train frames: 5th-percentile luminance <= 91 in 99%, never > 120)."""
+
+    def __init__(self, p):
+        self.p = p
+
+    def __call__(self, labels):
+        if random.random() >= self.p:
+            return labels
+        img = labels["img"].astype(np.float32) / 255.0
+        img = img ** random.uniform(0.5, 1.0)
+        a = random.uniform(0.4, 0.85)
+        img = img * (1 - a) + a
+        g = img.mean(2, keepdims=True)
+        sat = random.uniform(0.3, 1.0)
+        img = g + (img - g) * sat
+        labels["img"] = np.ascontiguousarray(np.clip(img * 255.0, 0, 255).astype(np.uint8))
+        return labels
+
+
 class DegradeDataset(YOLODataset):
     """YOLODataset whose transforms always end with Degrade before Format. Overriding build_transforms (instead of
     inserting once) keeps it after close_mosaic rebuilds the pipeline; module-level so Windows spawn workers can
     unpickle it."""
     degrade_p = 0.0
+    washout_p = 0.0
 
     def build_transforms(self, hyp=None):
         t = super().build_transforms(hyp)
+        if self.augment and self.washout_p > 0:
+            t.insert(-1, Washout(self.washout_p))  # before Format (numpy -> tensor)
         if self.augment and self.degrade_p > 0:
-            t.insert(-1, Degrade(self.degrade_p))  # before Format (numpy -> tensor)
+            t.insert(-1, Degrade(self.degrade_p))
         return t
 
 
-def make_trainer(degrade_p):
+def make_trainer(degrade_p, washout_p=0.0):
     class StudentTrainer(DetectionTrainer):
         def build_dataset(self, img_path, mode="train", batch=None):
             ds = super().build_dataset(img_path, mode, batch)
-            if mode == "train" and degrade_p > 0 and type(ds) is YOLODataset:
+            if mode == "train" and (degrade_p > 0 or washout_p > 0) and type(ds) is YOLODataset:
                 ds.__class__ = DegradeDataset
                 ds.degrade_p = degrade_p
+                ds.washout_p = washout_p
                 ds.transforms = ds.build_transforms(self.args)
             return ds
 
@@ -148,6 +174,8 @@ def main():
     ap.add_argument("--cache", default="false", choices=["false", "ram", "disk"])
     ap.add_argument("--fraction", type=float, default=1.0, help="train subset (fraction, or count if > 1)")
     ap.add_argument("--degrade", type=float, default=DEGRADE_P, help="probability of the blur/JPEG transform")
+    ap.add_argument("--washout", type=float, default=0.0,
+                    help="probability of the over-exposure transform (0 = off, as cars_n640 / cars_s640)")
     ap.add_argument("--cos-lr", action="store_true")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--resume", action="store_true", help="resume students/runs/<name>/weights/last.pt")
@@ -160,7 +188,7 @@ def main():
     from ultralytics import YOLO
 
     run_dir = RUNS / a.name
-    trainer = make_trainer(a.degrade)
+    trainer = make_trainer(a.degrade, a.washout)
     if a.test_only:
         dev = a.device if a.device is not None else ("0" if torch.cuda.device_count() > 0 else "cpu")
         test_eval(run_dir / "weights" / "best.pt", Path(a.data).resolve(), a.imgsz, dev, run_dir)
@@ -169,6 +197,10 @@ def main():
         last = run_dir / "weights" / "last.pt"
         if not last.exists():
             sys.exit("nothing to resume: %s" % last)
+        mf = run_dir / "student_meta.json"
+        if mf.exists():  # the custom transforms are not in ultralytics' args: take them from the original run
+            m = json.loads(mf.read_text())
+            trainer = make_trainer(m.get("degrade", a.degrade), m.get("washout", 0.0))
         print("resuming", last, flush=True)
         YOLO(str(last)).train(resume=True, trainer=trainer)
         return
@@ -193,6 +225,7 @@ def main():
         args["time"] = a.hours
     run_dir.mkdir(parents=True, exist_ok=True)
     meta = dict(started=time.strftime("%Y-%m-%d %H:%M:%S"), git=git_rev(), model=a.model, degrade=a.degrade,
+                washout=a.washout,
                 argv=sys.argv, train_args=args, torch=torch.__version__,
                 gpu=torch.cuda.get_device_name(0) if device != "cpu" else None)
     (run_dir / "student_meta.json").write_text(json.dumps(meta, indent=1))
