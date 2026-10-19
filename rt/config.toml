@@ -5,7 +5,7 @@
 [models]
 # One-line switch to the published models: manifest = "deploy/models/manifest.json" (its roles override the paths
 # below; see rt/README.md for the format). Empty = use the paths below.
-manifest = ""
+manifest = "deploy/models/manifest.json"   # final models (all 5 events), validated on 26SE
 manifest_car = "car_n"          # with a manifest: "car_n" (YOLO11n, default) or "car_s" (YOLO11s)
 car_detector = "students/runs/bench/cars_n640_v2_best/384x640/best.onnx"
 car_detector_alt = "students/runs/bench/cars_s640_best/384x640/best.onnx"  # YOLO11s (~3x the CPU): bench_laptop.py only

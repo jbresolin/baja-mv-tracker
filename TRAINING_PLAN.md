@@ -15,7 +15,11 @@ in real time on 2 pinned cores at the finish. cars_s640 drops frames, so it is o
 Identity costs ~0.25–0.75 s per pass on 4 threads (~3% of a core at one pass per 40 s); RAM < 0.4 GB.
 **Caveat:** 26SE has now been used to compare many variants. Its ranking was never contradicted by val or test, but it is
 becoming a development set. The next event's start line, with human counts, is the real test.
-Next: WP11 (real-time prototype + laptop benchmark), then a final retrain on all 5 events. Open: pass-logic minimum in
+**Done (2026-10-19):** WP11 prototype `rt/`, and the final models on all 5 events published in `deploy/models/`:
+car_n = cars_n640_v2_all (26SE precision 0.967), car_s = cars_s640_all, panel = num_n320_r2 (dynamic export; the _all panel
+cost one wrong auto-confirm), recog = pq_spl_all. `rt/config.toml` uses the manifest by default; smoke-tested.
+**Waiting on the user:** a candidate laptop (`rt/bench_laptop.py`), the lap-app integration, the PTZ interface/scope and the
+camera hardware. Open: pass-logic minimum in
 seconds (decide on non-26SE footage), and re-ID for mud cars (car 1 is never auto-confirmed; 7 of its no-abstain errors read "11").
 
 Earlier status (2026-10-18): **teacher done.** WP0–WP6 and WP8 are done (each agent's section in LESSONS.md has the numbers).
