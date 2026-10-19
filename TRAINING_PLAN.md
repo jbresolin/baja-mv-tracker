@@ -1,6 +1,20 @@
 # Training plan: distil a laptop-sized car detector + number reader
 
-Status (2026-10-18): **teacher done.** WP0–WP6 and WP8 are done (each agent's section in LESSONS.md has the numbers).
+**Status (2026-10-19): M3/M4 done. The students alone match the teacher on 26SE.**
+
+| pipeline (26SE, 252 laps) | pass recall / precision | right number, no abstain | auto-confirm (val rule) | CPU |
+|---|---|---|---|---|
+| teacher: YOLO-World + Qwen3-VL-4B | 0.933 / 0.975 | 67.9% | 98.7% precision at 65% (share ≥ 0.5) | GPU |
+| cars_s640 + num_n320_r2 + pq_spl_full | 0.929 / 0.967 | **75.8%** | **144/144 = 100%**, 57.1% of laps | 45 ms/frame (4 threads) |
+| cars_n640_v2 (same chain) | 0.925 / 0.932 (0.971 tracking at 10 fps) | 75.8% | 139/139, 55.2% | 21 ms/frame (4 thr), 45 (1 thr) |
+
+Identity costs ~0.25–0.75 s per pass on 4 threads (~3% of a core at one pass per 40 s); RAM < 0.4 GB.
+**Caveat:** 26SE has now been used to compare many variants. Its ranking was never contradicted by val or test, but it is
+becoming a development set. The next event's start line, with human counts, is the real test.
+Next: WP11 (real-time prototype + laptop benchmark), then a final retrain on all 5 events. Open: pass-logic minimum in
+seconds (decide on non-26SE footage), and re-ID for mud cars (car 1 is never auto-confirmed; 7 of its no-abstain errors read "11").
+
+Earlier status (2026-10-18): **teacher done.** WP0–WP6 and WP8 are done (each agent's section in LESSONS.md has the numbers).
 - Labels: 7.4k consensus tracks. VLM vs overlay identity agree 96.9% (DIN/SPP close-ups).
 - Datasets: being re-exported from the final labels. Car set ≈ 45k frames.
 - Waiting on: the user's QA review of `out/qa/<EV>_teacher.jsonl`, and WP9 training on the 2080 Ti.

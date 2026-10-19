@@ -35,6 +35,9 @@ no bf16) + 64 GB RAM, available for weeks.
   (COCO: 0.87 / 0.95 / 62.7%).
 - On the 2080 Ti (this PC) the VLM runs in **fp16**: 99.2% identical to bf16. `torch.cuda.is_bf16_supported()` wrongly says True
   (emulation), and `vlm.py` checks native support. Don't batch the VLM above 6 here (11 GB, desktop uses ~1.8 GB).
+- **Laptop students (session 2) match the teacher on 26SE:** `cars_s640` / `cars_n640_v2` (car) → `num_n320_r2` (number
+  panel) → `pq_spl_full` (PARSeq-tiny + digit splicing) → boxed vote, all ONNX on CPU. Recall 0.93, precision 0.97, right
+  number on 75.8% of laps, auto-confirm at 100% precision on 57%. Details: TRAINING_PLAN.md status and LESSONS.md (WP9/WP10b).
 - Number reading: Qwen3-VL-4B-Instruct on ~10 crops per pass, majority vote snapped to the event roster
   (≈94–96% accurate when it answers; abstains on mud). Car #1 is unreadable (mud), which is a re-ID problem.
 - Pass rules: one car = one count. Merge tracks that re-start where the last box ended (<10 s), and merge coexisting
