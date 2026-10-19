@@ -1312,3 +1312,126 @@ loaded by WP9's training (`export_onnx.py`), 4 threads at batch 8 in brackets. H
 * SVHN pre-training (task 4): not done. Licence non-commercial (acceptable for an internal team tool), but the
   scene-text pretrained PARSeq already supplies the real-text prior, and the residual errors are livery styles, not
   house-number-like digits. Lower priority than recording start-line footage.
+
+## Session 2: WP9 final round (s640, panel detector round 2, washout augmentation, fully student 26SE chain)
+
+Everything below ran unattended overnight from `students/queue_wp9.sh` / `queue_wp9b.sh` (one GPU job at a time; CPU-only
+stages with `CUDA_VISIBLE_DEVICES=-1`). Nothing was tuned on 26SE.
+
+### cars_s640 (YOLO11s, 640, batch 32, patience 20, `--hours 10`)
+
+* 7.9 GB VRAM, ~260 s per epoch (3.0-4.1 it/s), early-stopped at epoch 75 (best 55), **5.4 h**. With `--hours` set,
+  ultralytics re-plans the epoch count to fit the budget (it printed "x/127"); patience still applies.
+* Val (25SU) mAP50 / 50-95 **0.867 / 0.692** (n640 0.846 / 0.660); 24SU test **0.935 / 0.772** (n640 0.924 / 0.742).
+* **26SE: 242 passes, recall 0.929, precision 0.967, 8 false passes**: practically the teacher (0.933 / 0.975, 6). Misses
+  18 = the 17 teacher misses + car 11 at 12:04:49 (end-of-race crowd). It finds the 4 washed-out laps that n640 missed.
+* CPU (ONNX, 384x640, loaded CPU, high priority): **126 ms (1 thread) / 45 ms (4 threads)**, OpenVINO 138 / 44 ms, 205 MB.
+  It meets <= 50 ms only with 4 threads.
+
+### cars_n640_v2 = cars_n640 + `--washout 0.15` (everything else identical)
+
+* `Washout` (train_det.py): gamma 0.5-1.0, blend towards white a = 0.4-0.85, desaturate to 30-100%, on 15% of training
+  images. Justification from the training data, not only 26SE: in 3,000 random `datasets/cars` train frames the
+  5th-percentile luminance is <= 91 in 99% of frames and never > 120 (broadcast cameras keep exposure under control),
+  while a washed-out fixed camera (26SE 10:24-10:51) gives mean ~235 and 5th percentile ~160. Augmented frames: mean
+  176-235, 5th percentile 120-185.
+* Early-stopped at 86 (best 66), 3.9 h. Val 0.850 / 0.663 (n640 0.846 / 0.660), 24SU test 0.922 / 0.737 (0.924 / 0.742):
+  **no cost on the streams**.
+* **26SE: 250 passes, recall 0.925 (n640 0.913), precision 0.932 (0.935)**. **All 4 washed-out student-only misses of
+  n640 (10:34:41, 10:36:16, 10:36:21, 10:39:52) are now found**; the remaining student-only misses are the two-cars-in-one-pass
+  case (10:55:39) and the end-of-race crowd (12:04:49). False passes 17 (n640 16): the same kinds (stationary tracks,
+  end-of-race clutter, 0.2-0.4 s blips). CPU 44.5 / 20.7 ms (ONNX 1 / 4 threads), same as n640.
+* Recommendation: keep the washout augmentation in every future car student (free on the streams, fixes a real
+  fixed-camera failure).
+
+### Tracking at 10 fps instead of 30 (deployment rate; cars_n640_v2, same timeline)
+
+* `--track-fps 10`: **240 passes, recall 0.925 (same), precision 0.971 (30 fps: 0.932), 7 false passes (17)**. The
+  passes.py thresholds are in frames (`MIN_FRAMES = 6`, i.e. 0.2 s at 30 fps but 0.6 s at 10 fps), so the 0.2-0.4 s
+  blips disappear. Not a threshold change, but note it: a deployment at 10 fps sees this precision; the "right"
+  minimum duration should be set in seconds, on non-26SE footage, if pass logic is ever revisited.
+
+### Number-panel detector round 2 (`num_n320_r2`, `datasets/numbers_crop_r2`)
+
+* `students/build_numbers_r2.py`: numbers_crop (hard links, unchanged val / test) + the WP9 proposals of the train events,
+  capped at 6 crops per track (evenly over the track): **+20,004 crops / 29,822 boxes** from 4,318 tracks (train 3,095 ->
+  23,099 crops). A random sheet of 40 proposal crops: boxes sit on real numbers on nearly all; a few (car 29, car 10,
+  car 47) are on a dark panel or a light with no visible digit, and the other numbers on the same car (side plates,
+  nose) are still unlabelled, i.e. the same missing-instance noise as round 1.
+* Same settings as num_n320 (YOLO11n, 320, batch 128, patience 30): early-stopped at 102 (best 73), ~1 h (35 s/epoch).
+  Box mAP: **val 0.762 / 0.365 (r1 0.743 / 0.351), test 0.519 / 0.186 (r1 0.542 / 0.203)**: mAP against the
+  grounded-only labels does not show it, but the chain does:
+* Chain on val (panel_val.py, recognizer syn_ft, conf 0.1, pad 0.05, 400 tracks x 4 crops): **top-1 89.0% (r1 86.3%)**,
+  crops without a box 8% (11%), tau 0.8 **52% / 97.6%** (r1 43% / 95.4%). Test (24SU): top-1 76.5% (72.8%), tau 0.8
+  19% / 97.4% (18% / 94.4%). r2 is the panel detector from here on.
+* **26SE with the WP10b recognizer `pq_spl_full`, boxed vote (tau 0.9 / k 3 from val), the teacher's passes**
+  (`out/eval_recog_pq_spl_full_panels[_all]_boxed[_r2]/`):
+
+| boxes | crops | no abstain: answered / precision / end-to-end | val rule: coverage / precision / end-to-end |
+|---|---|---|---|
+| num_n320 | 10 VLM crops | 97% / 73.2% / 66.3% | 55.3% / 93.8% / 48.4% |
+| num_n320_r2 | 10 VLM crops | 99% / 75.5% / 69.8% | 59.1% / 95.7% / 52.8% |
+| num_n320 | all (<= 30) | 100% / 78.2% / 72.6% | 54.5% / 99.2% / 50.4% |
+| **num_n320_r2** | **all (<= 30)** | **100% / 82.5% / 76.6%** | **61.7% / 98.6% / 56.7%** |
+
+  The proposal round gives +4 points end-to-end and +7 points of coverage at the val rule. (WP10b found the same
+  proposals useless as *recognizer* training data: they help the detector, not the reader.)
+
+### Fully student end-to-end on 26SE (`students/e2e_26se.py`): the headline
+
+Chain: student car detector (5 fps timeline + ByteTrack at 30 fps on events, native resolution) -> passes (passes.py,
+unchanged) -> <= 30 crops per pass (every track crop, evenly subsampled) -> num_n320_r2 (conf 0.1, +5%) -> pq_spl_full
+-> `vote_boxed` (tau 0.9, k 3, from 25SU val) -> 26SE roster -> id-preferring match to the 252 human laps after
+09:18:30. Outputs `out/eval_<run>_e2e/e2e_pq_spl_full/`. The native-resolution re-tracking reproduced the pass metrics
+of the 1920-wide runs exactly.
+
+| pipeline | passes | pass recall / precision | identity, no abstain: answered / precision | end-to-end | identity, val rule: answered / precision [95% CI] | end-to-end (val rule) |
+|---|---|---|---|---|---|---|
+| teacher: YOLO-World v2-x + Qwen3-VL-4B (10 crops) | 241 | 0.933 / 0.975 | 77% / 94.0% (it abstains by itself) | **67.9%** | (share >= 0.5: 65% / 98.7%) | - |
+| **students: cars_s640 + num_n320_r2 + pq_spl_full** | 242 | **0.929 / 0.967** | 99% / 82.7% | **75.8%** | **62% / 100% [97.4-100]** (144 / 144) | **57.1%** |
+| students: cars_n640_v2 + same | 250 | 0.925 / 0.932 | 99% / 82.7% | 75.8% | 60% / 100% [97.3-100] (139 / 139) | 55.2% |
+| students: cars_n640 + same | 246 | 0.913 / 0.935 | 99% / 81.6% | 73.8% | 61% / 99.3% [96.1-99.9] (140 / 141) | 55.6% |
+
+* **The all-student chain finds as many laps as the teacher and names more of them correctly** (75.8% of laps vs 67.9%),
+  because it reads ~30 crops per pass instead of 10 and answers on mud cars the VLM declined. At the val-picked rule it is
+  an auto-confirm signal: **every one of 144 (s640) / 139 (n640_v2) answers was right**, on 60-62% of the laps.
+* Per car (s640, no abstain): 4, 5, 8, 9, 11, 14, 16, 22 never wrong. **Car 1 (mud) 19/32 right, 12 wrong (7 read as
+  "11")** and never answered under the val rule; the VLM read car 1 on 4 of 32 passes. Other errors: car 6 (3 -> "5",
+  3 -> "1"), car 10 (-> 11 / 12), car 20 (-> 11 / 1), car 3 (-> 1). Most errors involve a "1": the easiest digit to see in
+  a vertical bar, as WP10 warned.
+* The 10 fps tracking above would raise pass precision further for the n models; not combined with identity here.
+
+### CPU cost of the deployed chain on this 3900X (loaded CPU, measured parts)
+
+| part | unit | 1 thread | 4 threads |
+|---|---|---|---|
+| car detector YOLO11n (ONNX, 384x640 + letterbox + NMS) | per frame | 45 ms | 21 ms |
+| car detector YOLO11s | per frame | 126 ms | 45 ms |
+| panel detector num_n320 (ONNX 320) | per car crop | 30 ms | 19 ms |
+| recognizer pq_spl_full (WP10b) | per number box | 21 ms | 12 ms (7 ms batched) |
+
+* Continuous detection + tracking at 10 fps: YOLO11n 0.45 s of CPU per second on one thread (45% of a core) or ~0.2 s/s
+  on 4 threads; YOLO11s needs 4 threads (0.45 s/s), it is not real-time on one thread (1.26 s/s). At 30 fps only
+  YOLO11n on 4 threads fits (0.63 s/s).
+* Identity per pass at 30 crops and ~0.8 boxes per crop (24 boxes): panel 0.9 s + recognizer 0.5 s = **~1.4 s on one
+  thread, ~0.75 s on 4 threads** (0.47 / 0.25 s at 10 crops). Passes come every ~40 s on average (252 laps in 2.85 h),
+  so identity is ~3% of a core; it can run in a worker after the car leaves the frame. In the e2e run (6 threads,
+  ultralytics path): 20 ms panel + 11 ms recognizer per crop.
+* So a laptop with 4 cores runs YOLO11n at 10-15 fps + the identity chain comfortably; YOLO11s at 10 fps is possible on
+  4 threads with little headroom. RAM: ~150 MB (car) + ~110 MB (panel) + ~125 MB (recognizer) peak per process.
+
+### Comparison table (final)
+
+| detector | input | 24SU test mAP50 / 50-95 | 26SE passes | recall | precision | false passes | end-to-end, borrowed VLM ids | end-to-end, all-student chain (no abstain / val rule) | CPU ms ORT 1 / 4 thr (384x640) |
+|---|---|---|---|---|---|---|---|---|---|
+| YOLO-World v2-x (teacher) | 1280 | reference | 241 | 0.933 | 0.975 | 6 | 67.9% | 76.6% / 56.7% (teacher passes) | GPU only |
+| COCO YOLO11x | 1280 | - | 230 | 0.869 | 0.952 | 11 | 62.7% (own VLM) | - | - |
+| COCO YOLO11n, untrained (11-09-03 only) | 1280 | - | 15 (24 laps) | 0.58 | 0.93 | 1 | - | - | 50 / 22 |
+| student YOLO11n (`cars_n640`) | 640 | 0.924 / 0.742 | 246 | 0.913 | 0.935 | 16 | 65.1% | 73.8% / 55.6% | 45 / 21 |
+| student YOLO11n + washout (`cars_n640_v2`) | 640 | 0.922 / 0.737 | 250 | 0.925 | 0.932 | 17 | 65.9% | 75.8% / 55.2% | 45 / 21 |
+| ... same, tracking at 10 fps | 640 | | 240 | 0.925 | 0.971 | 7 | | | |
+| **student YOLO11s (`cars_s640`)** | 640 | **0.935 / 0.772** | 242 | **0.929** | **0.967** | 8 | 65.9% | **75.8% / 57.1%** | 126 / 45 |
+
+Recommendation: **laptop default = cars_n640_v2 (YOLO11n + washout) at 10 fps**: real-time on one thread, pass recall
+0.925; use cars_s640 when 4 free cores are guaranteed (best precision at 30 fps). Number chain: num_n320_r2 +
+pq_spl_full + boxed vote; auto-confirm at the val rule, everything else to the human reviewer.
