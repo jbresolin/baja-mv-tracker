@@ -17,6 +17,8 @@ labelling (teacher). Offline teacher hardware: dedicated streaming PC, Ryzen 390
 no bf16) + 64 GB RAM, available for weeks.
 
 ## Layout
+Git remote: https://github.com/jbresolin/baja-mv-tracker (private, branch `master`). Models (`deploy/models/*.onnx`), media and
+generated data are gitignored.
 - `2026-10-17 *.mkv`: start-line recordings (OBS clock overlay burned in, top-left). Main benchmark footage.
 - `lap_count_dump_26se.sql`: MySQL dump of the race's human counts. Use `contagem_volta` (consolidated laps) and
   `contagem_passagem` (raw entries; `ts_ms` = pass time in server clock). Parser: `lapvision/gt.py`.
