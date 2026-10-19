@@ -1435,3 +1435,152 @@ of the 1920-wide runs exactly.
 Recommendation: **laptop default = cars_n640_v2 (YOLO11n + washout) at 10 fps**: real-time on one thread, pass recall
 0.925; use cars_s640 when 4 free cores are guaranteed (best precision at 30 fps). Number chain: num_n320_r2 +
 pq_spl_full + boxed vote; auto-confirm at the val rule, everything else to the human reviewer.
+
+## Session 2: real-time prototype (WP11)
+
+Code: `rt/` (`run.py` main, `capture.py`, `models.py` ONNX Runtime / OpenVINO wrappers + numpy CTC roster scorer,
+`tracker.py` numpy ByteTrack, `passlogic.py` online pass logic + crop candidates, `identity.py` async worker, `sinks.py`
+JSONL / CSV / LapAppSink stub, `timesync.py`, `stats.py`, `config.toml`; tools `eval_26se.py`, `loadtest.py`,
+`bench_laptop.py`; `rt/README.md` = install, config reference, event schema). Runtime deps: onnxruntime, numpy,
+opencv-python, ffmpeg (+ psutil for stats / affinity, openvino optional). No torch / ultralytics at run time. All runs
+CPU only (`CUDA_VISIBLE_DEVICES=-1`) while another agent trained on the GPU and its data loaders kept ~8 of the 24
+logical CPUs busy. Outputs: `out/rt/`.
+
+### Equivalence with the offline pipeline (checked part by part)
+
+* **Car detector**: the ONNX export (384x640) + `rt.models.letterbox` / NMS gives the same boxes as ultralytics' `.pt`
+  predict (1,937 detections on 1,800 frames, max coordinate difference 0.001 px).
+* **Tracker**: `rt/tracker.py` is a line-by-line port of ultralytics 8.4's BYTETracker (Kalman XYAH, two-stage
+  association with fuse_score, unconfirmed tracks reported from their second detection, buffer 30 *frames*,
+  end-of-frame duplicate removal, and the quirk that a just-removed lost track stays matchable for one more frame).
+  Same detections in -> **0 id mismatches in 1,800 frames, Kalman boxes within 1e-4 px**. lap.lapjv(cost_limit) is
+  replaced by an exact Hungarian solve on the augmented matrix.
+* **Panel detector**: needs a dynamic-shape export (`students/runs/bench/num_n320_r2_best/320dyn/best.onnx`, made here)
+  to use ultralytics' minimum-rectangle letterbox: boxes within 0.5 px of the `.pt`. The fixed 320x320 export
+  (`320/best.onnx`, also `deploy/models/panel.onnx`) is not equivalent: same box count on 94% of crops, same argmax
+  on 95% of boxed crops (600 crops). Small, but it is model noise; export the panel net with `dynamic=True`.
+* **Roster scorer**: numpy CTC forward vs torch `ctc_loss`: max posterior difference 2e-7.
+* **Pass logic** (`python rt/eval_26se.py passlogic out/eval_cars_n640_v2_t10`): the offline 10 fps tracks replayed
+  frame by frame through the online logic give **257 / 257 passes with identical t0 and 256 with identical t1** vs
+  `passes.build`. The streaming rules take the attach decision when a track becomes foreground (t0 and first box are
+  final by then). Nested duplicates are tested against coexisting members of open passes. A pass closes when all
+  members left the tracker, 10 s passed since its last box, and no younger, not-yet-foreground track started inside
+  the window (at most `pending_max_s` = 10 s).
+
+### Whole-race replay (cars_n640_v2, 10 fps, native-resolution crops, 4 files in parallel, `out/rt/replay_n/`)
+
+| | offline e2e (30 fps tracking, all crops <= 30) | offline, 10 fps tracking | **online rt (10 fps)** |
+|---|---|---|---|
+| passes / matched / laps | 250 / 233 / 252 | 240 / 233 | **240 / 233** |
+| pass recall / precision | 0.925 / 0.932 | 0.925 / 0.971 | **0.925 / 0.971** |
+| identity no abstain: answered / precision / end-to-end | 99% / 82.7% / 75.8% | - | **98% / 83.4% / 75.8%** |
+| val rule (tau 0.9, k 3): answered / precision / end-to-end | 60% / 139/139 / 55.2% | - | **58% / 134/135 = 99.3% [95.9-99.9] / 53.2%** |
+| crops read per pass | 29.2 | - | 22.8 |
+
+* **Passes: 238 / 240 identical to the offline 10 fps run** (t0 within 1 s; 13 differ by > 0.05 s). Continuous tracking
+  vs offline event windows: online finds car 7 at 09:55:43 and car 10 at 10:24:27; offline finds car 1 at 10:24:25 and
+  car 3 at 10:36:23. Same recall. Per file 75/75, 74/90, 21/24, 63/63 laps.
+* **Identity**: identical end-to-end without abstention (191 laps). The val rule answers slightly fewer passes. 10 fps
+  gives fewer frames per pass, and pick_crops (large + sharp, area > 0.4 x max) leaves 22.8 crops instead of ~29.
+  **One wrong auto-confirm**: car 6 at 10:55:28 (a 12 s pass in a pack, between car 15 and car 4) read "5" with 23
+  supporting crops, share 0.99. Offline read the same "5" with share 0.84, under tau. This is the known
+  stylised-6 error (WP10b: 6 -> "5"). Large, sharp crops agree with each other more than evenly spaced ones, so the
+  online crop choice makes a wrong read more confident. Treat auto-confirm as ~99%, not 100%. Never tuned on 26SE.
+* Same-number agreement with the offline e2e on the 238 common passes: 208. Auto set: 129 in both, 7 online only,
+  12 offline only.
+* Provisional reads (PTZ entry signal; same rule as auto-confirm, on <= 16 early crops): 57% of matched passes,
+  98.5% precise (wrong: car 1 read "11", and the car-6 pass above), always equal to the final number.
+* Timing: `pass_start` 0.5 s after the pass's first frame (6 frames). `pass_end` 10.1 s after the last box (p95 12.9 s;
+  this is the re-attach window by design). Identity after pass_end: p50 0.9 s, p95 2.9 s on the saturated replay CPU.
+* RAM: peak 285-290 MB per process at 1080p, 377 MB with native 4K frames. Crop buffers (JPEG q92, 48 candidates
+  per track, thinned in time) peak at 7-13 MB (34 MB at 4K). The identity queue never exceeded 3 jobs.
+* The 4 files in parallel saturated the CPU (system 90-95%): 1080p files ran at 1.0-1.3x real time, the 4K file at
+  0.5x (native 4K HEVC decode).
+
+### Real-time load (`rt/loadtest.py`, 11-29-49.mkv, `--realtime`, 10-min segments, high priority, decoder unpinned)
+
+quiet = 11:35-11:45 (14 laps), busy = 11:59-12:09 (19 laps incl. the 12:04 finish, cars stopped among people).
+Threads = detector + identity intra-op threads; cap2 / cap3 = process pinned to 2 / 3 physical cores (CPUs 2,4[,6]).
+CPU % = % of one logical CPU (100 = one core), mean / p95 over 1 s samples. `out/rt/load/`, `out/rt/load_s/`.
+
+| model | config | segment | dropped | det ms p50 / p90 | lag p95 / max ms | pipeline CPU % | ffmpeg CPU % | RAM peak | id latency p50 / max |
+|---|---|---|---|---|---|---|---|---|---|
+| n640_v2 | 1+1 | quiet | 0 | 59 / 69 | 74 / 348 | 71 / 88 | 112 | 252 MB | 0.64 / 4.6 s |
+| n640_v2 | 4+4 | quiet | 0 | 43 / 52 | 56 / 196 | 126 / 165 | 123 | 257 MB | 0.54 / 4.2 s |
+| n640_v2 | cap2 (1+1) | quiet | 0 | 55 / 62 | 66 / 89 | 67 / 81 | 91 | 250 MB | 0.57 / 4.0 s |
+| n640_v2 | cap3 (2+1) | quiet | 0 | 43 / 53 | 58 / 79 | 81 / 97 | 100 | 252 MB | 0.58 / 4.1 s |
+| n640_v2 | 1+1 | busy | 0 | 60 / 70 | 77 / 350 | 76 / 103 | 115 | 256 MB | 1.01 / 1.9 s |
+| n640_v2 | 4+4 | busy | 0 | 43 / 52 | 59 / 225 | 131 / 207 | 124 | 263 MB | 1.10 / 1.6 s |
+| n640_v2 | **cap2 (1+1)** | busy | **0** | 54 / 60 | 67 / 108 | **67 / 93** | 93 | 258 MB | 1.06 / 1.7 s |
+| n640_v2 | cap3 (2+1) | busy | 0 | 43 / 53 | 60 / 79 | 86 / 119 | 100 | 259 MB | 1.07 / 1.6 s |
+| s640 | 1+1 | busy | **2,241 (37%)** | 159 / 177 | 851 / 993 | 112 / 134 | 114 | 356 MB | 0.63 / 2.3 s |
+| s640 | 4+4 | busy | 13 | 90 / 106 | 371 / 599 | 286 / 410 | 139 | 344 MB | 1.43 / 3.0 s |
+| s640 | cap3 (2+1) | busy | 47 | 93 / 113 | 479 / 629 | 179 / 206 | 104 | 353 MB | 1.09 / 2.1 s |
+
+* **cars_n640_v2 keeps up in every config, including 2 pinned cores in the busy finish stretch**: 0 dropped frames,
+  bounded queues (identity queue <= 2), no growth in RAM. On those segments: laps 19/19 (busy) and 14/14 (quiet),
+  auto-confirm 14/14 and 12/12 correct (`rt/eval_26se.py metrics --window`). In real time the provisional number
+  arrives 0.6-0.75 s (p50) / 1.2-1.5 s (p90) after t_enter, always before the car leaves the frame.
+* **cars_s640 is out of budget**: on 1 thread it drops 37% of frames (159 ms per frame). On 4 threads it still drops
+  frames, uses ~2.9 cores and lags up to 0.6 s. With drops it produced 1 wrong auto-confirm in the busy segment
+  (13/14). Pass recall survived (19/19) even at 37% drops.
+* "det ms" in-situ is ~1.3-2x the isolated bench (WP9: 45 / 21 ms), because the 1080p letterbox counts in it and
+  ffmpeg + the other agent share the CPU and memory bandwidth. The 26SE files are HEVC 1080p60: their software
+  decode alone costs ~1 core (here) and is not representative of a camera (below).
+
+### Component costs on this 3900X and the worst-case laptop (`rt/bench_laptop.py`, `out/rt/bench_laptop_3900x.json`)
+
+Real 1080p frame. Wall ms p50 (CPU ms = all threads of the process, i.e. what the machine pays). Background load ~35%.
+
+| component | 1 thread | 2 threads | 4 threads | laptop worst case (x2): wall at 1 / 2 thr | laptop CPU % of one core at 10 fps |
+|---|---|---|---|---|---|
+| car detector n640_v2, ORT (letterbox + 384x640 + NMS), per frame | 55 (55) | 40 (68) | 37 (91) | 110 / 80 ms | 110 (1 thr) / 135 (2 thr) |
+| same, OpenVINO CPU | 58 (57) | 38 (70) | 28 (97) | 115 / 76 ms | ~ the same |
+| car detector s640, ORT | 148 (148) | 97 (176) | 79 (233) | 300 / 195 ms | 300-350: impossible |
+| panel detector per car crop | 19 (19) | 15 (24) | 14 (31) | 38 / 30 ms | - |
+| recognizer per number box | 24 (24) | 22 (36) | 19 (44) | 48 / 44 ms | - |
+| identity per pass (30 crops, 0.8 boxes per crop, 1 thread) | 1.15 s | | | 2.3 s | 38 (busy: 1 pass / 6 s), 6 (race average: 1 pass / 40 s) |
+| tracker + pass logic + crop JPEG / sharpness | | | | | ~15 (in-situ total minus det and identity, x2) |
+| decode 1080p30 H.264 8 Mb/s, software, 10 fps out | 53-60% of a core | | | | ~100-120 |
+| decode 1080p30 MJPEG (USB webcam), software | 61% | | | | ~120 |
+| decode 26SE HEVC 1080p60 (the replay files) | 159% | | | | out of budget: use another format |
+
+* Extrapolation: an i5-8250U-class CPU is ~1.3-1.5x slower per core than this 3900X at turbo (single-thread
+  benchmarks: approximate, from memory, not measured). Under sustained all-core load a U-series chip falls toward
+  its 1.6 GHz base clock, so x2 is the planning number. The only real answer is `rt/bench_laptop.py` on the laptop.
+  It has a `--sustain` check for throttling (here: stable, p90 70 -> 61 ms over 60 s).
+* **Worst-case laptop budget, cars_n640_v2 at 10 fps (2 detector threads + 1 identity thread)**: detector ~135% +
+  identity ~38% (busy) + tracking ~15% ~= 1.9 cores = 47% of 4 cores *before decoding*. Software decode of a 1080p30
+  camera adds ~1 core (-> ~72%), which leaves too little for the OS + OBS. On one detector thread the detector alone
+  would need ~110 ms per 100 ms frame (drops); hence the default is now 2 + 1 threads.
+* Levers, in order: (1) hardware decode: `capture.hwaccel = "d3d11va"` / `"qsv"` (Intel QuickSync on the UHD 620;
+  untested here), or set the camera itself to 10-15 fps / 720p (software decode cost scales with the input fps);
+  (2) the car detector on the iGPU: `runtime.car_backend = "openvino"`, `car_device = "GPU"` (static 384x640; falls
+  back to ORT CPU with a warning). Untested here (no Intel GPU). It would free ~1.3 cores if UHD 620 runs YOLO11n in
+  <= 30-40 ms; (3) the identity worker on 1 thread is cheap on average and only bursts at packs (it is async, so it
+  delays numbers, never frames).
+* RAM is not an issue: 250-260 MB (n) / 345-355 MB (s) per process, steady over 10 min. 8 GB is plenty.
+
+### Gotchas
+
+* `threading.Thread` subclasses must not have attributes named `start` or `_stop` (my first FileCapture had
+  `self.start` = the seek offset and crashed `cap.start()`).
+* `time.process_time()` on Windows ticks in 15.6 ms steps: measure CPU over a whole loop and divide, never per call.
+* ONNX Runtime's idle intra-op threads spin by default. `session.intra_op.allow_spinning = 0` (`ort_spinning = false`)
+  keeps them from burning a laptop core between 10 fps frames.
+* This PC's clock is **not** synced (`w32tm /query /status`: "Local CMOS Clock", leap indicator 3). `rt/timesync.py`
+  warns about exactly this at the start of every live run.
+* ffmpeg is on the user PATH via WinGet (`%LOCALAPPDATA%\Microsoft\WinGet\Links`). Git Bash shells may lack it, so
+  prepend that path.
+
+### Open questions for the user
+
+1. The laptop: run `python rt/bench_laptop.py --video <a camera recording> --sustain 120` (and `--hwaccel d3d11va`)
+   and send back `bench_laptop.json`. Does the iGPU (OpenVINO GPU) work there?
+2. Lap app: API or direct `contagem_passagem` insert? Unread passes (`equipe_numero` is NOT NULL)? Should
+   `auto_confirm` create a `contagem_decisao` 'confirmar', or only pre-fill the reviewer's screen? A new
+   `contagem_fonte` row for the camera? Server-clock anchoring (the `ancora_*` columns).
+3. PTZ: which transport (UDP / websocket / HTTP) and which payload? Today: `pass_start` (entry box) + `pass_provisional`
+   (number) events.
+4. Camera / capture: USB (MJPEG?) or IP camera (RTSP H.264?), resolution and fps. Can it stream at 10-15 fps? It sets
+   the decode cost, which is the largest single item on the laptop.

@@ -1,0 +1,105 @@
+# rt/config.toml: settings of the real-time lap-pass prototype (rt/run.py). Relative paths are relative to the
+# repo root (the folder that contains rt/). Any key can be overridden on the command line: --set section.key=value
+# Defaults are sized for the worst-case laptop (4-core 8th-gen Intel U-series, 8 GB RAM, Intel UHD 620 iGPU).
+
+[models]
+# One-line switch to the published models: manifest = "deploy/models/manifest.json" (its roles override the paths
+# below; see rt/README.md for the format). Empty = use the paths below.
+manifest = ""
+manifest_car = "car_n"          # with a manifest: "car_n" (YOLO11n, default) or "car_s" (YOLO11s)
+car_detector = "students/runs/bench/cars_n640_v2_best/384x640/best.onnx"
+car_detector_alt = "students/runs/bench/cars_s640_best/384x640/best.onnx"  # YOLO11s (~3x the CPU): bench_laptop.py only
+car_imgsz = [384, 640]          # (h, w); a fixed-shape export overrides it
+panel_detector = "students/runs/bench/num_n320_r2_best/320dyn/best.onnx"  # dynamic-shape export (minimum rectangle)
+panel_imgsz = 320
+recognizer = "students/runs/recog/pq_spl_full/recog.onnx"
+vote = "students/runs/recog/pq_spl_full/eval/panel_tau.json"   # tau / min_support / score picked on 25SU val (WP10b)
+
+[runtime]
+# Inference backend per model: "onnxruntime" (CPU) or "openvino" (device CPU, GPU = Intel iGPU, AUTO). OpenVINO
+# falls back to ONNX Runtime CPU with a warning if it or the device is missing. Measure first: rt/bench_laptop.py
+car_backend = "onnxruntime"
+car_device = "CPU"
+id_backend = "onnxruntime"      # panel detector + recognizer
+id_device = "CPU"
+threads_detector = 2            # intra-op threads of the car detector (--threads N sets both). 2, not 1: on the worst-case
+                                # laptop (~2x slower per core when throttled) one thread would need ~110 ms per 100 ms frame
+threads_identity = 1            # intra-op threads of the panel detector and the recognizer (identity worker)
+cv2_threads = 1                 # OpenCV's own thread pool (resize / letterbox)
+ort_spinning = false            # false: idle ONNX Runtime threads sleep instead of busy-waiting (saves a laptop core)
+affinity = []                   # optional CPU list for this process and ffmpeg, e.g. [0, 2] (needs psutil)
+affinity_decoder = true         # also pin the ffmpeg decoder to that list
+priority = "normal"             # "normal" | "high" (Windows: above-normal priority for the race-day process)
+
+[capture]
+fps = 10.0                      # detection / tracking rate (WP9: tracking at 10 fps, min 6 frames per track)
+max_width = 1920                # downscale wider sources (4K) to this width at decode; 0 = native
+ffmpeg = "ffmpeg"
+ffprobe = "ffprobe"
+decode_threads = 0              # ffmpeg -threads for decoding (0 = ffmpeg's default)
+hwaccel = "none"                # ffmpeg -hwaccel for files/streams: none | d3d11va | qsv | dxva2 | auto (Intel laptop: try d3d11va;
+                                # decode of 1080p30 H.264 costs ~0.6 core on this 3900X in software)
+queue_size = 4                  # frames between capture and detection; live sources drop frames when it is full
+camera_backend = "auto"         # OpenCV backend for camera indices: auto | dshow | msmf | v4l2
+camera_width = 1920
+camera_height = 1080
+camera_fps = 30
+live_latency_s = 0.0            # known capture latency of a live source (subtracted from the frame time)
+
+[clock]
+# Frame time = wall clock of the video PC. Files: "auto" = OBS clock overlay (26SE) if present, else the container
+# creation_time tag, else file mtime - duration. Live: the system clock (time sync is checked at start).
+mode = "auto"                   # auto | overlay | creation | mtime | pts | system
+offset_s = 0.0                  # added to every frame time (manual correction of a known clock error)
+video_minus_server_s = 0.0      # this PC's clock minus the lap server's (26SE: +80); LapAppSink subtracts it
+warn_sync_age_h = 24.0          # warn if Windows time sync is older than this
+ntp_server = ""                 # optional SNTP offset check at start (e.g. "pool.ntp.org"); empty = no network
+
+[detection]
+conf = 0.15                     # = students/eval_26se.py TRACK_CONF
+nms_iou = 0.7
+
+[tracker]                       # = ultralytics bytetrack.yaml (the offline evaluation's tracker)
+track_high_thresh = 0.25
+track_low_thresh = 0.1
+new_track_thresh = 0.25
+track_buffer = 30               # frames (ultralytics does not scale it with fps: 3 s at 10 fps)
+match_thresh = 0.8
+fuse_score = true
+
+[passes]                        # = lapvision/passes.py (session 1; never tuned on 26SE)
+fg_h = 0.20                     # foreground track: max box height > fg_h * H ...
+fg_y2 = 0.40                    # ... and max box bottom > fg_y2 * H ...
+min_frames = 6                  # ... and >= 6 reported frames (0.6 s at 10 fps, as evaluated by WP9)
+edge = 0.02
+merge_gap_s = 3.0               # rule (a): car still in view reappears nearby within 3 s
+static_gap_s = 10.0             # rule (b): a track restarting where the last box ended (IoU > 0.2) within 10 s
+nested_ratio = 0.6              # nested duplicate boxes: median intersection / smaller area > 0.6
+recent_passes = 4
+pending_max_s = 10.0            # a pass waits for a not-yet-foreground track that started inside its window, at most this long
+
+[identity]
+max_crops = 30                  # crops read per pass (passes.pick_crops: large + sharp + spread in time)
+crop_pad = 0.05
+crop_min_h = 0.10               # keep crop candidates only for boxes taller than this share of the frame
+candidates_per_track = 48       # bounded candidate buffer per track (thinned in time when full)
+crop_jpeg = 92                  # store candidates JPEG-encoded at this quality (bounded RAM; the offline crops were q92); 0 = raw
+panel_conf = 0.1                # picked on 25SU val (WP9)
+panel_pad = 0.05
+panel_rect = true               # minimum-rectangle letterbox (= ultralytics .pt predict); needs the dynamic export
+provisional = true              # read a few crops while the car is in view (PTZ entry camera)
+provisional_every_s = 0.5
+provisional_batch = 4
+provisional_max_reads = 16
+queue_max = 64                  # identity jobs waiting; provisional jobs are dropped first when it is full
+
+[output]
+csv = ""                        # passes CSV; default: <--out>.csv
+crops_dir = ""                  # optional: save each pass's selected crops here (review / future training data)
+
+[lapapp]                        # stub only (rt/sinks.py LapAppSink): writes the rows it would insert, no network/DB
+enabled = false
+fonte_id = 5                    # a new contagem_fonte row for the camera (26SE has 1-3 human, 4 box)
+dispositivo_id = 0
+only_numbered = true            # contagem_passagem.equipe_numero is NOT NULL in every 26SE row
+outbox = ""                     # JSONL file of the would-be rows; default: <--out>.lapapp.jsonl
