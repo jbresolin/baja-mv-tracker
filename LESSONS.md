@@ -1142,3 +1142,173 @@ panels); the hard ones (missed panels, unreadable liveries) stay missing. `out/p
 | COCO YOLO11n, untrained (11-09-03 only) | 1280 | - | 15 (24 laps) | 0.58 | 0.93 | 1 | - | 50 / 22 |
 | **student YOLO11n (`cars_n640`)** | 640 | **0.924 / 0.742** | 246 | **0.913** | 0.935 | 16 | 65.1% | **45 / 21** |
 | student YOLO11s (`cars_s640`) | 640 | (training) | | | | | | 135 / 49 (pretrained) |
+
+## Session 2: recognizer generalisation (WP10b)
+
+Code (all CPU, `CUDA_VISIBLE_DEVICES=-1`, <= 8 threads while WP9 trained on the GPU): `students/recog/` `folds.py` +
+`folds/numbers_v1.json` (fixed folds), `heldout_eval.py` (the protocol), `gen.py` (fold / car filters, uniform text),
+`splice.py` (digit splicing), `parseq_model.py` + `train_parseq.py` (PARSeq-tiny), `prep_props.py` (WP9 proposals as
+training data), `panel_tau.py` (panel-chain abstain rule on val), `wp10b_table.py`; options added to `train.py`
+(`--fold --keep-cars --syn-text uniform --p-splice --p-prop`), `export_onnx.py` (`--ckpt --export-only`),
+`harness_26se.py` (`--vote boxed`), `common.py` (`vote_boxed`, PARSeq checkpoints in `load_model`), `augment.py`
+(`render(text=)`, `synth_sample(text_fn=)`). Defaults reproduce WP10 (syn_ft) exactly. New pip package: `timm==1.0.30`
+(requirements.txt). PARSeq weights: `weights/parseq/parseq_tiny-e7a21b54.pt` (github.com/baudm/parseq release v1.0.0,
+Apache-2.0, sha256 prefix checked). Runs: `students/runs/recog/{gx,pq}_<recipe>_{full,f0..f3}`.
+
+### The unseen-number protocol (reusable)
+
+* Folds v1 (`folds.py`, deterministic): folds 0-2 each hold out 5-6 of the numbers 1-16 (balanced by val+test crops,
+  >= 2 one-digit and >= 2 two-digit) plus 5 of 17-39/40-61; **fold 3 = the 7 remaining numbers >= 40** (manager request:
+  the high-number case). Every crop of a held-out number, and the "no number" windows cut from the same car crops, is
+  removed from training in all events. Every digit keeps >= 30% of its crop-weighted count.
+* Val/test contain only 1-16 and folds 0-2 partition 1-16, so **every val/test crop is "unseen" for exactly one fold
+  model: the gap is perfectly paired** (same crops, same box heights): full model (all numbers) vs the fold model that
+  never saw the crop's number. Fold 3 has no val/test crops: it is scored on its train-split crops ("unseen number, seen
+  event"), next to the folds 0-2 numbers under the same condition. Seen-number control: fold models on val/test numbers
+  they did see (~20% less training data; it never mattered: within 1 point of the full model in every family).
+* Recipes are short and fixed (no early stopping, `last.pt` evaluated): CRNN = syn_ft recipe (init syn_pre, lr 1e-3,
+  30 epochs x 6000, ~18-21 min at 4 threads); PARSeq = 5 epochs x 6000, batch 64, lr 3e-4, ~28-31 min. The short CRNN
+  full model equals syn_ft (val/test snap 80.5/68.1 vs 82.7/68.0; 75.3 vs 75.0 on all val+test crops), so ~1 point is
+  the run-to-run noise to keep in mind. Usage: train the 5 runs with `--fold v1:K`, then
+  `heldout_eval.py --family <prefix>`.
+* **Seen number, unseen style proxy:** val/test are already that. Of the 28 val/test cars with crops, all numbers occur in
+  training, but only 24SU #6 (Imperador, #6 at 26BR too) with the same team; the others belong to a different
+  team. Team seen in training with another number vs team never seen: 74.5 vs 78.2% (height-standardised, CRNN), so
+  team liveries do not carry over between events either. 24SU #6 (same team, same number) is still 71-73%: liveries
+  change between years.
+
+### Result 1: the unseen-number gap (roster-snapped crop accuracy, val+test 'ok' crops, n = 2,038)
+
+| family (recipe) | number seen | number held out | gap | test: seen -> held out | test tracks, held out: top-1, tau 0.6 cov/prec |
+|---|---|---|---|---|---|
+| CRNN syn_ft recipe (`gx_base`) | 75.3 | **54.6** [52-57] | -20.7 | 68.1 -> 47.3 | 52.4%, 20% / **82.6%** |
+| CRNN + splicing + uniform synth (`gx_spl`) | 76.4 | 69.3 | -7.1 | 68.8 -> 62.0 | 70.1%, 33% / 99.3% |
+| CRNN + splicing + synth + proposals (`gx_all`) | 76.1 | 68.1 | -8.0 | 68.4 -> 60.7 | 68.5%, 32% / 96.5% |
+| PARSeq-tiny, real only (`pq_base`) | 86.1 | 73.3 | -12.8 | 78.3 -> 63.1 | 68.7%, 42% / 91.9% |
+| **PARSeq-tiny + splicing + uniform synth (`pq_spl`)** | **87.4** | **84.4** [83-86] | **-3.0** | 82.1 -> 76.3 | **82.3%, 48% / 98.6%** |
+| PARSeq-tiny + splicing + synth + proposals (`pq_all`) | 87.9 | 83.8 | -4.1 | 82.3 -> 74.5 | 80.7%, 54% / 98.7% |
+
+* **The WP10 CRNN loses 21 points on a number it never saw** (greedy 69.3 -> 47.0), at every box height (16-24 px 55 ->
+  37, 64-96 px 89 -> 66), and **its confidence does not drop**: at tau 0.6 track precision falls from 97% to 83-85%.
+  ~70% of the errors on held-out numbers are reads of another *training* number (val 368 of 529 errors, test 376 of
+  551: 7 -> "1", 11 -> "17", 16 -> "13", 14 -> "16"). The BiLSTM memorises whole numbers like words. Deploying it at an
+  event with new numbers would silently produce confident wrong numbers.
+* Unseen number in a seen event (train split, `gx_base` fold models): 1-digit 69%, 10-16 63%, 17-39 77%, >= 40 78%
+  (fold 3: 80%). PARSeq + splicing: 90 / 85 / 95 / 95% (fold 3: 96%). **High numbers are not harder than low ones**
+  (the train-split crops of 17-61 are larger and cleaner than the 10-16 ones; not paired, read as "no high-number
+  penalty").
+* Splicing + uniform synthetic numbers closes most of the gap for both models (CRNN -21 -> -7, PARSeq -13 -> -3) and
+  restores calibration (held-out track precision at tau 0.6: 99%). It costs nothing on seen numbers (+1 point).
+* Scene-text pretraining (PARSeq) alone gives +11 points on seen and +19 on unseen numbers, but still a 13-point gap and
+  overconfident unseen reads (92% at tau 0.6); it needs the splicing too.
+
+### Result 2: PARSeq-tiny (scene-text pretrained) vs the CRNN
+
+* PARSeq-tiny (6.0 M params, ViT encoder 12 x 192, 1-layer decoder, 32x128), pretrained on real scene-text datasets,
+  vendored model code (`parseq_model.py`, Apache-2.0 header kept), digits-only head/embedding rows sliced from the
+  94-char model, permutation-LM fine-tuning (forward + mirrored perms). Zero-shot (94 chars, tight crops) it already
+  reads 12/15 val crops; after **one** epoch of fine-tuning val accuracy is 87.5% (the CRNN tops out at ~80%).
+* **Same interface as the CRNN:** input "image" (N,3,32,W) RGB in [0,1] (the `augment.plain` / `to_input` 32x96 crop),
+  resized inside the model to 32x128; output "logp" (T=10, N, 11) CTC-shaped log-probs (`positions_to_ctc`: position k
+  -> a frame with P(blank) = cumulative EOS, digits renormalised, plus a certain-blank separator frame). So `greedy`,
+  `RosterScorer`, the votes, `evaluate.py`, `harness_26se.py`, `panel_val.py` and the ONNX loader work unchanged.
+  ONNX gotcha: `aten::cumprod` has no ONNX export at opset 17; written as exp(cumsum(log)). max |onnx - torch| 4e-5.
+* PARSeq on the 32x64 input (half the encoder tokens, position grid resampled 8x16 -> 8x8; `--img-w 64`): val/test
+  83.1/61.6% vs 89-90/77% at 128, i.e. no better than the CRNN on test. Not worth the ~30% speed-up.
+* int8 dynamic quantisation (onnxruntime `quantize_dynamic`) broke it (val 8%) and gained only 12% speed. The encoder
+  is 29 of 35 ms (loaded CPU). Not pursued.
+* PARSeq overfits the training numbers when fine-tuned longer: fold runs often have their best val epoch at 1-2 of 5
+  (val holds their unseen numbers). Keep schedules short.
+
+### Result 3: digit splicing + uniform synthetic numbers (`splice.py`, `--syn-text uniform`)
+
+* Bank: syn_ft reads 3,330 of 3,502 train 'ok' crops exactly; CTC forced alignment (Viterbi on the known label) gives
+  each digit's frame centre, the cut is the least-ink column (Otsu) within +-20% of the centre gap: 3,302 crops, 5,942
+  glyphs (digit counts '1' 1,282 ... '7' 288). Cuts checked by eye on 64 crops (`splice_cuts.jpg`): right on nearly all.
+* Composites (`splice_samples.jpg`): 35% same crop ("ab" -> "ba", "aa", "bb", "a", "b"), 25% same team (glyphs from the
+  team's crops across events, a number the team does not carry), 40% cross-crop with a target uniform over 1-99 + "0N"
+  and glyphs from crops with a similar plate colour. Glyphs scaled to one box height, 6% linear seam blend, outer
+  context from the source where the glyph keeps its side. Then the normal augmentation. Plus synthetic plates with
+  `gen.rand_text_uniform` (12% "0N", 23% "N", 65% two digits with uniform digits): **63-99 and single digits in both
+  forms are covered by both generators**, although no real crop of 63-99 exists.
+* Mix used: 20% "no number" windows, 20% spliced, 10% synthetic, 50% real. Fold runs build the bank without their
+  held-out numbers' crops (the alignment model saw all training numbers, but no held-out pixels enter a fold's
+  training). Effect: see Result 1 (-21 -> -7 CRNN, -13 -> -3 PARSeq), seen numbers +1, test crops +2.5 greedy / +0.7 snapped
+  (CRNN), +5.1 / +3.8 (PARSeq, 72.2 -> 77.3 greedy).
+
+### Result 4: WP9's panel proposals as extra real data (`prep_props.py`, `--p-prop`)
+
+* 32,425 proposals -> capped at 6 boxes per track (round-robin over the track's crops; against near-duplicate views and
+  confirmation bias) -> 22,004 -> 21,979 with syn_ft's greedy string equal to the consensus (keeps "06": 1,018 leading
+  zeros), 4,318 tracks, 50 numbers. Box + 5% (the deployment pad), cut and augmented like the grounded crops.
+  Train events only (asserted); folds drop their numbers.
+* **No measurable gain**: CRNN val/test 78.4/59.8 vs 78.4/61.3 without, held-out 68.1 vs 69.3; PARSeq 90.5/76.7 vs
+  89.4/77.3, held-out 83.8 vs 84.4, panel chain test top-1 92.2 vs 91.4. All within ~1 point (noise). As feared, these
+  are panels the current models already read: more views of the same 100 cars, not new liveries. Not used in the
+  recommended model (keeps it independent of another model's picks).
+
+### Result 5: track vote fixed for the panel chain (`common.vote_boxed`, `panel_tau.py`, `harness_26se.py --vote boxed`)
+
+* WP9's diagnosis confirmed on val with crop-count simulation (random subsets of 2/4/6/all <= 8 crops per track,
+  num_n320 boxes at conf 0.1 + 5% pad, 2,116 val tracks / 15,007 crops, 604 test tracks): with the old mean vote,
+  coverage at a fixed tau falls as crops are added (syn_ft, tau 0.8: val 56% at 2 crops -> 45% at all; test 27% -> 16%).
+* `vote_boxed`: ignore crops without a box; score = posterior-weighted vote share (sum of P(winner) / sum of each
+  crop's max P), so weak crops (blur, partial panel, a box on a shirt) carry little weight; answer only if >= k boxed
+  crops vote for the winner with P >= 0.5. Also a "mean over boxed crops" variant. tau and k are chosen on val (max
+  coverage at >= 97% precision with all crops, and >= 96% at 4 crops); written to `<run>/eval/panel_tau.json`, which
+  the harness reads. The share rule won for every model except `gx_base` (mean over boxed crops, tau 0.9, k 1);
+  k = 3 everywhere except `pq_all` (k = 2).
+* 26SE (evaluation only; WP9's boxes, nothing tuned): syn_ft 10 crops 28% / 95.5% (old) -> **35.7% / 96.4%**; all crops
+  (<= 30) 16% / 100% -> **29.8% / 100%**. Better, but the val tau is still conservative on 26SE: the start-line crops
+  give weaker posteriors than broadcast close-ups (domain), and with 30 crops a rule with tau near 1 needs near-unanimity.
+  The real lever was the recognizer (below). Val tracks have at most 8 crops, so 10-30 crops cannot be simulated
+  directly; precision rises with the crop count at a fixed tau in every simulation, so the val rule errs on the safe side.
+
+### Comparison and recommendation
+
+Crop columns: grounded boxes ('ok' bucket), greedy accuracy / roster-snapped. Panel chain: num_n320 boxes on WP4 crops
+of teacher-labelled tracks (<= 8 crops), top-1 and the val-chosen rule on test. Latency: ONNX Runtime, batch 1, CPU
+loaded by WP9's training (`export_onnx.py`), 4 threads at batch 8 in brackets. Held-out: Result 1.
+
+| model | params | ms/crop 1 thr / 4 thr | val crop | test crop | panel chain top-1 val / test | chain rule on test (cov / prec) | held-out number (snap) | 26SE panels, all crops: top-1, val rule cov / prec |
+|---|---|---|---|---|---|---|---|---|
+| syn_ft (WP10) | 1.29 M | 2.5 / 1.0 (0.6) | 80.2 / 82.7 | 59.9 / 68.0 | 89.0 / 78.5 | 35% / 97.2% | ~55 (as gx_base) | 66.8%, 29.8% / 100% |
+| CRNN + splice (`gx_spl_full`) | 1.29 M | 2.6 / 1.2 (0.7) | 78.4 / 81.9 | 61.3 / 68.8 | 87.4 / 81.3 | 37% / 98.7% | 69.3 | 68.1%, 40.0% / 98.9% |
+| PARSeq-tiny (`pq_base_full`) | 5.98 M | ~21 / 12 | 90.3 / 91.9 | 72.2 / 78.3 | 90.4 / 86.9 | 48% / 97.6% | 73.3 | - |
+| **PARSeq-tiny + splice (`pq_spl_full`)** | 5.98 M | **21.0 / 12.1 (7.0)** | 89.4 / 91.3 | **77.3 / 82.1** | **91.3 / 91.4** | **61% / 98.9%** | **84.4** | **77.9%, 54.5% / 99.2%** |
+| PARSeq-tiny + splice + proposals (`pq_all_full`) | 5.98 M | same | 90.5 / 91.9 | 76.7 / 82.3 | 91.3 / 92.2 | 56% / 98.5% | 83.8 | - |
+
+* 26SE details (evaluation only, 235 passes with a GT car, 252 laps; `out/eval_recog_pq_spl_full_panels[_all]_boxed/`):
+  10 VLM crops: top-1 71.1% (syn_ft 62.6%), val rule 55.3% / 93.8%; all crops: top-1 77.9% (syn_ft 66.8%), val rule
+  54.5% / 99.2% [95.7-99.9]. End-to-end of the 252 laps without abstaining: 183 = 72.6% (VLM teacher 67.9%); with the
+  val rule 127 = 50.4% at 99% precision. The 10-crop precision (93.8%) is under the val target: calibration does not
+  fully transfer to the start-line domain.
+* **Recommendation: `pq_spl_full` (PARSeq-tiny + digit splicing + uniform synthetic numbers).** It is the only model
+  whose accuracy on numbers it never saw (84%) is close to its accuracy on seen ones (87%), it is the best on test and
+  on 26SE, and it is calibrated on unseen numbers. Cost: ~21 ms per number box on one thread of this 3900X under load
+  (12 ms on 4 threads, 7 ms/box batched), 123 MB peak RAM, 23 MB ONNX. At 10-30 boxes per pass that is 0.2-0.6 s per
+  pass on one thread; fine for lap counting and the PTZ entry camera, but it is ~8x the CRNN. If the laptop budget
+  cannot afford it, use `gx_spl_full` (CRNN + splicing, 2.6 ms): never the WP10 syn_ft, whose unseen-number reads are
+  confidently wrong. `pq_all` is equivalent within noise; `pq_spl` is chosen as the simpler one (best held-out score,
+  no dependency on proposals picked by another model).
+* **Swap-in for WP9's 26SE chain:** `students/runs/recog/pq_spl_full/recog.onnx` has the same input / output names and
+  layout as syn_ft's (`image` (N,3,32,W) float RGB 0-1 -> `logp` (T,N,11), T = 10 instead of W/4). `common.load_any`
+  picks it up by run name: `harness_26se.py --name pq_spl_full --mode panels --boxes out/panel_boxes_num_n320[_all].csv
+  [--all-crops] --vote boxed` (tau 0.9 / k 3 from `pq_spl_full/eval/panel_tau.json`); `panel_val.py --recog
+  pq_spl_full`. Torch fallback: `common.load_model(pq_spl_full/last.pt)` (= best.pt) needs `timm`; the ONNX path needs
+  only onnxruntime.
+
+### What more data would buy
+
+* Distinct training numbers: with splicing + uniform synthetic numbers, PARSeq reads numbers absent from its real
+  training data at 80-84% whether it was trained on 23 numbers / 28 cars (`pq_k25`: unseen 82.2%, seen 89.3%), 36 / 52
+  (`pq_k50`: 79.8% on the 361 crops of its unseen numbers) or ~40 / ~80 (folds: 83.8%). **More distinct numbers are no
+  longer the bottleneck**; the remaining 3-5 point unseen gap is flat in the number count.
+* Cars / liveries: 28 -> 52 -> 100 training cars give test crop accuracy 74.8 -> 74.2 -> 76.7% (snap 80.1 -> 80.6 ->
+  82.3), val 89.0 -> 90.0 -> 90.5%: about +1 point per doubling of cars. The test errors are concentrated in a few
+  liveries (24SU car 16 outlined digits, car 13, stylised 6), so data helps only when it brings new styles: each new
+  event adds ~15-50 liveries. Expect +1-2 points on a new event per doubling of events, i.e. diminishing returns;
+  start-line footage from future events (target domain) is worth more than more broadcast close-ups.
+* SVHN pre-training (task 4): not done. Licence non-commercial (acceptable for an internal team tool), but the
+  scene-text pretrained PARSeq already supplies the real-text prior, and the residual errors are livery styles, not
+  house-number-like digits. Lower priority than recording start-line footage.

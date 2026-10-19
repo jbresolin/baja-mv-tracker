@@ -82,6 +82,7 @@ def main():
     ap.add_argument("--bench-only", action="store_true")
     ap.add_argument("--worker", nargs=4)
     ap.add_argument("--ckpt", default="best.pt", help="checkpoint to export (WP10b protocol runs use last.pt)")
+    ap.add_argument("--export-only", action="store_true")
     a = ap.parse_args()
     if a.worker:
         kind, path, th, b = a.worker
@@ -92,7 +93,12 @@ def main():
     info = {}
     if not a.bench_only:
         out, n, diff = export(a.name, a.ckpt)
-        info.update(params=n, max_abs_diff=diff)
+        info.update(params=n, max_abs_diff=diff, ckpt=a.ckpt)
+        if a.export_only:
+            json.dump(info, open(d / "export.json", "w"), indent=1)
+            return
+    elif (d / "export.json").exists():
+        info.update(json.load(open(d / "export.json")))
     res = []
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="-1")
     for kind, path in (("ort", d / "recog.onnx"), ("torch", d / a.ckpt)):
