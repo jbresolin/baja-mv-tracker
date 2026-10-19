@@ -1,6 +1,6 @@
 {
- "created": "2026-10-19 06:52:43",
- "note": "interim set (pre all-events retrain); same file names will be replaced by the _all models if they pass the 26SE regression check",
+ "created": "2026-10-19 10:55:29",
+ "note": "interim set (pre all-events retrain); panel.onnx re-exported with dynamic=True (WP11 finding); same file names will be replaced by the _all models if they pass the 26SE regression check",
  "models": {
   "car_n": {
    "file": "car_n.onnx",
@@ -19,6 +19,18 @@
      640
     ],
     "preprocess": "resize keeping aspect so the image fits, pad with 114 grey centred, BGR->RGB, CHW, float32 / 255 (see students/bench_cpu.py letterbox)"
+   },
+   "export": {
+    "tool": "ultralytics 8.4.181 YOLO.export",
+    "format": "onnx",
+    "imgsz": [
+     384,
+     640
+    ],
+    "dynamic": false,
+    "simplify": true,
+    "nms": false,
+    "verified": "WP11: matches the .pt within 0.001 px"
    },
    "output": "output0 (1, 5, N): rows 0-3 = box centre x, centre y, width, height in input pixels (after letterbox), row 4 = class score (sigmoid already applied); no NMS inside: filter by conf, then NMS IoU 0.7 (see students/bench_cpu.py postprocess)",
    "cpu_ms_3900x_loaded": {
@@ -45,6 +57,18 @@
     ],
     "preprocess": "resize keeping aspect so the image fits, pad with 114 grey centred, BGR->RGB, CHW, float32 / 255 (see students/bench_cpu.py letterbox)"
    },
+   "export": {
+    "tool": "ultralytics 8.4.181 YOLO.export",
+    "format": "onnx",
+    "imgsz": [
+     384,
+     640
+    ],
+    "dynamic": false,
+    "simplify": true,
+    "nms": false,
+    "verified": "WP11: matches the .pt within 0.001 px"
+   },
    "output": "output0 (1, 5, N): rows 0-3 = box centre x, centre y, width, height in input pixels (after letterbox), row 4 = class score (sigmoid already applied); no NMS inside: filter by conf, then NMS IoU 0.7 (see students/bench_cpu.py postprocess)",
    "cpu_ms_3900x_loaded": {
     "threads_1": 126,
@@ -54,7 +78,7 @@
   },
   "panel": {
    "file": "panel.onnx",
-   "sha256_16": "b91c25f934c5a5d0",
+   "sha256_16": "43f3e3ca4e3ec7e3",
    "source_run": "students/runs/num_n320_r2",
    "arch": "YOLO11n",
    "classes": [
@@ -65,12 +89,21 @@
     "shape": [
      1,
      3,
-     320,
-     320
+     "H",
+     "W"
     ],
-    "preprocess": "resize keeping aspect so the image fits, pad with 114 grey centred, BGR->RGB, CHW, float32 / 255 (see students/bench_cpu.py letterbox); input = one car crop"
+    "preprocess": "one car crop, letterboxed like ultralytics' rect mode: scale so the long side is 320, pad the short side only up to the next multiple of 32 (e.g. 320x256), grey 114, BGR->RGB, CHW, float32 / 255. A fixed 320x320 export padded to square gave the same box count as the .pt on only 89-94% of crops; the dynamic export matches exactly"
    },
-   "output": "output0 (1, 5, 2100): rows 0-3 = box centre x, centre y, width, height in input pixels (after letterbox), row 4 = class score (sigmoid already applied); no NMS inside: filter by conf, then NMS IoU 0.7 (see students/bench_cpu.py postprocess)",
+   "export": {
+    "tool": "ultralytics 8.4.181 YOLO.export",
+    "format": "onnx",
+    "imgsz": 320,
+    "dynamic": true,
+    "simplify": true,
+    "nms": false,
+    "verified": "students/verify_onnx.py: 500 26SE car crops, same box count on 100%, max coordinate difference 0.0001 px"
+   },
+   "output": "output0 (1, 5, N): rows 0-3 = box centre x, centre y, width, height in input pixels (after letterbox), row 4 = class score (sigmoid already applied); no NMS inside: filter by conf, then NMS IoU 0.7 (see students/bench_cpu.py postprocess)",
    "cpu_ms_3900x_loaded": {
     "threads_1": 30,
     "threads_4": 19
@@ -92,6 +125,14 @@
     "preprocess": "number box (+ the detector pad) enlarged by 10% per side (students/recog/augment.plain), resized to height 32 keeping aspect, width padded to 96 with the border mean, RGB float 0-1 (students/recog/common.to_input)"
    },
    "output": "logp (T=10, N, 11): log-probs, class 0 = CTC blank, class d+1 = digit d. Roster snap: students/recog/common.RosterScorer (P('n') + P('0n') per roster number from the CTC sequence likelihood)",
+   "export": {
+    "tool": "students/recog/export_onnx.py",
+    "opset": 17,
+    "dynamic": [
+     "N",
+     "W"
+    ]
+   },
    "cpu_ms_3900x_loaded": {
     "threads_1": 21,
     "threads_4": 12,

@@ -36,16 +36,28 @@ def main():
         models=dict(
             car_n=dict(file="car_n.onnx", sha256_16=sha(D / "car_n.onnx"), source_run="students/runs/%s" % a.car_n,
                        arch="YOLO11n", classes=["car"], input=dict(name="images", shape=[1, 3, 384, 640], preprocess=letterbox),
+                       export=dict(tool="ultralytics 8.4.181 YOLO.export", format="onnx", imgsz=[384, 640], dynamic=False,
+                                  simplify=True, nms=False, verified="WP11: matches the .pt within 0.001 px"),
                        output=yolo_out, cpu_ms_3900x_loaded=dict(threads_1=45, threads_4=21),
                        use="default laptop detector (real-time on one thread at 10 fps)"),
             car_s=dict(file="car_s.onnx", sha256_16=sha(D / "car_s.onnx"), source_run="students/runs/%s" % a.car_s,
                        arch="YOLO11s", classes=["car"], input=dict(name="images", shape=[1, 3, 384, 640], preprocess=letterbox),
+                       export=dict(tool="ultralytics 8.4.181 YOLO.export", format="onnx", imgsz=[384, 640], dynamic=False,
+                                  simplify=True, nms=False, verified="WP11: matches the .pt within 0.001 px"),
                        output=yolo_out, cpu_ms_3900x_loaded=dict(threads_1=126, threads_4=45),
                        use="better precision, needs 4 threads"),
             panel=dict(file="panel.onnx", sha256_16=sha(D / "panel.onnx"), source_run="students/runs/%s" % a.panel,
-                       arch="YOLO11n", classes=["number"], input=dict(name="images", shape=[1, 3, 320, 320],
-                                                                       preprocess=letterbox + "; input = one car crop"),
-                       output=yolo_out.replace("(1, 5, N)", "(1, 5, 2100)"), cpu_ms_3900x_loaded=dict(threads_1=30, threads_4=19)),
+                       arch="YOLO11n", classes=["number"],
+                       input=dict(name="images", shape=[1, 3, "H", "W"],
+                                  preprocess="one car crop, letterboxed like ultralytics' rect mode: scale so the long "
+                                             "side is 320, pad the short side only up to the next multiple of 32 "
+                                             "(e.g. 320x256), grey 114, BGR->RGB, CHW, float32 / 255. A fixed 320x320 "
+                                             "export padded to square gave the same box count as the .pt on only "
+                                             "89-94% of crops; the dynamic export matches exactly"),
+                       export=dict(tool="ultralytics 8.4.181 YOLO.export", format="onnx", imgsz=320, dynamic=True,
+                                   simplify=True, nms=False, verified="students/verify_onnx.py: 500 26SE car crops, "
+                                   "same box count on 100%, max coordinate difference 0.0001 px"),
+                       output=yolo_out, cpu_ms_3900x_loaded=dict(threads_1=30, threads_4=19)),
             recog=dict(file="recog.onnx", sha256_16=sha(D / "recog.onnx"), source_run="students/runs/recog/%s" % a.recog,
                        arch="PARSeq-tiny (digits) with CTC-shaped output",
                        input=dict(name="image", shape=["N", 3, 32, "W"],
@@ -56,6 +68,7 @@ def main():
                        output="logp (T=10, N, 11): log-probs, class 0 = CTC blank, class d+1 = digit d. Roster snap: "
                               "students/recog/common.RosterScorer (P('n') + P('0n') per roster number from the CTC "
                               "sequence likelihood)",
+                       export=dict(tool="students/recog/export_onnx.py", opset=17, dynamic=["N", "W"]),
                        cpu_ms_3900x_loaded=dict(threads_1=21, threads_4=12, threads_4_batch8_per_box=7)),
         ),
         pipeline=dict(

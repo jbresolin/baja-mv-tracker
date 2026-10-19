@@ -70,7 +70,7 @@ def main():
     a = ap.parse_args()
     torch.set_num_threads(a.threads)
     from ultralytics import YOLO
-    det = YOLO(a.panel_weights)
+    det = YOLO(a.panel_weights, task="detect")  # .pt or a (dynamic-shape) .onnx export
     rec = load_any(RECOG_RUNS / a.recog, a.threads)
     roster = read_roster("26SE")
     sc = RosterScorer(roster)
