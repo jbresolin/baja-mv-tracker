@@ -10,7 +10,11 @@ Status (2026-10-18): **teacher done.** WP0–WP6 and WP8 are done (each agent's 
   21 ms on 4 CPU threads. Misses are the overexposed 10:24–10:51 stretch → exposure augmentation in cars_n640_v2.
 - 26SE identity chain (num_n320 + recognizer), no abstain: 62–67% top-1, end-to-end 62% (teacher 67.9%). Abstain
   scoring is being fixed (WP10b). Round 2: 32k proposed panel boxes → numbers_crop_r2 → num_n320_r2, plus more digits.
-- GPU queue: cars_s640 (running) → num_n320_r2 → cars_n640_v2.
+- GPU queue: cars_s640 (running) → num_n320_r2 → cars_n640_v2 → student-only 26SE end to end.
+- **WP10b is done. Deploy `pq_spl_full`** (PARSeq-tiny + digit splicing + uniform synthetic numbers): 84% on unseen
+  numbers vs 87% on seen ones (the WP10 CRNN gets 55%: it memorised numbers), 21 ms/box on 1 thread. 26SE on the teacher's
+  passes: 72.6% of laps right with no abstain (VLM 67.9%), or 99.2% precision at 54.5% coverage. More events are now worth
+  only ~+1–2 points per doubling. New liveries (future start-line footage) matter more than more numbers.
 - Number boxes exist for only 2.6k of the 7.4k consensus tracks. Plan: train the number-panel student on them, then let it
   propose boxes for the rest (cheaper than ~5 GPU-h of grounded reads), keeping only boxes whose read matches the consensus.
 
