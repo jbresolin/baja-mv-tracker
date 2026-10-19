@@ -50,6 +50,9 @@ def main():
     ap.add_argument("--no-pretrained", action="store_true")
     ap.add_argument("--img-w", type=int, default=128, help="encoder input width (64 halves the encoder cost)")
     ap.add_argument("--init", default=None, help="start from a train_parseq.py checkpoint instead")
+    ap.add_argument("--all-splits", action="store_true",
+                    help="(WP9 final models) train on train + val + test (all events); val is then logged only, "
+                         "NOT held out; use last.pt")
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--workers", type=int, default=2)
     ap.add_argument("--seed", type=int, default=0)
@@ -61,7 +64,7 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     (out / "args.json").write_text(json.dumps(vars(a), indent=1))
 
-    tr = load("train")
+    tr = load("train") + (load("val") + load("test") if a.all_splits else [])
     held = gen.fold_numbers(a.fold)
     tr = gen.keep_cars(gen.exclude_numbers(tr, held), a.keep_cars, a.keep_seed)
     print("held out", sorted(held), "train items", len(tr), flush=True)
