@@ -11,7 +11,8 @@ not travel with the folder:
    timestamp + confidence, as a third "fonte" next to the human counters.
 2. "Entry camera" for the live-stream PTZ tracker: read car numbers at the start of the PTZ section so tracking can
    prioritise cars of interest.
-The final system must run on a **modest laptop (≤16 GB RAM, small or no GPU)**. Heavy models are only for offline
+The final system must run on a **modest laptop**. The laptop isn't chosen yet; the worst-case budget the user gave
+(2026-10-19) is a **4-core 8th-gen Intel, 8 GB RAM, Intel iGPU**. Heavy models are only for offline
 labelling (teacher). Offline teacher hardware: dedicated streaming PC, Ryzen 3900X + RTX 2080 Ti (11 GB, Turing, fp16 only,
 no bf16) + 64 GB RAM, available for weeks.
 
