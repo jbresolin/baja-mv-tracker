@@ -14,3 +14,5 @@ students/runs/
 __pycache__/
 *.pyc
 PAUSE
+# deployable ONNX set (regenerate with students/make_manifest.py + exports; see deploy/models/manifest.json)
+deploy/models/*.onnx
