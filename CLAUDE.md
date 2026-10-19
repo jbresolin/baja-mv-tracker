@@ -38,7 +38,8 @@ no bf16) + 64 GB RAM, available for weeks.
   (emulation), and `vlm.py` checks native support. Don't batch the VLM above 6 here (11 GB, desktop uses ~1.8 GB).
 - **Laptop students (session 2) match the teacher on 26SE:** `cars_s640` / `cars_n640_v2` (car) → `num_n320_r2` (number
   panel) → `pq_spl_full` (PARSeq-tiny + digit splicing) → boxed vote, all ONNX on CPU. Recall 0.93, precision 0.97, right
-  number on 75.8% of laps, auto-confirm at 100% precision on 57%. Details: TRAINING_PLAN.md status and LESSONS.md (WP9/WP10b).
+  number on 75.8% of laps, auto-confirm at ~99% precision on 53–57% (offline 144/144; the online `rt/` replay 134/135).
+  Real-time prototype: `rt/` (see rt/README.md). Laptop default is cars_n640_v2; cars_s640 doesn't fit. Details: TRAINING_PLAN.md status and LESSONS.md (WP9/WP10b).
 - Number reading: Qwen3-VL-4B-Instruct on ~10 crops per pass, majority vote snapped to the event roster
   (≈94–96% accurate when it answers; abstains on mud). Car #1 is unreadable (mud), which is a re-ID problem.
 - Pass rules: one car = one count. Merge tracks that re-start where the last box ended (<10 s), and merge coexisting

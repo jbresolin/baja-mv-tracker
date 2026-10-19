@@ -8,6 +8,10 @@
 | cars_s640 + num_n320_r2 + pq_spl_full | 0.929 / 0.967 | **75.8%** | **144/144 = 100%**, 57.1% of laps | 45 ms/frame (4 threads) |
 | cars_n640_v2 (same chain) | 0.925 / 0.932 (0.971 tracking at 10 fps) | 75.8% | 139/139, 55.2% | 21 ms/frame (4 thr), 45 (1 thr) |
 
+**Correction (WP11 online replay):** auto-confirm is ~99%, not 100%. The real-time `rt/` replay of the whole race
+(cars_n640_v2, 10 fps) gives recall 0.925, precision 0.971, right number 75.8% and auto-confirm 134/135 = 99.3%. The one error
+is car 6's stylised 6 read as 5 with high confidence, because online crop picking favours sharp crops that agree. It keeps up
+in real time on 2 pinned cores at the finish. cars_s640 drops frames, so it is out of the laptop budget.
 Identity costs ~0.25–0.75 s per pass on 4 threads (~3% of a core at one pass per 40 s); RAM < 0.4 GB.
 **Caveat:** 26SE has now been used to compare many variants. Its ranking was never contradicted by val or test, but it is
 becoming a development set. The next event's start line, with human counts, is the real test.
