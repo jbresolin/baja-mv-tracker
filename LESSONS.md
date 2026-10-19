@@ -1584,3 +1584,75 @@ Real 1080p frame. Wall ms p50 (CPU ms = all threads of the process, i.e. what th
    (number) events.
 4. Camera / capture: USB (MJPEG?) or IP camera (RTSP H.264?), resolution and fps. Can it stream at 10-15 fps? It sets
    the decode cost, which is the largest single item on the laptop.
+
+## Session 2: final deployable models on all 5 events + deploy/models (WP9)
+
+`students/build_all_events.py` builds `datasets/cars_all` (45,939 images) and `datasets/numbers_crop_r2_all` (25,068) as
+hard links of train + val + test (the sources are untouched; ultralytics' label caches land in the new folders);
+`images/val` = 25SU again, for curves only (it is in the training data). `students/queue_final.sh` ran everything.
+
+### Recipe: identical hyperparameters, fixed epochs, no early stopping
+
+* Epochs = the best epoch of the held-out run, i.e. **the same number of passes over the (larger) data**: cars_n640_v2_all
+  66 epochs (best of cars_n640_v2), cars_s640_all 55 (cars_s640), num_n320_r2_all 73 (num_n320_r2); `--patience 0`, and
+  **`last.pt` is the model** (best.pt is picked on 25SU, which is in training). Unavoidable differences from the held-out
+  runs: the linear LR decay now ends at the last epoch (the held-out runs stopped mid-schedule at ~35-45% of lr0), and
+  ultralytics' `close_mosaic = 10` now applies to the last 10 epochs (the held-out runs never reached it).
+* Recognizer `pq_spl_all`: `train_parseq.py --all-splits` (new option: train + val + test caches, 5,540 'ok' crops vs
+  3,502) with the pq_spl_full recipe; PARSeq epochs are fixed sample counts (6,000), so "same passes over the data" =
+  5 x 1.58 -> **8 epochs** (51 min on CPU, 4 threads); last.pt. The splice bank stays train-only (its glyphs come from
+  the alignment of the train crops). tau / k copied from pq_spl_full (no val left): `pq_spl_all/eval/panel_tau.json`.
+* GPU time: num_n320_r2_all 1.0 h, cars_n640_v2_all 4.5 h (~245 s/epoch), cars_s640_all 5.6 h (~360 s/epoch).
+  Final curves on 25SU (not held out): n 0.950 / 0.811, s 0.964 / 0.848, panel 0.909 / 0.545.
+
+### 26SE regression check (evaluation only; full eval with the new car models + e2e_26se.py)
+
+Pass metrics come from each car model's own 5 fps timeline + 30 fps tracking. Identity: <= 30 crops per pass, panel boxes
+conf 0.1 + 5%, boxed vote tau 0.9 / k 3. "rule" = answered share of matched passes / precision / end-to-end of 252 laps.
+
+| car passes | panel | recognizer | pass recall / precision | no abstain: precision / end-to-end | val rule: answered / precision / end-to-end |
+|---|---|---|---|---|---|
+| cars_n640_v2 (current) | r2 | pq_spl_full | 0.925 / 0.932 | 82.7% / 75.8% | 60% / 100% / 55.2% |
+| cars_s640 (current) | r2 | pq_spl_full | 0.929 / 0.967 | 82.7% / 75.8% | 62% / 100% / 57.1% |
+| **cars_n640_v2_all** | r2 | pq_spl_full | **0.925 / 0.967** | 82.3% / 75.8% | 60% / 100% / 55.6% |
+| **cars_n640_v2_all** | **r2** | **pq_spl_all** | 0.925 / 0.967 | **84.4% / 77.4%** | **61% / 100% / 56.4%** (142 / 142) |
+| cars_n640_v2_all | r2_all | pq_spl_all | 0.925 / 0.967 | 85.0% / 76.6% | 64% / 99.3% / 59.1% (149 / 150) |
+| **cars_s640_all** | r2 | pq_spl_full | 0.929 / 0.967 | 85.8% / 79.0% | 60% / 99.3% / 55.6% |
+| **cars_s640_all** | **r2** | **pq_spl_all** | 0.929 / 0.967 | **85.3% / 78.6%** | **60% / 99.3% / 55.2%** (139 / 140) |
+| cars_s640_all | r2_all | pq_spl_all | 0.929 / 0.967 | 87.5% / 80.6% | 64% / 98.7% / 58.3% (147 / 149) |
+
+On the teacher's passes (harness, all crops): r2 + pq_spl_full top-1 82.1%, rule 62% / 98.6%; r2 + pq_spl_all 83.4%,
+64% / 98.7%; r2_all + pq_spl_full 78.3%, 61% / 98.6%; r2_all + pq_spl_all 83.4%, 65% / 98.7%. With 10 crops: 74.9 /
+78.7 / 74.9 / 77.0% top-1.
+
+* **cars_n640_v2_all: better.** Same recall, **pass precision 0.932 -> 0.967** (8 false passes instead of 17; the same
+  stationary / end-of-race kinds remain). **cars_s640_all: same pass metrics** (identical recall / precision), slightly
+  better identity downstream. Both adopted.
+* **pq_spl_all: at least as good** (+1.3 points top-1 on the teacher's passes, +1.6 end-to-end on the n passes, -0.4 on
+  the s passes = 1 lap, precision unchanged). Adopted.
+* **num_n320_r2_all: not adopted.** It is not clearly worse, but it trades precision for coverage at the auto-confirm rule:
+  +7 / +8 correct auto-confirms and **+1 / +1 wrong ones** (99.3% / 98.7% instead of 100% / 99.3%), and it finds fewer
+  boxes on the 26SE crops (5,803 vs 6,651 on the harness crops). For a human-assist system a wrong auto-confirm costs more
+  than a missed one, so the deployed panel stays num_n320_r2. The extra errors (car 13 read "16" at 10:41:21, car 1 read
+  "13" at 10:24:26) are in the washed-out stretch where all chains are weakest, and the differences are within the
+  Wilson intervals (~±3 points at n ~ 145): this is a judgement call, not a significant result.
+* So the deployed set is **car_n = cars_n640_v2_all, car_s = cars_s640_all, panel = num_n320_r2, recog = pq_spl_all**.
+  With car_n: pass recall 0.925 / precision 0.967, 77.4% of laps named correctly without abstaining, auto-confirm on 61%
+  of passes at 100% (teacher: 0.933 / 0.975 / 67.9%).
+
+### deploy/models (ONNX set for WP11's rt/; `students/make_manifest.py` writes manifest.json)
+
+* `car_n.onnx`, `car_s.onnx`: fixed 1x3x384x640 (`dynamic=False`, simplify, no NMS). `panel.onnx`: **dynamic shapes**
+  (`dynamic=True`, imgsz 320). `recog.onnx`: students/recog/export_onnx.py (opset 17, dynamic N and W). The `.onnx`
+  files are gitignored; `manifest.json` (committed) has source runs, sha256 prefixes, export flags, pre/post-processing,
+  and every pipeline threshold (detector conf 0.15, ByteTrack defaults, 10 fps tracking, passes.py rules incl.
+  MIN_FRAMES 6 in frames, crops <= 30 with 5% pad, panel conf 0.1 / pad 0.05, recognizer +10%, vote share tau 0.9 / k 3
+  / p 0.5, roster snapping).
+* **Fixed-size export bug found by WP11:** a 320x320 panel export padded every crop to a square, while the .pt (ultralytics
+  rect mode) pads only to the next multiple of 32, so the box count matched on only 89-94% of crops
+  (`students/verify_onnx.py`: 89% same count, max difference up to 72 px). The dynamic export matches on 100% (max
+  0.0001 px, 500 26SE crops). The car exports at 384x640 match exactly anyway (99 26SE frames: 100% same count, max 0.0004 px)
+  because a 16:9 frame letterboxes to 384x640 in both cases.
+* The deploy files themselves were validated end to end: `e2e_26se.py --panel-weights deploy/models/panel.onnx --recog
+  pq_spl_all` on the cars_*_all passes reproduces the .pt numbers exactly (n: 77.4% / 61% at 100%; s: 78.6% / 60% at
+  99.3%). `e2e_26se.py` now accepts an .onnx panel detector.

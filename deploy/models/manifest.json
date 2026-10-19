@@ -1,11 +1,11 @@
 {
- "created": "2026-10-19 10:55:29",
- "note": "interim set (pre all-events retrain); panel.onnx re-exported with dynamic=True (WP11 finding); same file names will be replaced by the _all models if they pass the 26SE regression check",
+ "created": "2026-10-19 20:21:39",
+ "note": "final set: car_n, car_s, recog retrained on all 5 events; panel = num_n320_r2 (dynamic export); validated end to end on 26SE with these files",
  "models": {
   "car_n": {
    "file": "car_n.onnx",
-   "sha256_16": "562a07f6f773edef",
-   "source_run": "students/runs/cars_n640_v2",
+   "sha256_16": "a15cb56e9195ed27",
+   "source_run": "students/runs/cars_n640_v2_all",
    "arch": "YOLO11n",
    "classes": [
     "car"
@@ -41,8 +41,8 @@
   },
   "car_s": {
    "file": "car_s.onnx",
-   "sha256_16": "e8b21ff3918376b9",
-   "source_run": "students/runs/cars_s640",
+   "sha256_16": "86f302d90e716fe8",
+   "source_run": "students/runs/cars_s640_all",
    "arch": "YOLO11s",
    "classes": [
     "car"
@@ -111,8 +111,8 @@
   },
   "recog": {
    "file": "recog.onnx",
-   "sha256_16": "17153f705cbe5604",
-   "source_run": "students/runs/recog/pq_spl_full",
+   "sha256_16": "8e9a5837cbfe0a1b",
+   "source_run": "students/runs/recog/pq_spl_all",
    "arch": "PARSeq-tiny (digits) with CTC-shaped output",
    "input": {
     "name": "image",
@@ -193,9 +193,13 @@
    "snapping": "numbers outside the roster are never output"
   }
  },
+ "training": {
+  "final": "car_n / car_s / recog trained on all 5 stream events (19SU, 24SU, 25BR, 25SU, 26BR; no held-out split) with the recipes of cars_n640_v2 / cars_s640 / pq_spl_full and a fixed epoch count = the best epoch of the held-out run (same number of passes over the data; no early stopping; last.pt). panel = num_n320_r2 (held-out run; its all-events version num_n320_r2_all was not adopted, see LESSONS)",
+  "regression": "26SE e2e (students/e2e_26se.py) with these exact files: see benchmark_26se"
+ },
  "benchmark_26se": {
   "teacher": "YOLO-World + VLM: pass recall 0.933, precision 0.975, end-to-end 67.9%",
-  "students_s640": "recall 0.929, precision 0.967, identity no-abstain 82.7% (end-to-end 75.8%), val rule 62% coverage at 100% (end-to-end 57.1%)",
-  "students_n640_v2": "recall 0.925, precision 0.932 (30 fps tracking), end-to-end 75.8% / 55.2%"
+  "car_n_chain": "car_n + panel + recog (this set): pass recall 0.925, precision 0.967 (30 fps tracking); identity no-abstain 84.4% right, end-to-end 77.4%; val rule 61% of matched passes at 100% (142/142), end-to-end 56.4%",
+  "car_s_chain": "car_s + panel + recog (this set): pass recall 0.929, precision 0.967; no-abstain 85.3%, end-to-end 78.6%; val rule 60% at 99.3% (139/140), end-to-end 55.2%"
  }
 }

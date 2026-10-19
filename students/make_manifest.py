@@ -92,11 +92,19 @@ def main():
                       source="picked on 25SU val by WP10b (students/runs/recog/pq_spl_full/eval/panel_tau.json)"),
             roster=dict(file="rosters/<EVENT>.csv (numero,equipe)", snapping="numbers outside the roster are never output"),
         ),
+        training=dict(
+            final="car_n / car_s / recog trained on all 5 stream events (19SU, 24SU, 25BR, 25SU, 26BR; no held-out split) "
+                  "with the recipes of cars_n640_v2 / cars_s640 / pq_spl_full and a fixed epoch count = the best epoch of "
+                  "the held-out run (same number of passes over the data; no early stopping; last.pt). panel = "
+                  "num_n320_r2 (held-out run; its all-events version num_n320_r2_all was not adopted, see LESSONS)",
+            regression="26SE e2e (students/e2e_26se.py) with these exact files: see benchmark_26se"),
         benchmark_26se=dict(
             teacher="YOLO-World + VLM: pass recall 0.933, precision 0.975, end-to-end 67.9%",
-            students_s640="recall 0.929, precision 0.967, identity no-abstain 82.7% (end-to-end 75.8%), val rule 62% "
-                          "coverage at 100% (end-to-end 57.1%)",
-            students_n640_v2="recall 0.925, precision 0.932 (30 fps tracking), end-to-end 75.8% / 55.2%"),
+            car_n_chain="car_n + panel + recog (this set): pass recall 0.925, precision 0.967 (30 fps tracking); identity "
+                        "no-abstain 84.4% right, end-to-end 77.4%; val rule 61% of matched passes at 100% (142/142), "
+                        "end-to-end 56.4%",
+            car_s_chain="car_s + panel + recog (this set): pass recall 0.929, precision 0.967; no-abstain 85.3%, "
+                        "end-to-end 78.6%; val rule 60% at 99.3% (139/140), end-to-end 55.2%"),
     )
     (D / "manifest.json").write_text(json.dumps(m, indent=1))
     print(json.dumps({k: v["file"] + " <- " + v["source_run"] for k, v in m["models"].items()}, indent=1))
