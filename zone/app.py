@@ -8,7 +8,9 @@ Page: http://<laptop>:8090/ (pt-BR). It always starts in STOPPED (also after a c
 until someone presses PASSIVO or AUTO.
 
 Exit codes (the launcher restarts on anything but 0): 0 = stopped on purpose (Ctrl-C), 3 = no spotter frames for
-health.no_frame_exit_s, 1 = crash.
+health.no_frame_exit_s, 1 = crash. When the watchdog fires and the clean shutdown doesn't finish within
+health.shutdown_grace_s (e.g. the frame loop is stuck in a hung detector or PTZ call), the process is killed with
+os._exit(3), so the launcher always gets to restart it.
 """
 import argparse
 import datetime as dt
@@ -56,8 +58,13 @@ class ZoneApp:
     """Everything the page talks to. Built by `main()`, or by tests with fakes (no threads started)."""
 
     def __init__(self, cfg, settings, ptz, clock, zone, zone_path, out_dir, source=None, spotter=None,
-                 log=print, cycle_log=True):
+                 log=print, cycle_log=True, hard_exit=os._exit, wait_event=None):
         self.cfg, self.settings, self.ptz, self.clock = cfg, settings, ptz, clock
+        # how the watchdog kills a stuck process, and how it waits for the shutdown: injected by the tests (a fake
+        # exit that only records the code, and an instant wait), real os._exit / Event.wait otherwise
+        self.hard_exit = hard_exit
+        self.wait_event = wait_event or (lambda ev, timeout: ev.wait(timeout))
+        self.exited_ev = threading.Event()   # set by main() just before the process returns
         self.zone_path = Path(zone_path)
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
@@ -90,7 +97,10 @@ class ZoneApp:
     def _log(self, msg, kind="info"):
         self.print(msg)
         if self.control_log:
-            self.control_log.write(dict(type=kind, msg=msg))
+            try:
+                self.control_log.write(dict(type=kind, msg=msg))
+            except Exception:  # noqa: BLE001 (logging must never take the process down)
+                pass
 
     def _on_event(self, ev):
         e = dict(ev)
@@ -139,14 +149,44 @@ class ZoneApp:
         self.recorder.write(fr)
 
     def watchdog(self):
-        """No frames for too long -> exit 3, so the launcher restarts the whole process (camera unplugged...)."""
-        limit = float(self.cfg["health"]["no_frame_exit_s"])
+        """No frames for too long -> exit 3, so the launcher restarts the whole process (camera unplugged, hung
+        detector or PTZ call...)."""
         while not self.stop_ev.wait(1.0):
-            if self.clock.monotonic() - self.last_frame_mono > limit:
-                self._log("no spotter frame for %.0f s: exiting so the launcher restarts" % limit, "error")
-                self.exit_code = 3
-                self.shutdown()
+            if self.check_frames():
                 return
+
+    def check_frames(self):
+        """One watchdog check. -> True when it fired (and the process is on its way out)."""
+        limit = float(self.cfg["health"]["no_frame_exit_s"])
+        if self.clock.monotonic() - self.last_frame_mono <= limit:
+            return False
+        self._log("no spotter frame for %.0f s: exiting so the launcher restarts" % limit, "error")
+        self.exit_code = 3
+        self.shutdown_or_exit(3)
+        return True
+
+    def shutdown_or_exit(self, code):
+        """Clean shutdown, but never a hang: shutdown() runs in a helper thread, and if it hasn't finished within
+        health.shutdown_grace_s the process is killed (os._exit) with `code`. A frame loop stuck inside a cycle can
+        block the shutdown (it holds locks, the PTZ call never returns...); without this the process would sit there
+        forever and the launcher would never restart it. After a clean shutdown, main() must also return within the
+        same grace, or the process is killed anyway."""
+        grace = float(self.cfg["health"].get("shutdown_grace_s", 5.0))
+        done = threading.Event()
+
+        def run():
+            try:
+                self.shutdown()
+            finally:
+                done.set()
+        threading.Thread(target=run, daemon=True, name="shutdown").start()
+        if not self.wait_event(done, grace):
+            self._log("shutdown did not finish within %.0f s: forcing exit %d" % (grace, code), "error")
+            self.hard_exit(code)
+            return
+        if not self.wait_event(self.exited_ev, grace):
+            self.print("process still running %.0f s after shutdown: forcing exit %d" % (grace, code))
+            self.hard_exit(code)
 
     def health_loop(self, period_s=5.0):
         from rt import timesync
@@ -444,6 +484,7 @@ def main(argv=None):
         ptz.close()
     except Exception:  # noqa: BLE001
         pass
+    zapp.exited_ev.set()           # the watchdog's "forced exit" no longer needs to fire
     return zapp.exit_code
 
 

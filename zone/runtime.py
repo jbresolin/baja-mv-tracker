@@ -7,6 +7,9 @@ The same `ZoneRuntime` runs live in the app (zone/app.py, real or simulated PTZ,
 replay harness (zone/tools/replay.py, SimulatedPtz on a fake clock), so what's measured offline is what runs live.
 
 Thread safety: the app's web handlers (mode buttons, big STOP, teach edits) and the frame loop share one lock.
+The big STOP never waits for it forever: if the frame loop is stuck while holding it (a hung detection or PTZ call),
+`big_stop()` gives up after `health.stop_lock_timeout_s`, sends the stop straight to the driver, and leaves a flag
+that the next cycle obeys.
 """
 import json
 import threading
@@ -31,6 +34,7 @@ class ControlLog:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.f = open(self.path, "a", encoding="utf-8")
+        self.closed = False
         self.clock = clock
         self.flush_every = max(1, int(flush_every))
         self.n = 0
@@ -42,6 +46,8 @@ class ControlLog:
         rec.setdefault("wall", round(self.clock.wall(), 3))
         line = json.dumps(rec, separators=(",", ":"), default=str)
         with self.lock:
+            if self.closed:          # a late line during shutdown (e.g. from the watchdog): dropped, never a crash
+                return
             self.f.write(line + "\n")
             self.n += 1
             if self.n % self.flush_every == 0:
@@ -49,6 +55,7 @@ class ControlLog:
 
     def close(self):
         with self.lock:
+            self.closed = True
             self.f.close()
 
 
@@ -73,6 +80,9 @@ class ZoneRuntime:
         self.log = log
         self.on_event_cb = on_event
         self.lock = threading.RLock()
+        # how long the big STOP waits for the lock before stopping the camera directly (see big_stop)
+        self.stop_lock_timeout_s = float(settings.cfg.get("health", {}).get("stop_lock_timeout_s", 0.5))
+        self.stop_requested = False      # set by big_stop when it couldn't get the lock: the next cycle obeys it
         self.profile_path = Path(profile_path) if profile_path else None
         self.profile = profile
         if self.profile is None and self.profile_path and self.profile_path.exists():
@@ -151,18 +161,47 @@ class ZoneRuntime:
                 self.controller.stop()      # immediately, not at the next frame
             return True, mode
 
-    def big_stop(self):
-        """The big red button: STOPPED and a stop command right now."""
-        with self.lock:
-            self.director.set_mode(D.STOPPED, self.clock.monotonic(), "big_stop")
-            self.controller.stop()
-            self.director._pending = None   # already stopped
+    def big_stop(self, lock_timeout_s=None):
+        """The big red button: STOPPED and a stop command right now. -> True if it got the lock and switched the
+        director to STOPPED, False if the frame loop is stuck holding the lock (then the camera was stopped directly
+        through the driver, and the next cycle switches to STOPPED as soon as the loop gets going again)."""
+        timeout = self.stop_lock_timeout_s if lock_timeout_s is None else float(lock_timeout_s)
+        self.stop_requested = True
+        got = self.lock.acquire(timeout=timeout) if timeout > 0 else self.lock.acquire(blocking=False)
+        if not got:
+            # the frame loop is stuck inside a cycle (hung detector, hung PTZ call...): don't wait for it forever,
+            # talk to the driver directly. The driver has its own lock with a timeout, so this can't hang either.
+            self._direct_stop()
+            self._event(dict(type="warning", msg="big STOP: frame loop busy for %.1f s, stop sent directly to the PTZ"
+                             % timeout))
+            return False
+        try:
+            self._apply_stop("big_stop")
             return True
+        finally:
+            self.lock.release()
+
+    def _direct_stop(self):
+        """Stop pan/tilt and zoom through the driver, without the controller (and without the runtime lock)."""
+        for fn in (self.ptz.stop, self.ptz.zoom_stop):
+            try:
+                fn()
+            except Exception:  # noqa: BLE001 (a dead PTZ must not stop us from trying the next command)
+                pass
+
+    def _apply_stop(self, why):
+        """Caller holds self.lock: director to STOPPED and a stop through the controller."""
+        self.director.set_mode(D.STOPPED, self.clock.monotonic(), why)
+        self.controller.stop()
+        self.director._pending = None   # already stopped
+        self.stop_requested = False
 
     # ------------------------------------------------------------------------------------------- one cycle
     def cycle(self, frame, tracker_out=None) -> CycleResult:
         """frame: ZoneFrame (img may be None when tracker_out is given, e.g. a cached replay)."""
         with self.lock:
+            if self.stop_requested:
+                self._apply_stop("big_stop (delayed: the loop was busy)")
             if hasattr(self.ptz, "tick"):
                 self.ptz.tick()                      # the simulator integrates its motion up to now
             if frame.img is not None:

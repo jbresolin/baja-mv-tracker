@@ -149,6 +149,10 @@ ptz_segment_s = 0                 # > 0: split the PTZ recording into files of t
 [health]
 min_free_gb = 5.0                 # warn on the page below this free disk space in out_dir
 no_frame_exit_s = 20.0            # no spotter frame for this long: exit with an error so the launcher restarts us
+shutdown_grace_s = 5.0            # ... and if the clean shutdown hangs (stuck detector / PTZ call), kill the process
+                                  # (os._exit 3) after this long, so the launcher can always restart it
+stop_lock_timeout_s = 0.5         # big STOP: wait at most this long for the control loop; past it, the stop goes
+                                  # straight to the PTZ driver and the loop switches to STOPPED when it wakes up
 
 [supervisor]
 backoff_initial_s = 2.0           # run_zone.bat: wait before restarting a crashed process, doubling each time ...
