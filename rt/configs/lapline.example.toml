@@ -1,0 +1,89 @@
+# Lap-line node (WP-L1): one rt, a USB MJPEG webcam, recording + status page, started by rt\run_lapline.bat.
+#
+# Copy this file to rt/configs/lapline.toml and edit it for the event. Only the keys written here change the
+# defaults; every other setting comes from rt/config.toml (see rt/README.md for all of them).
+# Any key can also be changed for one run: --set section.key=value (e.g. --set camera.settings.exposure=-9).
+
+[launch]                        # read by rt/supervise.py (the launcher)
+name = "lapline"                # output files: <out_dir>/<date>/lapline_<HH-MM-SS>.jsonl
+event = "27SE"                  # REQUIRED: the event's roster code (rosters/<EV>.csv)
+source = "camera"               # "camera" = the [camera] section below; a number = that camera index
+out_dir = "out/lapline"         # runs, recordings (rec/ next to each JSONL) and launcher.log go here
+extra_args = ["--stats"]        # more rt/run.py arguments: --stats samples CPU/RAM into the .stats.json
+restart_first_s = 5             # after rt exits or stalls: wait 5 s, then 10, 20, 40, 60, 60, ...
+restart_max_s = 60
+healthy_reset_min = 10          # a run that lasted 10 min resets the wait to 5 s
+stall_s = 30                    # status page fps = 0 (or no answer) for 30 s -> kill rt and restart it
+startup_grace_s = 60            # no stall check in the first 60 s of a run (models load, camera opens)
+poll_s = 2                      # how often the launcher looks at rt
+
+[runtime]
+priority = "high"               # Windows: above-normal priority on race day
+# affinity = [2, 3]             # optional: pin rt to some CPUs (needs psutil)
+
+[capture]
+fps = 10.0                      # processing rate (as evaluated; don't change without re-scoring)
+live_latency_s = 0.0            # camera latency subtracted from frame times; measure it (LED/beam, WP-L2) and set it
+
+[camera]
+backend = "auto"                # auto = DirectShow on Windows; "msmf" only if DirectShow misbehaves
+device = 0                      # BETTER: the device path from `python rt/run.py --list-cameras`, e.g.
+                                # device = "usb#vid_046d&pid_085e&mi_00#7&2f0c1a3b&0&0000"
+                                # (any unique part of it). Identical webcams share a name, so names are never used.
+width = 1920
+height = 1080
+fps = 30
+fourcc = "MJPG"                 # 1080p30 over USB 2 needs MJPG; rt fails loudly (and retries) if the camera gives another
+require_fourcc = true
+read_mode = "auto"              # DirectShow: every frame is retrieved (decoded) and 2 of 3 are dropped; see rt/README.md
+lost_after_s = 3.0              # no frame for 3 s = camera lost: status page "lost", recording file closed,
+lost_after_failures = 10        # reopen with backoff (1 s ... 30 s) until the camera is back
+reopen_first_s = 1
+reopen_max_s = 30
+clock_map_every_s = 60          # JSONL `clock_map` event: wall clock vs monotonic clock of one grab
+
+[camera.settings]
+# Applied at every open (webcams forget them on replug), then read back and logged; the status page shows the
+# read-back. Values are the backend's raw units. A setting the camera does not support gives a warning, not an error.
+# Delete a line to leave that setting as the camera has it. Check the read-back on the status page.
+#
+# DirectShow (Windows) units:
+#   auto_exposure: the OpenCV DirectShow backend treats 0 as manual; some drivers want 0.25 (manual) / 0.75 (auto)
+#   exposure: log2(seconds): -10 = 1/1024 s (the 1/1000 s target), -9 = 1/512 s, -8 = 1/256 s
+#   gain: 0 .. 255 on most UVC webcams (raise it if the image is dark at -10)
+#   auto_wb: 0 = off; wb_temperature: Kelvin (5500 = daylight)
+#   autofocus: 0 = off; focus: 0 .. 255 (UVC), 0 = infinity on most Logitech
+auto_exposure = 0
+exposure = -10
+gain = 64
+auto_wb = 0
+wb_temperature = 5500
+autofocus = 0
+focus = 0
+
+[recording]
+mode = "h264"                   # "h264": ~4 GB per hour at 10 fps (x264 CRF 23 on 26SE footage; check the real size on
+                                # the T14), hardware encoder (QuickSync / AMF) if one works, else x264 veryfast.
+                                # "off": no recording. ("mjpeg" copy is not possible: DirectShow decodes the frames.)
+segment_min = 30                # one file per 30 minutes: rec_<date>_<time>.mkv + .json sidecar + .frames.csv
+                                # (+ .ffmpeg.log); also a new file after a camera loss or a gap in the frames
+warn_free_gb = 20               # status page warns under 20 GB free
+stop_free_gb = 5                # recording stops under 5 GB (detection never stops); resumes above warn_free_gb
+h264_encoders = ["h264_qsv", "h264_amf", "libx264"]   # probed in this order at start; rt logs the one it uses
+
+[status]
+enabled = true                  # the launcher needs it to detect stalls
+bind = "0.0.0.0"                # all interfaces: open http://<laptop IP>:8765/ on a phone on the same network
+port = 8765                     # Windows asks once to allow Python through the firewall: allow "Private networks"
+passes = 20
+time_check_s = 60
+
+[clock]
+ntp_server = "192.168.88.1"     # PLACEHOLDER: set the event router's IP (192.168.88.1 is a MikroTik's default). rt
+                                # asks it for the time (SNTP) at start and every minute: the primary clock check,
+                                # shown on the status page (red above 0.5 s). The router must answer NTP (MikroTik:
+                                # enable its NTP server). "" = no network check, only Windows' own sync status.
+offset_s = 0.0                  # manual correction only if the PC clock can't be synced
+
+[lapapp]
+enabled = false                 # shadow mode: nothing is written to the lap app at this event
