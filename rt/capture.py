@@ -5,8 +5,10 @@ clock (epoch seconds). Sources:
   WP9: never `select`, it duplicates frames), frame time = file start + pts. File start from the OBS clock overlay
   when present (26SE), else the container creation_time, else mtime - duration. `realtime=True` paces frames at real
   speed and drops frames when detection falls behind (as a live source would); otherwise every frame is processed.
-* camera index (OpenCV), or rtsp/http/udp URL (ffmpeg pipe, `fps` filter): frame time = system clock at arrival
-  minus a configured latency; a full queue drops the frame (never blocks the camera).
+* USB camera (`camera`, an index, or the [camera] config; rt/livecam.py): grab() every frame, retrieve() only the
+  processed ones; frame time = system clock at grab minus a configured latency; recorded by rt/recorder.py.
+* rtsp/http/udp URL (ffmpeg pipe, `fps` filter): frame time = system clock at arrival minus a configured latency.
+Live sources never block: a full queue drops the frame.
 """
 import datetime as dt
 import json
@@ -31,7 +33,7 @@ class Frame:
     t: float           # wall clock of the video PC (epoch s), incl. clock.offset_s
     pts: float         # seconds into the source (files) or since start (live)
     idx: int           # sampled frame number
-    t_cap: float       # time.monotonic() when captured (latency measurement)
+    t_cap: float       # time.monotonic() when captured (live camera: at grab(), the same instant as t)
 
 
 def probe(ffprobe, src):
@@ -181,7 +183,10 @@ class Capture(threading.Thread):
 
     def frames(self):
         while True:
-            fr = self.q.get()
+            try:
+                fr = self.q.get(timeout=0.5)  # a timeout, so Ctrl+C works on Windows while waiting for a camera
+            except queue.Empty:
+                continue
             if fr is None:
                 if self.error:
                     raise RuntimeError("capture failed: %s" % self.error)
@@ -314,59 +319,14 @@ class StreamCapture(Capture):
         self.proc.wait()
 
 
-class CameraCapture(Capture):
-    """OpenCV camera index. Frames are kept at det_fps by time (an accumulator, so 30 -> 10 fps keeps every 3rd)."""
-
-    def __init__(self, cfg, index, log=print):
-        super().__init__(cfg, log)
-        import cv2
-        c = cfg["capture"]
-        api = {"auto": cv2.CAP_ANY, "dshow": cv2.CAP_DSHOW, "msmf": cv2.CAP_MSMF,
-               "v4l2": getattr(cv2, "CAP_V4L2", cv2.CAP_ANY)}[c["camera_backend"]]
-        self.cap = cv2.VideoCapture(int(index), api)
-        if not self.cap.isOpened():
-            raise SystemExit("cannot open camera %s" % index)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(c["camera_width"]))
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(c["camera_height"]))
-        self.cap.set(cv2.CAP_PROP_FPS, float(c["camera_fps"]))
-        self.index = index
-        self.live = True
-        self.w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        self.h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        self.info = dict(w=self.w, h=self.h, fps=self.cap.get(cv2.CAP_PROP_FPS))
-        self.clock_how = "system clock at arrival - %.2f s" % float(c["live_latency_s"])
-        self.max_width = int(c["max_width"])
-
-    def describe(self):
-        return "camera %s: %dx%d @ %.3g fps, sampled to %.3g fps; clock %s" % (
-            self.index, self.w, self.h, self.info["fps"], self.det_fps, self.clock_how)
-
-    def _run(self):
-        import cv2
-        lat = float(self.cfg["capture"]["live_latency_s"])
-        period = 1.0 / self.det_fps
-        t_start = time.time()
-        next_t, k = t_start, 0
-        while not self.stop_ev.is_set():
-            ok, img = self.cap.read()
-            if not ok:
-                break
-            now = time.time()
-            if now < next_t:
-                continue
-            next_t = max(next_t + period, now - period)  # keep the cadence, never burst after a stall
-            ow, oh = out_size(img.shape[1], img.shape[0], self.max_width)
-            if ow != img.shape[1]:
-                img = cv2.resize(img, (ow, oh), interpolation=cv2.INTER_AREA)
-            self._push(Frame(img, now - lat + self.offset, now - t_start, k, time.monotonic()), block=False)
-            k += 1
-        self.cap.release()
-
-
-def open_source(cfg, source, start=None, duration=None, realtime=False, as_live=False, log=print):
+def open_source(cfg, source, start=None, duration=None, realtime=False, as_live=False, log=print, **live_kw):
+    """`camera` = the USB camera of the [camera] config; a number = that camera index (overrides camera.device);
+    an rtsp/http/... URL = a network stream; anything else = a video file. live_kw (recorder, emit) go to the
+    camera capture."""
     s = str(source)
-    if re.fullmatch(r"\d+", s):
-        return CameraCapture(cfg, int(s), log)
+    if s == "camera" or re.fullmatch(r"\d+", s):
+        from .livecam import CameraCapture
+        return CameraCapture(cfg, None if s == "camera" else int(s), log, **live_kw)
     if re.match(r"^(rtsp|rtmp|http|https|udp|tcp|srt)://", s, re.I):
         return StreamCapture(cfg, s, log=log)
     if not Path(s).exists():

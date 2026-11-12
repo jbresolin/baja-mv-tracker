@@ -65,6 +65,41 @@ def check(cfg, log):
     return warns
 
 
+def measure_offset(cfg, runner=subprocess.run):
+    """This PC's clock minus the reference, in seconds, for the status page. Returns (offset_s or None, source).
+
+    With clock.ntp_server set: one SNTP request to it (the real measurement). Otherwise what the OS time service
+    reports: Windows `w32tm /query /status /verbose` "Phase Offset", Linux `timedatectl timesync-status` "Offset".
+    None = unknown (the page shows it in amber)."""
+    server = cfg["clock"].get("ntp_server")
+    if server:
+        off = sntp_offset(server)
+        return off, "SNTP %s" % server
+    try:
+        if sys.platform == "win32":
+            out = runner(["w32tm", "/query", "/status", "/verbose"], capture_output=True, text=True, timeout=10).stdout
+            return parse_w32tm_offset(out), "w32tm phase offset"
+        out = runner(["timedatectl", "timesync-status"], capture_output=True, text=True, timeout=10).stdout
+        return parse_timedatectl_offset(out), "timedatectl"
+    except Exception:  # noqa: BLE001
+        return None, "no time service query"
+
+
+def parse_w32tm_offset(out):
+    """'Phase Offset: 0.0012345s' (English Windows) -> 0.0012345. Other languages: None."""
+    m = re.search(r"Phase Offset\s*:\s*([-+]?\d+(?:[.,]\d+)?)s", out or "", re.I)
+    return float(m.group(1).replace(",", ".")) if m else None
+
+
+def parse_timedatectl_offset(out):
+    """'Offset: +1.234ms' / '-25us' / '+1.2s' -> seconds."""
+    m = re.search(r"^\s*Offset:\s*([-+]?\d+(?:\.\d+)?)\s*(us|µs|ms|s|min)\s*$", out or "", re.M)
+    if not m:
+        return None
+    scale = {"us": 1e-6, "µs": 1e-6, "ms": 1e-3, "s": 1.0, "min": 60.0}[m.group(2)]
+    return float(m.group(1)) * scale
+
+
 def _age_hours(s):
     for fmt in ("%m/%d/%Y %I:%M:%S %p", "%d/%m/%Y %H:%M:%S", "%m/%d/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
         try:

@@ -34,8 +34,11 @@ def load(path=None, overrides=()):
     cfg = copy.deepcopy(base)
     for o in overrides:
         k, v = o.split("=", 1)
-        sec, key = k.split(".", 1)
-        cfg.setdefault(sec, {})[key] = _parse_value(v)
+        *path, key = k.split(".")       # section.key, or section.table.key (camera.settings.exposure=-10)
+        d = cfg
+        for part in path:
+            d = d.setdefault(part, {})
+        d[key] = _parse_value(v)
     apply_manifest(cfg)
     m = cfg["models"]
     for r in ROLES:

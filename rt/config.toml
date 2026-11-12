@@ -40,11 +40,58 @@ decode_threads = 0              # ffmpeg -threads for decoding (0 = ffmpeg's def
 hwaccel = "none"                # ffmpeg -hwaccel for files/streams: none | d3d11va | qsv | dxva2 | auto (Intel laptop: try d3d11va;
                                 # decode of 1080p30 H.264 costs ~0.6 core on this 3900X in software)
 queue_size = 4                  # frames between capture and detection; live sources drop frames when it is full
-camera_backend = "auto"         # OpenCV backend for camera indices: auto | dshow | msmf | v4l2
-camera_width = 1920
-camera_height = 1080
-camera_fps = 30
 live_latency_s = 0.0            # known capture latency of a live source (subtracted from the frame time)
+
+[camera]                        # USB camera (--source camera, or a camera index); rt/livecam.py + rt/camsource.py
+backend = "auto"                # auto (= dshow on Windows, v4l2 on Linux) | dshow | msmf | v4l2
+device = 0                      # index, or (better) the device path: `python rt/run.py --list-cameras` prints it
+width = 1920
+height = 1080
+fps = 30
+fourcc = "MJPG"                 # set explicitly: without it DirectShow often falls back to YUY2 at 5 fps for 1080p
+require_fourcc = true           # fail (and retry) if the camera does not deliver this FOURCC
+raw_mjpeg = true                # ask for the compressed frames: recording without re-encoding, decode only processed frames
+lost_after_failed_grabs = 30    # failed grabs in a row (50 ms apart) before the camera counts as lost
+reopen_first_s = 1              # reopen backoff: 1 s, doubling ...
+reopen_max_s = 30               # ... up to 30 s
+clock_map_every_s = 60          # a `clock_map` event (wall vs monotonic time of a grab) this often
+[camera.settings]               # applied at every open, then read back and logged; empty = leave the camera as it is
+                                # (see rt/configs/lapline.example.toml for the image settings)
+
+[recording]                     # rt/recorder.py: live camera only; files go to <folder of --out>/rec/
+mode = "h264"                   # h264: ~4 GB/h at 10 fps | mjpeg: camera JPEGs copied as is, ~20-30 GB/h at 10 fps | off
+all_frames = false              # false: the processed frames (10 fps, what rt saw); true: every camera frame (needs raw MJPEG)
+segment_min = 30                # a new file every 30 minutes
+warn_free_gb = 20               # status page warning under this much free disk
+stop_free_gb = 5                # stop recording (never detection) under this; resumes above warn_free_gb
+disk_check_s = 10
+queue_frames = 60               # frames waiting for the writer; more are dropped from the recording (counted)
+h264_encoders = ["h264_qsv", "h264_amf", "libx264"]   # first that works on this machine; x264 runs as "veryfast"
+subdir = "rec"
+
+[status]                        # rt/status.py: read-only page, http://<laptop>:<port>/
+enabled = true
+bind = "0.0.0.0"                # all interfaces: a phone on the LAN can open it (allow Python in the Windows firewall)
+port = 8765
+passes = 20                     # last passes shown
+thumb_width = 320
+thumb_fps = 5                   # thumbnails kept per second for the pass list
+thumb_ring_s = 20               # seconds of thumbnails kept (a pass's thumbnail is the frame nearest its t_cross)
+fps_window_s = 10
+time_check_s = 60               # re-measure the clock offset this often
+
+[launch]                        # rt/supervise.py (rt\run_lapline.bat): one unattended rt
+name = "lapline"
+event = ""                      # roster code, e.g. "27SE" (required)
+source = "camera"
+out_dir = "out/lapline"         # each run: <out_dir>/<date>/lapline_<time>.jsonl (+ rec/); launcher.log here
+extra_args = []                 # more rt/run.py arguments, e.g. ["--stats", "--quiet"]
+restart_first_s = 5             # restart backoff: 5 s, doubling ...
+restart_max_s = 60              # ... up to 60 s
+healthy_reset_min = 10          # a run that lasted this long resets the backoff to restart_first_s
+stall_s = 30                    # status fps = 0 (or no answer) this long -> kill and restart
+startup_grace_s = 60            # no stall check during the first seconds of a run
+poll_s = 2
 
 [clock]
 # Frame time = wall clock of the video PC. Files: "auto" = OBS clock overlay (26SE) if present, else the container
