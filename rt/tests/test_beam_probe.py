@@ -4,7 +4,9 @@ find out HOW the adapter delivers the sensor's pulse, and which [beam] settings 
 How the probe decides (the "guess"), in plain words:
   * If one of the four modem input lines (CTS, DSR, DCD, RI) changed while the beam was being broken, that is the
     line: driver = "modem-line". The state the line sits in most of the time is "beam clear"; the other state is
-    "beam blocked", which gives the polarity (`active`).
+    "beam blocked", which gives the polarity (`active`). "Most of the time" = the state the line was in when the
+    probe STARTED (the beam is clear then); if the line then spends most of the probe in the other state, the guess
+    warns (someone may have been standing in the beam).
   * Else, if bytes arrived: driver = "byte-stream". One repeated message -> that is the pattern; two messages that
     alternate -> "blocked" and "clear" patterns. Mostly 00 / FF bytes -> probably the wrong baud rate.
   * Else nothing happened: check the wiring (and break the beam during the probe!).
@@ -137,3 +139,63 @@ def test_whole_probe_loop_on_a_fake_port_prints_changes_and_guesses():
     g = report(log, 9600, out=printed.append)
     assert g["config"] == ['driver = "modem-line"', 'line = "cts"', 'active = "high"']
     assert any(line.startswith("[beam]") for line in printed)
+
+
+# ------------------------------------------------------------------------------------------------ polarity from idle
+def test_polarity_comes_from_the_state_at_the_start_even_if_the_beam_was_mostly_blocked():
+    # CTS is off at the start (beam clear). Then someone stands in the beam for a long time: CTS is ON for most of
+    # the probe. The idle state is still "off at the start", so active = "high" - and a warning says the time
+    # share disagrees.
+    log = ProbeLog(0.0)
+    log.lines(0.0, ALL_OFF)                          # start: beam clear, CTS off
+    log.lines(1.0, dict(ALL_OFF, cts=True))          # blocked ...
+    log.lines(1.2, ALL_OFF)                          # ... a short car
+    log.lines(2.0, dict(ALL_OFF, cts=True))          # someone stands in the beam for 20 s
+    log.lines(22.0, ALL_OFF)
+    log.finish(23.0)
+    g = guess_config(log.summary())
+    assert 'active = "high"' in g["config"]
+    assert any(n.startswith("WARNING") and "opposite of its state at the start" in n for n in g["notes"])
+
+
+def test_no_polarity_warning_when_start_and_majority_agree():
+    log = probe_with_pulses("dsr", idle=True)        # DSR on at the start and most of the time: active low
+    g = guess_config(log.summary())
+    assert 'active = "low"' in g["config"]
+    assert not any(n.startswith("WARNING") for n in g["notes"])
+
+
+# ------------------------------------------------------------------------------------------------ split messages
+def test_probe_joins_a_message_split_into_pieces_at_9600_baud():
+    # The adapter sends "B1\r\n" for blocked and "B0\r\n" for clear, but each arrives in two pieces 1 ms apart (as
+    # USB can do). The probe must see 2 kinds of MESSAGE that alternate, not 4 kinds of fragment, and so guess a
+    # blocked / clear pattern pair.
+    clock = TickingClock(mono=0.0)
+    world = SerialPortWorld(clock)
+    ser = world.factory("COM5", 9600, 0)
+    pieces = {}
+    for k in range(3):                                   # 3 cars: blocked at 0.1 + k, clear 0.2 s later
+        for t0, msg in ((0.1 + k, b"B1\r\n"), (0.3 + k, b"B0\r\n")):
+            pieces[round(t0, 3)] = msg[:2]
+            pieces[round(t0 + 0.001, 3)] = msg[2:]
+
+    def sleep(dt):
+        clock.advance(dt)
+        piece = pieces.pop(round(clock.mono(), 3), None)
+        if piece:
+            ser.incoming += piece
+
+    printed = []
+    log = run_probe(ser, seconds=3.0, clock=clock.mono, wall=clock.wall, sleep=sleep, out=printed.append)
+    summary = log.summary()
+    assert summary["n_chunks"] == 6                      # 6 whole messages, not 12 pieces
+    g = guess_config(summary, baud=9600)
+    assert 'byte_pattern = "42310d0a"' in g["config"]
+    assert 'byte_release_pattern = "42300d0a"' in g["config"]
+
+
+def test_alternation_needs_at_least_one_pair():
+    from rt.tools.beam_probe import _alternates
+    assert _alternates(["31", "30", "31", "30"])
+    assert not _alternates(["31", "31", "30"])
+    assert not _alternates(["31"])

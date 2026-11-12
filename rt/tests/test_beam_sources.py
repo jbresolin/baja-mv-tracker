@@ -229,6 +229,15 @@ def bytes_source(world, clock, pattern="", release=""):
                             serial_factory=world.factory)
 
 
+def poll_for(src, clock, seconds):
+    """Call poll() for `seconds` of fake time (each empty read waits 2 ms of fake time) and collect the edges."""
+    edges = []
+    end = clock.mono() + seconds
+    while clock.mono() < end:
+        edges += src.poll()
+    return edges
+
+
 def test_any_received_bytes_are_one_edge_with_the_raw_bytes_kept():
     # No pattern configured: whatever the adapter sends is a pulse. A message of several bytes that arrives in one
     # go is ONE edge (not one per byte), and the bytes are kept (hex) so the JSONL shows what was sent.
@@ -238,9 +247,11 @@ def test_any_received_bytes_are_one_edge_with_the_raw_bytes_kept():
     src.open()
     assert src.poll() == []                          # nothing waiting: the read times out (2 ms of fake time)
     world.serial.incoming += b"T1\r\n"
-    (e,) = src.poll()
+    t_receipt = clock.mono()
+    assert src.poll() == []                          # received, but the message may not be over yet: held back
+    (e,) = poll_for(src, clock, 0.02)                # a few ms of quiet: the message is complete -> one edge
     assert (e.line, e.level, e.raw, e.momentary) == ("bytes", 1, b"T1\r\n".hex(), True)
-    assert e.t_mono == pytest.approx(clock.mono())   # stamped on receipt
+    assert e.t_mono == pytest.approx(t_receipt)      # stamped on receipt of its first byte, not when handed out
     assert src.bytes_total == 4
 
 
@@ -253,8 +264,8 @@ def test_byte_pattern_marks_each_pulse_even_split_over_two_reads():
     src.open()
     world.serial.incoming += b"A\r"
     assert src.poll() == []                          # CR alone: not yet a match
-    world.serial.incoming += b"\nB\r\nC\r\n"
-    edges = src.poll()
+    world.serial.incoming += b"\nB\r\nC\r\n"         # 2 ms later: the same message continues
+    edges = poll_for(src, clock, 0.02)
     assert [e.level for e in edges] == [1, 1, 1]     # three CR LF in total
     assert all(e.momentary for e in edges)           # no release pattern: pulses
 
@@ -267,11 +278,65 @@ def test_release_pattern_gives_blocked_and_clear_edges():
     src.open()
     assert src.level() == 0
     world.serial.incoming += b"1"
-    (e,) = src.poll()
+    (e,) = poll_for(src, clock, 0.02)
     assert e.level == 1 and not e.momentary and src.level() == 1
     world.serial.incoming += b"0"
-    (e,) = src.poll()
+    (e,) = poll_for(src, clock, 0.02)
     assert e.level == 0 and src.level() == 0
+
+
+# The byte-stream driver joins bytes into messages. Background: at 9600 baud one character takes ~1.04 ms on the wire
+# (10 bits: start bit, 8 data bits, stop bit). A 4-byte message like "T1\r\n" takes ~4 ms, and the USB adapter
+# can hand it to the PC in pieces. Bytes less than 3 character times (~3.1 ms) apart are one message.
+
+def test_a_message_split_over_three_reads_at_9600_baud_is_one_pulse():
+    clock = TickingClock()
+    world = SerialPortWorld(clock)
+    src = bytes_source(world, clock)                 # no pattern: every MESSAGE is one pulse
+    src.open()
+    t0 = clock.mono()
+    for piece in (b"T", b"1\r", b"\n"):             # one message, arriving in 3 reads ~2 ms apart
+        world.serial.incoming += piece
+        assert src.poll() == []                      # read it now (no edge yet) ...
+        src.poll()                                   # ... and one empty read (2 ms of fake time) before the next piece
+    (e,) = poll_for(src, clock, 0.02)
+    assert e.raw == b"T1\r\n".hex()                  # the whole message in one edge
+    assert e.t_mono == pytest.approx(t0)             # stamped at the first piece
+
+
+def test_two_messages_with_a_pause_are_two_pulses():
+    clock = TickingClock()
+    world = SerialPortWorld(clock)
+    src = bytes_source(world, clock)
+    src.open()
+    world.serial.incoming += b"T1\r\n"
+    edges = poll_for(src, clock, 0.01)               # 10 ms of quiet: well over 3 character times
+    world.serial.incoming += b"T1\r\n"
+    edges += poll_for(src, clock, 0.01)
+    assert len(edges) == 2
+    assert edges[1].t_mono - edges[0].t_mono == pytest.approx(0.01, abs=0.003)
+
+
+def test_merge_gap_follows_the_baud_rate():
+    from rt.beam.sources import merge_gap_s
+    assert merge_gap_s(9600) == pytest.approx(3 * 10 / 9600)      # 3.1 ms
+    assert merge_gap_s(1200) == pytest.approx(0.025)              # slow line: 25 ms
+    assert merge_gap_s(115200) == pytest.approx(0.001)            # fast line: never below 1 ms (USB packets)
+
+
+def test_message_assembler_rules():
+    # The pure logic, with made-up times: gap 3 ms.
+    from rt.beam.sources import MessageAssembler
+    a = MessageAssembler(gap_s=0.003, max_bytes=8)
+    assert a.feed(1.000, b"AB") == []                # message started
+    assert a.pending_since() == 1.000
+    assert a.feed(1.002, b"C") == []                 # 2 ms later: same message
+    assert a.feed(1.004) == []                       # 2 ms of quiet: not yet over
+    assert a.feed(1.006) == [(1.000, b"ABC")]        # 4 ms of quiet: over, stamped at its first byte
+    assert a.pending_since() is None
+    # A stream that never pauses still gives messages (max_bytes).
+    out = a.feed(2.0, b"123456789")
+    assert out == [(2.0, b"123456789")]
 
 
 def test_byte_stream_unplug_and_missing_port():

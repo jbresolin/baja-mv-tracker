@@ -139,15 +139,18 @@ python -m rt.tools.beam_probe --port COM5 --baud 115200 --seconds 60      (if by
 ```
 
 Close rt first (only one program can open a COM port). The probe prints every change of the four modem input
-lines (CTS, DSR, DCD, RI, read 1000 times a second) and every chunk of bytes, with times. At the end it guesses
-the driver, the line and the polarity (or the byte pattern) and prints the lines to paste into the `[beam]` section
+lines (CTS, DSR, DCD, RI, read 1000 times a second) and every message of bytes, with times (bytes less than 3
+character times apart are one message, as in rt). At the end it guesses the driver, the line and the polarity (the
+line's state at the start = beam clear, so start with the beam clear; a warning if the line then spent most of the
+time in the other state), or the byte pattern and prints the lines to paste into the `[beam]` section
 of `rt/configs/lapline.toml` (example and every key: `rt/configs/lapline.example.toml`).
 
 * **Two ways the pulse can arrive**, because the adapter is not known yet:
   * `modem-line`: the sensor switches one adapter input line. A dedicated thread polls it at `poll_hz` (1 kHz) and
     stamps each change. `active = "high"` means line asserted = beam blocked; `"low"` the opposite.
-  * `byte-stream`: the adapter sends bytes per pulse. Each receipt (or each `byte_pattern`, hex) is an edge,
-    stamped on receipt; the raw bytes are kept. With `byte_release_pattern` the "clear" message is an edge too.
+  * `byte-stream`: the adapter sends bytes per pulse. Bytes less than `byte_merge_chars` (3) character times apart
+    (3.1 ms at 9600 baud) are joined into one message even if they arrive in several reads; each message (or each
+    `byte_pattern`, hex) is an edge, stamped at the receipt of the message's first byte; the raw bytes are kept. With `byte_release_pattern` the "clear" message is an edge too.
   * `fake`: one synthetic tube-frame car every `fake_every_s` (check the chain and the status page without hardware).
 * **Same clocks as the frames.** Each edge is stamped right after it is seen with `time.time()` and
   `time.monotonic()` (the clock object rt/livecam.py stamps frames with). `t_edge` / `t_beam` = wall time +

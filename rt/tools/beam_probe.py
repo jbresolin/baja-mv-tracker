@@ -8,9 +8,11 @@ usage (from the repo folder, with the adapter plugged in):
 While it runs, break the beam several times (wave a hand / walk through it, slowly and quickly). It prints, live and
 time-stamped:
   * every change of the four modem input lines (CTS, DSR, DCD, RI), read ~1000 times a second;
-  * every chunk of bytes received, in hex and as text.
+  * every message of bytes received, in hex and as text (bytes less than 3 character times apart are one message,
+    as in rt's byte-stream driver, even when the adapter hands them over in pieces).
 At the end (Ctrl+C or --seconds) it prints a summary and its GUESS of the [beam] config to use: driver (modem-line or
-byte-stream), the line, the polarity (`active`), or the byte pattern. Paste that into rt/configs/lapline.toml.
+byte-stream), the line, the polarity (`active`: the state the line is in at the start = beam clear, so start the
+probe with the beam clear), or the byte pattern. Paste that into rt/configs/lapline.toml.
 
 The guess is only as good as what happened during the probe: break the beam at least 3 times. rt itself does not need
 to be running (and must NOT be running: only one program can open a COM port).
@@ -25,7 +27,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from rt.beam.sources import MODEM_LINES, default_serial_factory  # noqa: E402
+from rt.beam.sources import MODEM_LINES, MessageAssembler, default_serial_factory, merge_gap_s  # noqa: E402
 
 LINE_NAMES = dict(cts="CTS", dsr="DSR", cd="DCD", ri="RI")
 
@@ -94,13 +96,24 @@ def guess_config(summary, baud=9600):
         order = {line: i for i, line in enumerate(MODEM_LINES)}
         line = max(toggled, key=lambda k: (toggled[k]["transitions"], -order.get(k, 9)))
         s = toggled[line]
-        # The idle state is where the line spends most of its time; "active" (beam blocked) is the other one.
-        idle_asserted = s["asserted_share"] > 0.5
+        # The idle state (beam clear) is the state the line was in when the probe started: the beam is clear then
+        # (nobody waves a hand before the probe is running). "active" (beam blocked) is the other state. The share
+        # of time is only a cross-check: someone standing in the beam for a long time would turn it around.
+        idle_asserted = bool(s["initial"])
         active = "low" if idle_asserted else "high"
         breaks = s["transitions"] // 2
-        notes.append("%s changed %d times (~%d beam breaks); idle it is %s, so a break makes it %s -> active = \"%s\""
-                     % (LINE_NAMES[line], s["transitions"], breaks, "asserted" if idle_asserted else "not asserted",
-                        "drop" if idle_asserted else "rise", active))
+        notes.append("%s changed %d times (~%d beam breaks); idle (at the start) it is %s, so a break makes it %s "
+                     "-> active = \"%s\"" % (LINE_NAMES[line], s["transitions"], breaks,
+                                             "asserted" if idle_asserted else "not asserted",
+                                             "drop" if idle_asserted else "rise", active))
+        majority_asserted = s["asserted_share"] > 0.5
+        if majority_asserted != idle_asserted:
+            notes.append("WARNING: %s spent most of the probe (%.0f%%) %s, the opposite of its state at the start. "
+                         "Was the beam blocked when the probe started, or held blocked for long? If the beam was "
+                         "clear at the start, keep active = \"%s\"; otherwise run the probe again with the beam "
+                         "clear at the start" % (LINE_NAMES[line], 100 * (s["asserted_share"] if majority_asserted
+                                                                         else 1 - s["asserted_share"]),
+                                                 "asserted" if majority_asserted else "not asserted", active))
         others = [LINE_NAMES[k] for k in toggled if k != line]
         if others:
             notes.append("other lines changed too (%s): check the wiring; the busiest line was picked" %
@@ -144,7 +157,9 @@ def guess_config(summary, baud=9600):
 
 
 def _alternates(order):
-    return all(order[i] != order[i + 1] for i in range(len(order) - 1))
+    """True when consecutive MESSAGES (joined by MessageAssembler, so a message split over several reads counts
+    once) always differ: A B A B ... = "blocked" / "clear" pairs. Needs at least one A B pair."""
+    return len(order) >= 2 and all(order[i] != order[i + 1] for i in range(len(order) - 1))
 
 
 def read_lines(ser):
@@ -152,11 +167,20 @@ def read_lines(ser):
 
 
 def run_probe(ser, seconds=None, poll_hz=1000.0, clock=time.monotonic, wall=time.time, sleep=time.sleep, out=print,
-              stop=lambda: False):
+              stop=lambda: False, baud=None):
     """Watch an open serial object (pyserial, or a fake in tests) until `seconds` pass, Ctrl+C or stop() is true.
-    Prints every change; returns the ProbeLog."""
+    Prints every change; returns the ProbeLog. Bytes are joined into messages exactly like the byte-stream driver
+    does (bytes less than 3 character times apart at `baud` = one message), so the guess sees what rt will see."""
     t0 = clock()
     log = ProbeLog(t0)
+    baud = baud or getattr(ser, "baudrate", 9600) or 9600
+    assembler = MessageAssembler(merge_gap_s(baud))
+
+    def record(messages):
+        for t_msg, msg in messages:
+            log.data(t_msg, msg)
+            out("%s  +%9.3f s  bytes %s  %r" % (_hms(wall() - (clock() - t_msg)), t_msg - t0, msg.hex(" "), msg))
+
     first = read_lines(ser)
     log.lines(t0, first)
     out("start %s  lines: %s" % (_hms(wall()), "  ".join("%s=%d" % (LINE_NAMES[k], v) for k, v in first.items())))
@@ -172,14 +196,12 @@ def run_probe(ser, seconds=None, poll_hz=1000.0, clock=time.monotonic, wall=time
                 out("%s  +%9.3f s  %-3s -> %s" % (_hms(wall()), t - t0, LINE_NAMES[line],
                                                    "asserted (1)" if states[line] else "not asserted (0)"))
             waiting = ser.in_waiting
-            if waiting:
-                chunk = ser.read(waiting)
-                t = clock()
-                log.data(t, chunk)
-                out("%s  +%9.3f s  bytes %s  %r" % (_hms(wall()), t - t0, chunk.hex(" "), chunk))
+            chunk = ser.read(waiting) if waiting else b""
+            record(assembler.feed(clock(), chunk))
             sleep(period)
     except KeyboardInterrupt:
         out("(stopped)")
+    record(assembler.flush())
     log.finish(clock())
     return log
 
@@ -243,7 +265,7 @@ def main(argv=None):
                          "--list shows the ports)" % (a.port, e))
     try:
         print("watching %s at %d baud: break the beam a few times; Ctrl+C to finish" % (a.port, a.baud))
-        log = run_probe(ser, a.seconds)
+        log = run_probe(ser, a.seconds, baud=a.baud)
     finally:
         ser.close()
     report(log, a.baud)

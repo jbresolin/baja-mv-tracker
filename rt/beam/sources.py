@@ -143,6 +143,11 @@ class BeamSource:
         """The current beam level (1 active, 0 inactive), or None when the driver cannot tell."""
         return None
 
+    def pending_since(self):
+        """The monotonic stamp of an edge the driver has seen but not returned yet (byte-stream: a message still
+        being assembled), or None. The service never lets break grouping run past it."""
+        return None
+
 
 # ------------------------------------------------------------------------------------------------ modem-line
 class ModemLineSource(BeamSource):
@@ -266,6 +271,61 @@ class ModemLineSource(BeamSource):
 
 
 # ------------------------------------------------------------------------------------------------ byte-stream
+def char_time_s(baud):
+    """Time on the wire of one serial character at `baud`: 10 bits (start + 8 data + stop). 9600 baud: 1.04 ms."""
+    return 10.0 / float(baud)
+
+
+def merge_gap_s(baud, chars=3):
+    """Bytes closer together than this belong to the same message: `chars` character times at `baud` (9600 baud,
+    3 chars: 3.1 ms), but never less than 1 ms (USB delivers bytes in packets, with their own timing)."""
+    return max(float(chars) * char_time_s(baud), 0.001)
+
+
+class MessageAssembler:
+    """Joins bytes into MESSAGES: a message is a run of bytes in which no gap is longer than `gap_s`. A sensor that
+    sends "T1\r\n" per pulse can reach the PC in two or three reads (USB packets, read timeouts), and each read
+    must not become a pulse of its own. Used by the byte-stream driver and by the probe (rt/tools/beam_probe.py).
+
+    feed(t, data) adds what one read returned (t = when it was received; nothing = b""), and returns the messages
+    finished by then: a list of (time of the message's FIRST byte, bytes). A message is finished when no byte
+    came for gap_s, or when it is `max_bytes` long or `max_s` old (a never-ending stream still produces messages).
+    Pure logic: no clock, no I/O."""
+
+    def __init__(self, gap_s, max_bytes=256, max_s=0.05):
+        self.gap_s, self.max_bytes, self.max_s = float(gap_s), int(max_bytes), float(max_s)
+        self.buf = bytearray()
+        self.t_first = None          # receipt time of the first byte of the message being assembled
+        self.t_last = None           # receipt time of its latest bytes
+
+    def feed(self, t, data=b""):
+        out = []
+        if self.buf and (t - self.t_last > self.gap_s):
+            out.append(self._finish())                  # quiet long enough before this read: the message ended
+        if data:
+            if not self.buf:
+                self.t_first = t
+            self.buf += data
+            self.t_last = t
+            if len(self.buf) >= self.max_bytes or t - self.t_first >= self.max_s:
+                out.append(self._finish())
+        return out
+
+    def flush(self):
+        """Whatever is still being assembled, as a finished message (or nothing)."""
+        return [self._finish()] if self.buf else []
+
+    def pending_since(self):
+        """Receipt time of the first byte not yet handed out as a message, or None."""
+        return self.t_first if self.buf else None
+
+    def _finish(self):
+        msg = (self.t_first, bytes(self.buf))
+        self.buf = bytearray()
+        self.t_first = self.t_last = None
+        return msg
+
+
 def parse_hex(text):
     """'0D 0A' / '0d0a' / '' -> bytes. Config patterns are written in hex so any byte can be given."""
     text = "".join(str(text or "").split())
@@ -275,20 +335,27 @@ def parse_hex(text):
 class ByteStreamSource(BeamSource):
     """The adapter sends serial bytes for each pulse. The bytes are read as they arrive and stamped on receipt.
 
-    * No `pattern`: every receipt of bytes is one edge (a "pulse": level 1, momentary). Bytes that arrive together
-      in one read (one short message) are one edge, not one edge per byte.
+    * Bytes are first joined into MESSAGES (MessageAssembler): bytes less than `merge_chars` character times
+      apart (3 at 9600 baud = 3.1 ms) are one message, even when they come in several reads. Each edge is stamped
+      with the receipt time of its message's FIRST byte, and is handed out once the message is over (a few ms
+      later; pending_since() tells the service which stamp is still being held back).
+    * No `pattern`: every message is one edge (a "pulse": level 1, momentary).
     * With `pattern` (hex): every occurrence of it in the stream is an active edge. With `release_pattern` too,
       every occurrence of that is an inactive edge (the adapter reports both "blocked" and "clear"), and the beam
       level is known; without it, pattern edges are momentary pulses.
-    The raw bytes of the read are kept in each edge (hex), so the JSONL shows exactly what the adapter sent."""
+    The raw bytes of the message are kept in each edge (hex), so the JSONL shows exactly what the adapter sent."""
     driver = "byte-stream"
 
     def __init__(self, port, baud=9600, pattern="", release_pattern="", read_timeout_s=0.002, clock=None,
-                 serial_factory=None):
+                 serial_factory=None, merge_chars=3):
         super().__init__()
         self.port, self.baud = str(port), int(baud)
+        if self.baud <= 0:
+            raise ValueError("beam.baud must be > 0; got %r" % baud)
         self.pattern, self.release = parse_hex(pattern), parse_hex(release_pattern)
         self.timeout = float(read_timeout_s)
+        self.merge_gap = merge_gap_s(self.baud, merge_chars)
+        self.assembler = MessageAssembler(self.merge_gap)
         self.clock = clock or SystemClock()
         self.serial_factory = serial_factory or default_serial_factory
         self.ser = None
@@ -296,6 +363,7 @@ class ByteStreamSource(BeamSource):
         self.last_level = None
         self.last_poll_mono = None
         self.bytes_total = 0
+        self.read_stamps = {}         # t_mono -> (t_wall, poll gap) of the reads of the message being assembled
 
     def open(self):
         try:
@@ -304,9 +372,12 @@ class ByteStreamSource(BeamSource):
             self.close()
             raise BeamPortError("cannot open %s at %d baud: %s" % (self.port, self.baud, e)) from e
         self.buffer = b""
+        self.assembler = MessageAssembler(self.merge_gap)
+        self.read_stamps = {}
         self.last_level = 0 if self.release else None
         self.last_poll_mono = self.clock.mono()
-        return dict(port=self.port, baud=self.baud, pattern=self.pattern.hex(), release_pattern=self.release.hex())
+        return dict(port=self.port, baud=self.baud, pattern=self.pattern.hex(), release_pattern=self.release.hex(),
+                    merge_gap_ms=round(1000 * self.merge_gap, 2))
 
     def poll(self):
         try:
@@ -321,14 +392,28 @@ class ByteStreamSource(BeamSource):
         gap = t_mono - self.last_poll_mono
         self.last_poll_mono = t_mono
         self.poll_stats.note(t_mono)
-        if not data:
-            return []
-        self.bytes_total += len(data)
-        raw = data.hex()
+        if data:
+            self.bytes_total += len(data)
+            self.read_stamps[t_mono] = (t_wall, gap)     # so a message gets the stamps of the read of its 1st byte
+        edges = []
+        for t_first_mono, message in self.assembler.feed(t_mono, data):
+            first_wall, first_gap = self.read_stamps.get(t_first_mono, (t_wall - (t_mono - t_first_mono), None))
+            edges += self._edges_of(message, first_wall, t_first_mono, first_gap)
+        held = self.assembler.pending_since()
+        for t in [t for t in self.read_stamps if held is None or t < held]:
+            del self.read_stamps[t]                      # only the stamps of the message being assembled are kept
+        return edges
+
+    def _edges_of(self, message, t_wall, t_mono, gap):
+        raw = message.hex()
         if not self.pattern:
             return [RawEdge(t_wall, t_mono, "bytes", 1, raw=raw, poll_gap_s=gap, momentary=True)]
         return [RawEdge(t_wall, t_mono, "bytes", level, raw=raw, poll_gap_s=gap, momentary=not self.release)
-                for level in self._match(data)]
+                for level in self._match(message)]
+
+    def pending_since(self):
+        """Monotonic stamp of a message still being assembled (its edge comes later, with this time), or None."""
+        return self.assembler.pending_since()
 
     def _match(self, data):
         """Levels (1 for pattern, 0 for release_pattern) of every complete occurrence in the stream, in order."""
@@ -457,7 +542,8 @@ def make_source(cfg, clock=None, sleep=None, serial_factory=None):
     if driver == "byte-stream":
         return ByteStreamSource(b["port"], int(b.get("baud", 9600)), b.get("byte_pattern", ""),
                                 b.get("byte_release_pattern", ""), float(b.get("read_timeout_s", 0.002)),
-                                clock=clock, serial_factory=serial_factory)
+                                clock=clock, serial_factory=serial_factory,
+                                merge_chars=float(b.get("byte_merge_chars", 3)))
     if driver == "fake":
         clock = clock or SystemClock()
         return FakeBeamSource(synthetic_cars(clock.mono(), float(b.get("fake_every_s", 20)),

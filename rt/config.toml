@@ -178,6 +178,7 @@ baud = 9600                     # byte-stream (and the port open): serial speed
 byte_pattern = ""               # byte-stream: hex bytes that mean "pulse/blocked" ("" = any received bytes = one edge)
 byte_release_pattern = ""       # byte-stream: hex bytes that mean "clear" ("" = pulses only)
 read_timeout_s = 0.002          # byte-stream: longest wait for a byte per read
+byte_merge_chars = 3            # byte-stream: bytes closer than this many character times (from baud) = one message
 group_gap_s = 0.25              # edges closer than this belong to the same car (tube frames give several pulses)
 stuck_s = 5.0                   # a break longer than this is not a car: beam_stuck, no breaks until it clears
 advance_guard_s = 0.02          # breaks are closed this far behind "now" (the reader may not have queued an edge yet)

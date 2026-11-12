@@ -128,8 +128,10 @@ class BeamService:
         for e in edges:
             self.q.put(("edge", e))
         now = self.clock.mono()
-        # Every edge stamped up to `now` is queued: any later edge will be stamped later than this.
-        self.reader_horizon_mono = now
+        # Every edge stamped up to `now` is queued (any later edge will be stamped later than this), except one the
+        # driver is still holding back (byte-stream: a message not finished yet).
+        held = self.source.pending_since()
+        self.reader_horizon_mono = now if held is None else min(now, held)
         if now - self.last_poll_report >= self.poll_report_s:
             self.last_poll_report = now
             self.q.put(("poll", self.source.poll_stats.report(now)))
