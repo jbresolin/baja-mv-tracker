@@ -24,7 +24,9 @@ python -m zone.tools.characterize --ip 192.168.1.50 --out reports/smtav-a/
 - It asks before the first move and starts from the VISCA home position. Use `--home-preset N` (0-based) to start
   from a preset instead; `--repeat-preset N` picks the preset for the repeatability test.
 - A full run takes roughly 15-25 minutes. `--quick` measures ~10 speed steps per axis instead of all of them.
-- During the zoom section it stops at 9 zoom positions for FOV screenshots (`--no-fov-pauses` to skip). At the end it
+- During the zoom section it stops at 9 zoom positions for FOV screenshots (`--no-fov-pauses` to skip). If the
+  camera can't report its zoom, the stops are commanded `zoom_direct` positions over an assumed 0..0x4000 range
+  (`--zoom-tele 0x...` if the camera's tele end is different). At the end it
   asks for two marks a known angle apart to get units per degree. Type nothing to skip, or pass
   `--pan-units-per-degree` if the camera documents it.
 - `--skip zoom,units` skips sections. Ctrl+C stops the camera and keeps what was measured.
@@ -52,7 +54,9 @@ python -m zone.tools.characterize --ip 127.0.0.1 --port 52399 --out reports/fake
   passed or failed. A camera that answers fast from a slowly refreshed position cache is flagged "STALE CACHE".
   While moving, the inquiry is classified as `yes`, `frozen` (answers, but the value doesn't change until the
   camera stops) or `no`.
-- **Speed table.** With live feedback, it moves at each step and fits the slope of the position over the second
+- **Speed table.** At the start of each step it goes home again if it has drifted more than a quarter of the
+  travel from home (an asymmetric camera creeps a bit every step). A measurement that ran into the end stop is
+  marked `hit_limit` and left out of the model. With live feedback, it moves at each step and fits the slope of the position over the second
   half of the move. Without it (position readable only at rest), it makes two timed moves of T and 2T per direction:
   (travel(2T) − travel(T)) / T is the steady rate with the latency and ramp cancelled out.
 - **Latency.** With live feedback at ≥ 10 Hz, it polls around the command: time to the first change, time to 90%

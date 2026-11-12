@@ -419,3 +419,99 @@ def test_stepped_motion_is_not_smooth_even_at_slow_speed():
     smooth = [(k * 0.05, round(12.5 * k * 0.05)) for k in range(40)]
     assert ba.is_smooth(smooth) is True
     assert ba.is_smooth(stepped) is False
+
+
+# --- nits: robustness of the run --------------------------------------------------------------------------------
+
+
+def test_ctrl_c_stops_the_camera_and_keeps_the_report(tmp_path):
+    # Ctrl+C arrives in Python as a KeyboardInterrupt exception, raised wherever the program happens to be. Here a
+    # simulated camera raises it during the speed table, while the camera is moving. The bench must stop the camera
+    # (pan/tilt and zoom), mark the run as interrupted, and still write what it had measured.
+    class OperatorPressesCtrlC(SimulatedPtz):
+        armed = False
+        calls = 0
+
+        def inquire_pan_tilt(self):
+            if self.armed:
+                self.calls += 1
+                if self.calls == 20:
+                    raise KeyboardInterrupt
+            return super().inquire_pan_tilt()
+
+        def pan_tilt_velocity(self, pan_step, tilt_step, ttl=None):
+            self.armed = True  # from the first move in the speed table on
+            return super().pan_tilt_velocity(pan_step, tilt_step, ttl)
+
+    clock = FakeClock()
+    sim = OperatorPressesCtrlC(PtzModel(), clock)
+    report = Characterizer(sim, clock, ScriptedUI(), BenchOptions(quick=True, skip=("feedback",)), tmp_path).run()
+    assert report["aborted"] == "interrupted (Ctrl+C)"
+    assert [c[1] for c in sim.commands[-2:]] == ["stop", "zoom_stop"]  # the last things sent
+    clock.advance(2.0)
+    assert not sim.is_moving()
+    saved = json.loads((tmp_path / "report.json").read_text())
+    assert saved["aborted"] and "verdict" in saved
+    assert "run incomplete" in summarize(report)
+
+
+def test_a_failing_home_move_is_recorded_and_the_run_goes_on():
+    # The first move (going home) used to run outside any section: an error there ended the run without a report.
+    class HomeBroken(SimulatedPtz):
+        def home(self):
+            raise RuntimeError("home switch broken")
+
+    clock = FakeClock()
+    sim = HomeBroken(PtzModel(), clock)
+    report = Characterizer(sim, clock, ScriptedUI(), BenchOptions(quick=True, skip=("zoom", "repeatability"))).run()
+    assert "home switch broken" in report["home"]["error"]
+    assert "!! section home failed" in summarize(report)
+    assert report["verdict"]["branch"] in ("A", "B")
+
+
+def test_speed_steps_that_hit_the_end_stop_are_left_out():
+    # A camera with only +/-500 units of pan travel. The fast steps run into the end stop during their
+    # measurement, so their "rate" is wrong: they are marked and left out of the model's speed table.
+    report, _ = run_on_sim(PtzModel(pan_limits=(-500.0, 500.0)),
+                           BenchOptions(quick=True, skip=("latency", "absolute", "zoom", "repeatability", "units")))
+    pan = report["speed_table"]["pan"]
+    hit = {step for step, row in pan.items() for sign in ("+", "-") if (row.get(sign) or {}).get("hit_limit")}
+    assert hit  # some steps did hit the stop
+    for step in hit:
+        assert step not in report["model"]["pan_speed_table"]
+    assert all(cell.get("excluded") for row in pan.values() for cell in (row.get("+"), row.get("-"))
+               if isinstance(cell, dict) and cell.get("hit_limit"))
+
+
+def test_an_asymmetric_camera_is_brought_home_when_it_drifts():
+    # This camera pans left at 60% of its right speed, so every +/- pair of moves ends further right. The bench
+    # notices the drift at the start of a step and goes home first, instead of creeping into the end stop.
+    truth = PtzModel(pan_speed_table_negative={s: v * 0.6 for s, v in PtzModel().pan_speed_table.items()})
+    report, _ = run_on_sim(truth, BenchOptions(quick=True, skip=("latency", "absolute", "zoom", "repeatability")))
+    assert report["speed_table"]["rehomes"] >= 1
+    measured = PtzModel.from_dict(report["model"])
+    assert measured.pan_speed_table_negative[8] == pytest.approx(truth.pan_speed_table_negative[8], rel=0.05)
+
+
+def test_fov_stops_without_zoom_inquiry_use_commanded_positions():
+    # A camera that can't report its zoom. João still needs the FOV screenshots, so the bench commands 9 zoom
+    # positions across the usual VISCA range (0..0x4000) and pauses at each.
+    ui = ScriptedUI()
+    options = BenchOptions(quick=True, skip=("feedback", "speed_table", "latency", "absolute", "repeatability", "units"))
+    report, sim = run_on_sim(PtzModel(zoom_inquiry_mode="never"), options, ui=ui)
+    zoom = report["zoom"]
+    assert zoom["fov_positions"] == [k * 0x4000 // 8 for k in range(9)]
+    assert "commanded" in zoom["fov_positions_source"]
+    assert sum("screenshot" in m for m in ui.messages) == 9
+
+
+def test_no_fov_stops_when_zoom_direct_is_refused_too():
+    options = BenchOptions(quick=True, skip=("feedback", "speed_table", "latency", "absolute", "repeatability", "units"))
+    report, _ = run_on_sim(PtzModel(zoom_inquiry_mode="never", supports_zoom_direct=False), options)
+    assert report["zoom"]["fov_positions"] == []
+    assert "refused" in report["zoom"]["fov_note"]
+
+
+def test_zoom_tele_flag():
+    args = parse_args(["--ip", "x", "--out", "y", "--zoom-tele", "0x7AC0"])
+    assert args.zoom_tele == 0x7AC0
