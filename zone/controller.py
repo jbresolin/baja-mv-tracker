@@ -260,7 +260,9 @@ class Controller:
         self.pan_step = self.tilt_step = 0
         self.t_last_zoom = -math.inf
         self.last_zoom_sent = None
-        self.ptz_ok = True              # did the last command succeed? (health)
+        # did the camera answer the last command? None = unknown (nothing sent yet), True = it answered (even with a
+        # VISCA error: it is reachable), False = no answer within the driver timeout / the call failed. For health.
+        self.ptz_ok = None
         self.q_pan = self.q_tilt = 0.0  # quantization deficit (reported units): wanted minus commanded, integrated
         self.t_follow = None            # time of the last follow() (None = the next one starts a new segment)
         self.want = (0.0, 0.0)          # wanted rates of the last cycle (reported units/s)
@@ -324,9 +326,10 @@ class Controller:
         try:
             r = self.ptz.pan_tilt_velocity(self.pan_step, self.tilt_step, ttl=self.cfg.ttl_s)
             ok = bool(getattr(r, "ok", True))
+            self.ptz_ok = answered(r)
         except Exception:  # noqa: BLE001 (the network can fail; the TTL stops the camera, we keep looping)
             ok = False
-        self.ptz_ok = ok
+            self.ptz_ok = False
         self.pose.commanded(self.pan_step, self.tilt_step)
         return ok
 
@@ -340,8 +343,9 @@ class Controller:
         if self.last_zoom_sent is not None and abs(z - self.last_zoom_sent) <= c.zoom_threshold:
             return None
         try:
-            self.ptz.zoom_direct(z)
+            self.ptz_ok = answered(self.ptz.zoom_direct(z))
         except Exception:  # noqa: BLE001
+            self.ptz_ok = False
             return None
         self.t_last_zoom, self.last_zoom_sent = now, z
         self.pose.zoom_commanded(z)
@@ -359,7 +363,7 @@ class Controller:
         self._reset_quant()
         for fn in (self.ptz.stop, self.ptz.zoom_stop):
             try:
-                fn()
+                self.ptz_ok = answered(fn())
             except Exception:  # noqa: BLE001
                 self.ptz_ok = False
         self.pose.commanded(0, 0)
@@ -370,13 +374,18 @@ class Controller:
         self.pan_step = self.tilt_step = 0
         self._reset_quant()
         try:
-            r = self.ptz.preset_recall(int(preset))
-            self.ptz_ok = bool(getattr(r, "ok", True))
+            self.ptz_ok = answered(self.ptz.preset_recall(int(preset)))
         except Exception:  # noqa: BLE001
             self.ptz_ok = False
         self.pose.recalled(pose, settle_s)
         self.last_zoom_sent = int(round(pose.zoom))  # the preset restores the taught zoom
         self.t_last_zoom = self.clock.monotonic()
+
+
+def answered(result):
+    """Did the camera answer this command? Only a timeout (or no reply at all) means "not reachable"; a VISCA error
+    reply still proves the camera is there. Results without a status (fakes) count as answered."""
+    return getattr(result, "status", None) != "timeout"
 
 
 def _clip(x, lim):

@@ -198,8 +198,11 @@ function render(s) {
   kv($("#health"), [
     ["processamento", `${h.fps} fps (descartados ${h.dropped})`, h.fps < 7 ? "bad" : "good"],
     ["último quadro", `${s.frame.age_s} s atrás`, s.frame.age_s > 2 ? "bad" : ""],
-    ["PTZ", `${h.ptz_driver} · ${h.ptz_reachable === null ? "?" : (h.ptz_reachable ? "respondendo" : "SEM RESPOSTA")}`,
-     h.ptz_reachable === false ? "bad" : "good"],
+    ["PTZ", `${h.ptz_driver} · ${h.ptz_reachable === null || h.ptz_reachable === undefined
+                                  ? "desconhecido (nada respondeu ainda)"
+                                  : (h.ptz_reachable ? "respondendo" : "SEM RESPOSTA")}` +
+            (h.ptz_reachable_how === "last_command" ? " (último comando)" : ""),
+     h.ptz_reachable === false ? "bad" : (h.ptz_reachable ? "good" : "")],
     ["ramo de controle", `${h.branch} · ${h.report.reason || h.report.path || "sem relatório"}`],
     ["relógio (NTP)", h.ntp_server ? (h.ntp_offset_s === null ? "sem resposta de " + h.ntp_server
                                      : `${h.ntp_offset_s >= 0 ? "+" : ""}${h.ntp_offset_s} s vs ${h.ntp_server}`)

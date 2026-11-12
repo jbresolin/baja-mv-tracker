@@ -85,8 +85,11 @@ class ZoneApp:
         self.frame_lock = threading.Lock()
         self.last_frame_mono = clock.monotonic()
         self.recorder = None
+        # ptz_reachable: None = unknown (nothing has answered yet), True / False; ptz_reachable_how: "probe" (an
+        # inquiry made by the health check) or "last_command" (the result of the controller's last command)
         self.health = dict(disk_free_gb=None, ntp_offset_s=None, ntp_server=None, clock_warnings=[],
-                           ptz_reachable=None, ptz_probe_wall=None)
+                           ptz_reachable=None, ptz_reachable_how=None, ptz_probe_wall=None)
+        self._probe_answered_once = False    # has this camera ever answered the health probe?
         self.stop_ev = threading.Event()
         self.exit_code = 0
         self._log("zone app start: branch %s (%s), pose source %s, zone %s (%d points)" % (
@@ -213,13 +216,38 @@ class ZoneApp:
             from rt.timesync import sntp_offset
             off = sntp_offset(server)
             self.health["ntp_offset_s"] = None if off is None else round(off, 3)
-        # PTZ reachable: a harmless zoom inquiry (cameras without zoom inquiry fall back to the last command result)
-        try:
-            z = self.ptz.inquire_zoom()
-        except Exception:  # noqa: BLE001
-            z = None
-        self.health["ptz_reachable"] = (z is not None) or self.runtime.controller.ptz_ok
+        self.health["ptz_reachable"], self.health["ptz_reachable_how"] = self.ptz_reachability()
         self.health["ptz_probe_wall"] = round(self.clock.wall(), 1)
+
+    def ptz_reachability(self):
+        """-> (reachable, how). reachable: True / False / None (unknown).
+
+        While AUTO is driving the camera (tracking a car or returning to the entry), no probe is sent: an inquiry
+        from this thread would compete with the control loop for the driver (one request on the wire at a time) and
+        could delay a velocity refresh up to the TTL. The result of the controller's last command is used instead.
+
+        Otherwise a harmless inquiry is sent (zoom, then pan/tilt if the camera has no zoom inquiry). If neither is
+        answered: when this camera has answered the probe before, it is unreachable now; when it never has (it may
+        simply not support inquiries), fall back to the last command's result, which is None until something was
+        sent: "unknown", never a false "reachable"."""
+        ctrl = self.runtime.controller
+        d = self.runtime.director
+        if d.mode == D.AUTO and d.sub in (D.TRACKING, D.RETURNING):
+            return ctrl.ptz_ok, "last_command"
+        answer = None
+        for inquiry in (self.ptz.inquire_zoom, self.ptz.inquire_pan_tilt):
+            try:
+                answer = inquiry()
+            except Exception:  # noqa: BLE001
+                answer = None
+            if answer is not None:
+                break
+        if answer is not None:
+            self._probe_answered_once = True
+            return True, "probe"
+        if self._probe_answered_once:
+            return False, "probe"
+        return ctrl.ptz_ok, "last_command"
 
     def ptz_recording_state(self):
         files = sorted(self.out_dir.glob("ptz_*.mkv"), key=lambda p: p.stat().st_mtime)

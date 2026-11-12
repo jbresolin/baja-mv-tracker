@@ -1,4 +1,6 @@
 """Tests for zone/app.py: the web page's API (mode buttons, big STOP, teach), with a simulated PTZ and no camera."""
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -98,3 +100,82 @@ def test_health_disk_and_ptz(tmp_path):
     app.check_health()
     h = client.get("/api/state").json()["health"]
     assert h["disk_free_gb"] > 0 and h["ptz_reachable"] is True
+
+
+# ================================================================================= "is the PTZ reachable?" on the page
+class SilentPtz:
+    """Wraps the simulated PTZ. `answers` decides whether inquiries get an answer (False = the camera is unplugged
+    or doesn't support inquiries: every inquiry returns None, like the real driver after its timeout). Every call
+    is recorded in `calls`, so a test can check what the health check asked."""
+
+    def __init__(self, inner, answers=True):
+        self.inner, self.answers, self.calls = inner, answers, []
+
+    def __getattr__(self, name):
+        fn = getattr(self.inner, name)
+
+        def wrapped(*a, **kw):
+            self.calls.append(name)
+            if name.startswith("inquire") and not self.answers:
+                return None
+            return fn(*a, **kw)
+        return wrapped
+
+
+def make_with(tmp_path, ptz_wrapper):
+    cfg = C.load(None, ["ptz.driver=sim"])
+    clock = FakeClock(0.0)
+    ptz = ptz_wrapper(SimulatedPtz(PtzModel(), clock))
+    app = ZoneApp(cfg, C.build(cfg), ptz, clock, straight_zone(), tmp_path / "zone.json", tmp_path / "out",
+                  log=lambda m: None)
+    return app, ptz, clock
+
+
+def test_ptz_reachability_is_unknown_until_something_answers(tmp_path):
+    # A camera that answers no inquiry, and nothing was sent to it yet: we simply don't know. The page used to say
+    # "respondendo" here, because the controller's "last command ok" started as True before any command.
+    app, ptz, _ = make_with(tmp_path, lambda sim: SilentPtz(sim, answers=False))
+    app.check_health()
+    assert app.health["ptz_reachable"] is None
+    assert app.runtime.controller.ptz_ok is None
+    # once a command was sent and the camera answered it, it is known to be reachable
+    app.runtime.big_stop()
+    app.check_health()
+    assert app.health["ptz_reachable"] is True and app.health["ptz_reachable_how"] == "last_command"
+
+
+def test_ptz_reachable_from_the_probe_and_unreachable_when_it_stops_answering(tmp_path):
+    app, ptz, _ = make_with(tmp_path, lambda sim: SilentPtz(sim, answers=True))
+    app.check_health()
+    assert app.health["ptz_reachable"] is True and app.health["ptz_reachable_how"] == "probe"
+    ptz.answers = False                      # the cable is pulled
+    app.check_health()
+    # it answered before, so silence now means "unreachable" (not "unknown")
+    assert app.health["ptz_reachable"] is False
+
+
+def test_page_shows_the_three_ptz_states(tmp_path):
+    # the page script has a text for each state: unknown, answering, not answering
+    js = (Path(__file__).resolve().parent.parent / "static" / "app.js").read_text(encoding="utf-8")
+    assert "desconhecido" in js and "respondendo" in js and "SEM RESPOSTA" in js
+
+
+def test_health_probe_stays_off_the_wire_while_auto_drives_the_camera(tmp_path):
+    # While AUTO follows a car, the control loop refreshes the velocity command every cycle, and the driver sends
+    # one request at a time. A health inquiry from another thread could hold the wire long enough to push a refresh
+    # to the edge of the TTL (the camera would stop). So while tracking or returning, the health check must not
+    # ask the camera anything: it reports the result of the controller's last command instead.
+    app, ptz, _ = make_with(tmp_path, lambda sim: SilentPtz(sim, answers=True))
+    d = app.runtime.director
+    for sub in ("tracking", "returning"):
+        d.mode, d.sub = "AUTO", sub
+        ptz.calls.clear()
+        app.runtime.controller.ptz_ok = True
+        app.check_health()
+        assert not [c for c in ptz.calls if c.startswith("inquire")], sub
+        assert app.health["ptz_reachable"] is True and app.health["ptz_reachable_how"] == "last_command"
+    # waiting at the entry (camera still): probing is fine again
+    d.sub = "waiting"
+    ptz.calls.clear()
+    app.check_health()
+    assert "inquire_zoom" in ptz.calls

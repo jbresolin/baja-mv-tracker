@@ -170,3 +170,28 @@ def test_stop_halts_the_camera():
     clock.advance(1.0)
     assert sim.true_pan_tilt()[0] == pytest.approx(pan)
     assert ctrl.pan_step == 0
+
+
+# ================================================================================= did the camera answer? (health)
+class TimeoutPtz:
+    """Every command "times out": the driver got no reply, as with an unplugged camera."""
+
+    def __getattr__(self, name):
+        from zone.ptz.interface import CommandResult
+        return lambda *a, **kw: CommandResult("timeout")
+
+
+def test_ptz_ok_is_unknown_until_the_first_command_then_follows_the_answers():
+    model = PtzModel(inquiry_mode="never")
+    st = settings("B", model=model)
+    clock = FakeClock(0.0)
+    sim = SimulatedPtz(model, clock)
+    ctrl = Controller(sim, clock, CURVE, st.pan_map, st.tilt_map, st.controller)
+    # nothing sent yet: we don't know whether the camera is there (None, not True)
+    assert ctrl.ptz_ok is None
+    ctrl.stop()                                  # the simulator answers every command
+    assert ctrl.ptz_ok is True
+    # the same controller talking to a camera that never answers
+    ctrl.ptz = TimeoutPtz()
+    ctrl.follow(0.2, 0.25, clock.monotonic())
+    assert ctrl.ptz_ok is False
