@@ -133,6 +133,9 @@ class Spotter:
         self.tracker = tracker
         self.last_dets = (np.zeros((0, 4), np.float32), np.zeros(0, np.float32))
         self.last_ms = 0.0
+        # which detector runs, for the page's health line: dict(kind="baja" | "coco" | "blobs", desc=..., bench=bool).
+        # bench = True means a bench-only detector (COCO) is active: the page shows a warning.
+        self.detector_info = None
 
     def set_roi(self, roi):
         self.det.roi = roi
@@ -174,13 +177,39 @@ def make_detector(rtcfg, log=print):
     return det, (w, h)
 
 
+# spotter.detector values. "rt" is the old name of "baja" (kept so existing site.toml files still work).
+DETECTOR_KINDS = ("baja", "coco", "blobs")
+DETECTOR_ALIASES = {"rt": "baja"}
+
+
+def detector_kind(spotter_cfg):
+    """spotter.detector -> "baja" (default), "coco" or "blobs". Anything else is an error at startup."""
+    kind = str(spotter_cfg.get("detector", "baja")).strip().lower()
+    kind = DETECTOR_ALIASES.get(kind, kind)
+    if kind not in DETECTOR_KINDS:
+        raise ValueError("spotter.detector must be one of %s, not %r" % (", ".join(DETECTOR_KINDS), kind))
+    return kind
+
+
 def make_spotter(cfg, rtcfg, roi=None, mode=None, det=None, input_wh=None, log=print):
+    """The spotter from the config. `det` / `input_wh` inject a detector (tests, tools); otherwise spotter.detector
+    picks it: "baja" = the deployed rt/ car detector, "coco" = the bench-only COCO detector (zone/bench_detector.py,
+    with its own confidence threshold spotter.coco_conf), "blobs" = white boxes (synthetic tests)."""
     s = cfg["spotter"]
-    if det is None and s.get("detector", "rt") == "blobs":
+    kind = detector_kind(s)
+    conf = rtcfg["detection"]["conf"]
+    if det is None and kind == "blobs":
         from zone.testing import BlobDetector
         det, input_wh = BlobDetector(), (640, 384)
-    if det is None:
+    elif det is None and kind == "coco":
+        from zone.bench_detector import make_coco_detector
+        det, input_wh = make_coco_detector(s, int(rtcfg["runtime"]["threads_detector"]), log)
+    elif det is None:
         det, input_wh = make_detector(rtcfg, log)
+    if kind == "coco":
+        conf = float(s["coco_conf"])
     rd = RoiDetector(det, mode or s["roi_mode"], roi, input_wh or (640, 384), s["tile_overlap"], s["tile_scale"],
-                     rtcfg["detection"]["conf"], rtcfg["detection"]["nms_iou"])
-    return Spotter(rd, make_tracker(rtcfg))
+                     conf, rtcfg["detection"]["nms_iou"])
+    sp = Spotter(rd, make_tracker(rtcfg))
+    sp.detector_info = dict(kind=kind, desc=str(getattr(det, "desc", type(det).__name__)), bench=kind == "coco")
+    return sp
