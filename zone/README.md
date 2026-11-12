@@ -141,6 +141,10 @@ python -m zone.tools.replay --video spotter.mp4 --zone zones/zone.json --report 
 python -m zone.tools.replay --tracks out/zone/replay_x/tracks.json --zone ... --set controller.k_pan=1.0
 ```
 
+Our own spotter recordings are encoded at a fixed 10 fps, so their pts are only nominal: the replay takes each
+frame's real grab time from the `.frames.csv` sidecar next to the video (found by itself; `--frames x.frames.csv`
+to point at another one, `--no-frames` to use the pts). Videos without a sidecar use their pts.
+
 The replay writes `cycles.csv`, `passes.csv` (time locked, drop reason, mean / max error), a `pass_NN.png` per pass,
 and `tracks.json` (re-run the control part alone with other settings).
 

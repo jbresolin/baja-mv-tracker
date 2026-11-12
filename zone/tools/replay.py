@@ -1,8 +1,13 @@
 """Offline replay: run the real zone pipeline (detector, tracker, progress, director, controller) on a recorded spotter
 video, driving the simulated PTZ on a fake clock, and score how well it framed each car.
 
-    python -m zone.tools.replay --video out/zone/spotter_20261115-101500.mp4 --zone zones/zone.json \\
+    python -m zone.tools.replay --video out/zone/spotter_20261115-101500.mkv --zone zones/zone.json \\
                                 --report reports/ptz1/report.json [--out out/zone/replay_x] [--set controller.branch=A]
+
+Frame times: our own spotter recordings are encoded at a fixed frame rate, so their pts are nominal. The real grab
+time of every frame is in the `.frames.csv` sidecar next to the video; it's picked up by itself when it's there
+(`--frames <sidecar.csv>` to point at one, `--no-frames` to use the pts anyway). Other videos (camera files, the
+October recording) have no sidecar and use their pts.
 
 Scoring: for every control cycle while a car is locked, the PTZ's true pointing (from the simulator) is compared with
 pose(s_true), where s_true is the same track's progress *without* lookahead, latency or filtering: its raw projected
@@ -207,6 +212,9 @@ def main(argv=None):
     ap.add_argument("--out", default=None)
     ap.add_argument("--start", default=None, help="seconds into the video, or HH:MM[:SS] wall time")
     ap.add_argument("--duration", type=float, default=None)
+    ap.add_argument("--frames", default=None,
+                    help="frame-time sidecar (.frames.csv) of a zone recording; default: the one next to the video")
+    ap.add_argument("--no-frames", action="store_true", help="ignore the sidecar: frame times from the pts")
     ap.add_argument("--tracks", default=None, help="tracks.json from an earlier replay: skip detection")
     ap.add_argument("--detector", default="rt", choices=["rt", "blobs"], help="blobs: synthetic test videos only")
     ap.add_argument("--proc-delay", type=float, default=None,
@@ -234,8 +242,13 @@ def main(argv=None):
         if not a.video:
             raise SystemExit("--video or --tracks is needed")
         from zone.spotter import RoiDetector, Spotter, make_tracker, rt_config
-        from zone.tools.common import pick_detector, video_frames
+        from zone.tools.common import load_frame_times, pick_detector, sidecar_for, video_frames
         rtcfg = rt_config(cfg)
+        frames_csv = None if a.no_frames else (Path(a.frames) if a.frames else sidecar_for(a.video))
+        frame_times = load_frame_times(frames_csv) if frames_csv else None
+        print("frame times: %s" % (("sidecar %s (%d frames)" % (frames_csv, len(frame_times))) if frame_times
+                                   else "video pts"))
+        ft_stats = {}
         det, inwh = pick_detector(a.detector, rtcfg)
         s = cfg["spotter"]
         size = zone.image_size
@@ -244,13 +257,17 @@ def main(argv=None):
                                       rtcfg["detection"]["conf"], rtcfg["detection"]["nms_iou"]), make_tracker(rtcfg))
         ms = []
         dets = []
-        for fr in video_frames(rtcfg, a.video, a.start, a.duration):
+        for fr in video_frames(rtcfg, a.video, a.start, a.duration, frame_times, ft_stats):
             dets.extend(detect([fr], spotter))
             ms.append(spotter.last_ms)
         det_ms = float(np.median(ms)) if ms else None
         (out_dir / "tracks.json").write_text(json.dumps(dict(video=str(a.video), roi_mode=s["roi_mode"], roi=roi,
-                                                             det_ms_median=det_ms, frames=dets)), encoding="utf-8")
+                                                             det_ms_median=det_ms,
+                                                             frame_times=str(frames_csv) if frames_csv else "pts",
+                                                             frames=dets)), encoding="utf-8")
         print("detection: %d frames, %.1f ms per frame (median)" % (len(dets), det_ms or 0))
+        if frame_times and ft_stats.get("missing"):
+            print("warning: %d frames not in the sidecar (their time comes from the pts)" % ft_stats["missing"])
     proc_delay = a.proc_delay if a.proc_delay is not None else (det_ms / 1000.0 if det_ms else 0.05)
     truth = truth_tracks(dets, path, settings.progress)
     profile = learn_profile(dets, path, settings) if a.warm_profile else None

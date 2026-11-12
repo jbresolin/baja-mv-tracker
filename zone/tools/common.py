@@ -1,22 +1,62 @@
 """Shared bits of the offline tools (replay, detection check): reading a recording frame by frame, picking the
 detector, writing small plots without matplotlib."""
+import csv
+from pathlib import Path
+
 import cv2
 import numpy as np
 
 from zone.source import ZoneFrame
 
 
-def video_frames(rtcfg, video, start=None, duration=None):
-    """Every sampled frame of a recording (at rt capture.fps), as fast as possible, with t = seconds into the file
-    (pts) and t_wall = rt's wall clock for the frame (overlay / creation_time / mtime, see rt/capture.py)."""
+def video_frames(rtcfg, video, start=None, duration=None, frame_times=None, stats=None):
+    """Every sampled frame of a recording (at rt capture.fps), as fast as possible.
+
+    Without `frame_times`: t = seconds into the file (pts) and t_wall = rt's wall clock for the frame (overlay /
+    creation_time / mtime, see rt/capture.py). That's right for camera files, whose pts are real time.
+
+    With `frame_times` (from `load_frame_times`, the `.frames.csv` sidecar our own SpotterRecorder writes): t and
+    t_wall are the grab times the tracker saw live. Our recordings are encoded at a fixed frame rate, so their pts
+    are only nominal (a frame the webcam delivered late, or a dropped one, shifts everything after it); the sidecar
+    has the real times. Frames missing from the sidecar fall back to pts and are counted in `stats["missing"]`."""
     from rt.capture import FileCapture
     cap = FileCapture(rtcfg, video, start, duration, realtime=False, log=lambda m: None)
+    fps = float(cap.info["fps"]) or 1.0
+    if stats is not None:
+        stats.update(matched=0, missing=0)
     cap.start()
     try:
         for fr in cap.frames():
-            yield ZoneFrame(fr.img, fr.pts, fr.t, fr.idx)
+            t, t_wall = fr.pts, fr.t
+            if frame_times is not None:
+                hit = frame_times.get(file_frame_number(fr.pts, fps))
+                if hit is not None:
+                    t_wall, t = hit
+                if stats is not None:
+                    stats["matched" if hit is not None else "missing"] += 1
+            yield ZoneFrame(fr.img, t, t_wall, fr.idx)
     finally:
         cap.stop()
+
+
+def file_frame_number(pts, fps):
+    """The frame number in the file (0, 1, 2...) of a frame shown at `pts` seconds, for a constant-rate file."""
+    return int(round(float(pts) * float(fps)))
+
+
+def sidecar_for(video):
+    """`spotter_X.mkv` -> `spotter_X.frames.csv` if that file exists next to it, else None."""
+    p = Path(video).with_suffix(".frames.csv")
+    return p if p.exists() else None
+
+
+def load_frame_times(path):
+    """Read a SpotterRecorder sidecar: -> {frame number in the file: (t_wall, t_mono)}."""
+    out = {}
+    with open(path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            out[int(row["frame"])] = (float(row["t_wall"]), float(row["t_mono"]))
+    return out
 
 
 def pick_detector(kind, rtcfg):
