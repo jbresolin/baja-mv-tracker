@@ -34,7 +34,9 @@ camera_backend = "auto"           # Windows: "dshow" or "msmf" if "auto" picks t
 camera_width = 1920
 camera_height = 1080
 camera_fps = 30
-live_latency_s = 0.0              # known webcam latency, subtracted from frame times (measure it: LED test)
+live_latency_s = 0.1              # spotter capture latency (s): from the moment the picture is taken to the moment the
+                                  # frame reaches us. Subtracted from live frame times (wall and monotonic), so the
+                                  # controller's lookahead covers it. 0.1 is a typical USB webcam; MEASURE it (README)
 
 [rt.models]
 manifest = "deploy/models/manifest.json"
@@ -93,7 +95,9 @@ tilt_min_smooth_step = "auto"
 
 [controller]
 branch = "auto"                   # "auto" = the report's verdict (no report: "B") | "A" | "B"
-latency_s = "auto"                # command-to-motion delay; "auto" = report command_latency_s + ramp_s / 2 (default 0.25)
+latency_s = "auto"                # command latency only (command sent -> camera moving); "auto" = report
+                                  # command_latency_s + ramp_s / 2 (default 0.25). The spotter's capture latency is
+                                  # rt.capture.live_latency_s, and the processing time is measured per frame
 include_processing_delay = true   # also look ahead by the time since the frame was grabbed
 k_pan = 1.5                       # feedback gain (1/s); Branch B uses it only right after a preset recall
 k_tilt = 1.5

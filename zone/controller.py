@@ -18,8 +18,12 @@ Branches (picked by config from the characterization report, never by editing co
   table (logged, but not trusted), and k = 0, except right after a preset recall: then the pose is known, and it
   stays trustworthy for `dead_reckoning_trust_s` seconds of motion.
 
-Latency: `latency_s` (config, seeded from the report's command latency) is the command-to-motion delay; when
-`include_processing_delay` is on, the time from the frame grab to now (detection + tracking) is added. Every velocity
+Latency: the lookahead covers three delays, and they come from three places:
+  * capture latency (picture taken -> frame arrives): already in the frame's grab time, because the spotter source
+    subtracts `rt.capture.live_latency_s` from the arrival time (zone/source.py);
+  * processing (frame grab -> now: detection, tracking): `now - t_grab`, when `include_processing_delay` is on
+    (so with it on, the capture latency is covered too, since t_grab is the corrected time);
+  * command latency (command sent -> the camera moves): `latency_s` (config, seeded from the report). Every velocity
 command carries the driver's TTL, so if this loop dies, the camera stops by itself.
 """
 import math
@@ -33,8 +37,10 @@ from zone.speedmap import AxisSpeedMap
 @dataclass
 class ControllerSettings:
     branch: str = "B"                    # "A" (inquiry feedback) | "B" (feed-forward only)
-    latency_s: float = 0.25              # command-to-motion delay (s)
-    include_processing_delay: bool = True  # also look ahead by (now - frame grab time)
+    latency_s: float = 0.25              # command latency ONLY: command sent -> camera moving (s). The spotter's
+                                         # capture latency is separate (rt.capture.live_latency_s, already taken
+                                         # off the frame's grab time by zone/source.py)
+    include_processing_delay: bool = True  # also look ahead by (now - frame grab time): processing + capture latency
     k_pan: float = 1.5                   # feedback gain (1/s): rate += k * error
     k_tilt: float = 1.5
     max_feedback_pan: float = 150.0       # cap on |k * error| (units/s), so feedback never yanks the camera

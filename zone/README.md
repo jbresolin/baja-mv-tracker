@@ -126,6 +126,20 @@ PTZ IP, report path, recording). `zone\run_zone.bat` picks `site.toml` up by its
 The first keyframe is s = 0, the last is s = 1. Teaching on a recording with the PTZ simulated also works:
 `--set spotter.source="rec.mp4" --set ptz.driver=sim`.
 
+### Spotter capture latency (measure it on the bench)
+
+The webcam delivers each frame some time after the picture was taken (exposure, MJPG, USB, driver): typically
+~0.1 s. `rt.capture.live_latency_s` (default 0.1) is subtracted from every live frame's time, so the controller's
+lookahead covers it (lookahead = capture latency + processing time + `controller.latency_s`, the PTZ command latency).
+Measure it once per webcam, in its real mode (1080p30 MJPG), and put the value in `site.toml`:
+
+* **LED method:** point the spotter at an LED that a script on the laptop toggles (or the laptop's caps-lock LED).
+  Log the toggle time and the time of the first frame that shows the change (`zone_<start>.jsonl` has every frame's
+  grab time). Average over ~20 toggles.
+* **Stopwatch method:** point the spotter at a millisecond stopwatch on the laptop's own screen and take a phone
+  photo of both the screen and the page's live frame. The difference between the stopwatch and its image in the frame
+  is the latency (plus the page's display delay; take a few photos and the smallest difference).
+
 ### Choosing the control branch
 
 `controller.branch = "auto"` reads the WP-Z1 report (`ptz.report`): **A** if pan/tilt inquiry works while moving,
