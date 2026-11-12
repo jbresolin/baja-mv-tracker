@@ -111,7 +111,10 @@ private networks when Windows asks).
 * **Launcher** (`rt/supervise.py`, `rt\run_lapline.bat`, `[launch]`): restarts rt when it exits (5 s, doubling, max
   60 s; reset after a 10-min healthy run) or when the status page does not answer, or reports 0 fps while the camera
   says "streaming", for 30 s (after a 60 s start-up grace). 0 fps with the camera "lost" / "retrying" / "opening" is
-  left to rt, which is already reopening the camera itself. It kills the whole process tree. It starts rt with
+  left to rt, which is already reopening the camera itself, within two limits: rt is restarted anyway when the
+  camera has been recovering for `camera_recover_max_s` (600 s) in one go, or when rt's camera open-attempt counter
+  (`open_attempts` on the status page) has not gone up for `camera_attempt_stall_s` (60 s: rt's reopen loop is
+  stuck, e.g. an open that never returns; keep `camera.reopen_max_s` well below it). It kills the whole process tree. It starts rt with
   `--require-status`: if the status port is busy (another rt, or another program), rt exits with code 3 and says
   why, and launcher.log names the reason, instead of rt running blind and being killed as "stalled" every ~90 s. On
   Windows the page binds its port exclusively (Python's default SO_REUSEADDR would let two programs share it

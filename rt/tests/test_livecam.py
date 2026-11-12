@@ -196,6 +196,12 @@ def test_missing_camera_at_start_is_retried_with_growing_waits(cfg):
     cap, frames, sleeper = run_capture(cfg, cam, clock, reopens=4)
     assert sleeper.reopen_waits() == [1.0, 2.0, 4.0, 1.0]   # the last one: the camera ran out of frames ("lost")
     assert len(frames) == 10
+    # Every try to open the camera is counted, and the status page shows the count: 3 failed opens + 1 good one
+    # = 4 (the test stops while rt waits before a 5th). The launcher watches this number while the camera is lost: if it
+    # stops going up, rt's reopen loop is stuck and the launcher restarts rt.
+    status = cap.status()
+    assert status["open_attempts"] == 4
+    assert status["last_attempt_age_s"] is not None
 
 
 # ------------------------------------------------------------------------------------------------ raw MJPEG

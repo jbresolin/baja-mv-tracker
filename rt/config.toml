@@ -104,6 +104,8 @@ restart_max_s = 60              # ... up to 60 s
 healthy_reset_min = 10          # a run that lasted this long resets the backoff to restart_first_s
 stall_s = 30                    # no status answer, or fps = 0 while the camera says streaming, this long -> kill + restart
 startup_grace_s = 60            # no stall check during the first seconds of a run
+camera_recover_max_s = 600      # camera lost / reopening this long in one go -> restart rt anyway
+camera_attempt_stall_s = 60     # camera lost and rt's open-attempt counter not moving this long -> restart rt
 poll_s = 2
 
 [clock]

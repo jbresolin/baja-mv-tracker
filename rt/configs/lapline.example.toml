@@ -16,6 +16,8 @@ healthy_reset_min = 10          # a run that lasted 10 min resets the wait to 5 
 stall_s = 30                    # status page silent, or fps = 0 while the camera says streaming, for 30 s ->
                                 # kill rt and restart it (camera lost/retrying: rt reopens it itself, no kill)
 startup_grace_s = 60            # no stall check in the first 60 s of a run (models load, camera opens)
+camera_recover_max_s = 600      # camera lost / reopening this long in one go -> restart rt anyway
+camera_attempt_stall_s = 60     # camera lost and rt's open-attempt counter not moving this long -> restart rt
 poll_s = 2                      # how often the launcher looks at rt
 
 [runtime]
