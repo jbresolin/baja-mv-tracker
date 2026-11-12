@@ -24,6 +24,7 @@ poll period), close(). A missing or unplugged port raises BeamPortError; the Bea
 catches it, shows it on the status page and reopens the port with backoff. Nothing here ever touches the detection
 pipeline.
 """
+import sys
 import time
 from dataclasses import dataclass, field
 
@@ -94,6 +95,30 @@ def default_serial_factory(port, baud, timeout):
     return serial.Serial(port=port, baudrate=int(baud), timeout=timeout)
 
 
+def windows_modem_status_ok(ser):
+    """Windows only: ask GetCommModemStatus directly and return its BOOL result (True = the port answered, False =
+    the call failed: the adapter is gone), or None when this check cannot be made (not Windows, not a pyserial
+    port, ctypes problem). Why: pyserial's Serial.cts / .dsr / .cd / .ri call the same function but ignore its
+    result, so after an unplug they simply read "not asserted" instead of raising. Read-only call; any surprise
+    here just disables the extra check (the in_waiting check still runs)."""
+    if sys.platform != "win32":
+        return None
+    handle = getattr(ser, "_port_handle", None)
+    if handle is None:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)   # our own instance: pyserial's is not touched
+        get_status = kernel32.GetCommModemStatus
+        get_status.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        get_status.restype = wintypes.BOOL
+        status = wintypes.DWORD()
+        return bool(get_status(handle, ctypes.byref(status)))
+    except Exception:  # noqa: BLE001 (an optional extra check must never break the driver)
+        return None
+
+
 class BeamSource:
     """The interface every driver implements. `poll_stats` is read by the service for the status page."""
     driver = "base"
@@ -128,11 +153,19 @@ class ModemLineSource(BeamSource):
     behind by more than one period (PC busy) the grid restarts instead of polling in a burst.
 
     DTR and RTS are output lines of the adapter. pyserial asserts both when it opens a port; they are set here from
-    the config because some sensors / pull-ups are powered from them (see rt/README.md "Beam input")."""
+    the config because some sensors / pull-ups are powered from them (see rt/README.md "Beam input").
+
+    Unplug detection: on Windows, pyserial reads the modem lines with GetCommModemStatus but ignores whether that
+    call failed, so after the adapter is pulled out the lines just read "not asserted" and nothing raises. So every
+    `health_check_s` (0.1 s) the driver also reads `in_waiting` (pyserial calls ClearCommError, which DOES raise on
+    a dead handle) and, on Windows, checks GetCommModemStatus' own result (windows_modem_status_ok). A failure of
+    either = the port is lost (BeamPortError); the service reopens it with backoff. Bytes that arrive in modem-line
+    mode are read and thrown away there, so the driver's buffer never fills up."""
     driver = "modem-line"
+    HEALTH_CHECK_S = 0.1
 
     def __init__(self, port, line="cts", active="high", poll_hz=1000.0, baud=9600, set_dtr=True, set_rts=True,
-                 clock=None, sleep=None, serial_factory=None):
+                 clock=None, sleep=None, serial_factory=None, modem_status_check=None):
         super().__init__()
         line = str(line).lower()
         if line == "dcd":
@@ -152,6 +185,20 @@ class ModemLineSource(BeamSource):
         self.last_level = None
         self.last_poll_mono = None
         self.next_due = None
+        self.modem_status_check = modem_status_check or windows_modem_status_ok
+        self.next_health_check = None
+        self.bytes_discarded = 0
+
+    def _check_port_alive(self):
+        """Raise BeamPortError if the adapter is gone (see the class comment: the line reads alone do not tell)."""
+        try:
+            waiting = self.ser.in_waiting
+            if waiting:
+                self.bytes_discarded += len(self.ser.read(waiting))   # not used in modem-line mode
+        except (OSError, ValueError, AttributeError) as e:
+            raise BeamPortError("%s: port check failed (adapter unplugged?): %s" % (self.port, e)) from e
+        if self.modem_status_check(self.ser) is False:
+            raise BeamPortError("%s: GetCommModemStatus failed (adapter unplugged?)" % self.port)
 
     def _read_line(self):
         """The line as the adapter reports it: True = asserted. Raises BeamPortError if the adapter is gone."""
@@ -171,10 +218,12 @@ class ModemLineSource(BeamSource):
         except (OSError, ValueError) as e:
             self.close()
             raise BeamPortError("cannot open %s: %s" % (self.port, e)) from e
+        self._check_port_alive()
         asserted = self._read_line()
         self.last_level = self._level_of(asserted)
         self.last_poll_mono = self.clock.mono()
         self.next_due = self.last_poll_mono + self.period
+        self.next_health_check = self.last_poll_mono + self.HEALTH_CHECK_S
         return dict(port=self.port, line=self.line, active="high" if self.active_high else "low",
                     line_asserted=asserted, level=self.last_level, poll_hz=round(1.0 / self.period, 1))
 
@@ -193,7 +242,12 @@ class ModemLineSource(BeamSource):
         self.next_due += self.period
         if t_mono - self.next_due > self.period:
             self.next_due = t_mono + self.period
+        # 4. Is the adapter still there? Every ~100 ms, and before reporting ANY change: on Windows an unplug reads
+        #    as "not asserted", which would otherwise become a false edge. (After the stamp, so it never delays it.)
         level = self._level_of(asserted)
+        if t_mono >= self.next_health_check or level != self.last_level:
+            self.next_health_check = t_mono + self.HEALTH_CHECK_S
+            self._check_port_alive()
         if level == self.last_level:
             return []
         self.last_level = level

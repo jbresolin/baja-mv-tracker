@@ -165,7 +165,10 @@ of `rt/configs/lapline.toml` (example and every key: `rt/configs/lapline.example
   line, a misaligned sensor, or the polarity set the wrong way round) gives one `beam_stuck` "stuck" event, no breaks,
   and one "cleared" event when the beam has been quiet again.
 * **Never in the way.** The reader thread only reads and stamps; a second thread writes the events. A missing or
-  unplugged adapter is logged, shown in red on the status page, and reopened with backoff (1 s, doubling, max 30 s);
+  unplugged adapter is logged, shown in red on the status page, and reopened with backoff (1 s, doubling, max 30 s;
+  on Windows pyserial reads the modem lines of an unplugged adapter as "not asserted" without an error, so the
+  modem-line driver also checks the port every 100 ms and before reporting any change: `in_waiting`, which does
+  fail, plus GetCommModemStatus' own result);
   detection never waits for the beam. A wrong `[beam]` setting is a warning at start and rt runs without the beam.
 * **Live association** (`pass_beam`, one per `pass_end`): exactly one break within `assoc_window_s` of
   `t_cross - assoc_offset_s` -> `matched` with `t_beam`; none -> `none`; several -> `ambiguous`. The pass events

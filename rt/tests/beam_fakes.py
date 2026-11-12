@@ -5,7 +5,10 @@ tests must run anywhere, fast, with nothing plugged in. So:
 
   * FakeSerial behaves like a pyserial `Serial` object: it has the four modem input lines (.cts .dsr .cd .ri) that
     a test can switch on and off, a byte buffer that a test can fill (as if the adapter had sent bytes), and it can
-    be "unplugged" (every access then fails the way pyserial fails: with an OSError).
+    be "unplugged". Unplugged, it behaves like REAL pyserial on Windows: reading a modem line does NOT fail, it just
+    says "not asserted" (False), because pyserial ignores the error of the Windows call behind it; only
+    `in_waiting` and `read()` fail (with an OSError, like pyserial's SerialException). That is exactly the trap the
+    driver has to handle. `lines_raise_when_unplugged=True` gives the Linux behaviour (the line read fails too).
   * SerialPortWorld is "the PC's USB port": it decides whether COM5 exists right now, and hands out the FakeSerial
     when the code opens the port (this is the `serial_factory` the drivers accept instead of pyserial).
   * TickingClock is rt's FakeClock (rt/backoff.py) plus a sleep() that advances the clock instead of waiting. So a
@@ -16,9 +19,10 @@ from rt.backoff import FakeClock
 
 
 class FakeSerial:
-    def __init__(self, port, baud, timeout, clock=None):
+    def __init__(self, port, baud, timeout, clock=None, lines_raise_when_unplugged=False):
         self.port, self.baudrate, self.timeout = port, baud, timeout
         self.clock = clock
+        self.lines_raise_when_unplugged = lines_raise_when_unplugged
         self.lines = dict(cts=False, dsr=False, cd=False, ri=False)   # False = not asserted
         self.incoming = bytearray()           # bytes "sent by the adapter", not read yet
         self.unplugged = False
@@ -29,26 +33,30 @@ class FakeSerial:
         if self.unplugged:
             raise OSError("ClearCommError failed (PermissionError(13, 'The device does not recognize the command.'))")
 
+    def _line(self, name):
+        """One modem input line. Unplugged on Windows: False, no error (see the module comment)."""
+        if self.unplugged:
+            if self.lines_raise_when_unplugged:
+                self._check()
+            return False
+        return self.lines[name]
+
     # The four modem input lines, as pyserial names them.
     @property
     def cts(self):
-        self._check()
-        return self.lines["cts"]
+        return self._line("cts")
 
     @property
     def dsr(self):
-        self._check()
-        return self.lines["dsr"]
+        return self._line("dsr")
 
     @property
     def cd(self):
-        self._check()
-        return self.lines["cd"]
+        return self._line("cd")
 
     @property
     def ri(self):
-        self._check()
-        return self.lines["ri"]
+        return self._line("ri")
 
     @property
     def in_waiting(self):
@@ -74,8 +82,9 @@ class SerialPortWorld:
     """The PC's serial ports, faked. `present` = is the adapter plugged in. factory() is what the drivers call to
     open a port; it fails like pyserial does when the port does not exist."""
 
-    def __init__(self, clock=None, present=True, lines=None):
+    def __init__(self, clock=None, present=True, lines=None, lines_raise_when_unplugged=False):
         self.clock = clock
+        self.lines_raise_when_unplugged = lines_raise_when_unplugged
         self.present = present
         self.initial_lines = dict(lines or {})   # line states of a freshly opened port, e.g. {"cts": True}
         self.opened = []                      # every FakeSerial handed out, newest last
@@ -84,7 +93,7 @@ class SerialPortWorld:
         if not self.present:
             raise OSError("could not open port '%s': FileNotFoundError(2, 'The system cannot find the file "
                           "specified.', None, 2)" % port)
-        s = FakeSerial(port, baud, timeout, self.clock)
+        s = FakeSerial(port, baud, timeout, self.clock, self.lines_raise_when_unplugged)
         s.lines.update(self.initial_lines)
         self.opened.append(s)
         return s

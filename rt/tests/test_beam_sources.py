@@ -154,9 +154,10 @@ def test_missing_port_raises_a_clear_error():
         src.open()
 
 
-def test_unplugged_adapter_raises_on_the_next_poll():
+def test_unplugged_adapter_on_linux_raises_on_the_next_poll():
+    # On Linux, reading a modem line of an unplugged adapter fails at once.
     clock = TickingClock()
-    world = SerialPortWorld(clock)
+    world = SerialPortWorld(clock, lines_raise_when_unplugged=True)
     src = modem(world, clock)
     src.open()
     src.poll()
@@ -165,6 +166,61 @@ def test_unplugged_adapter_raises_on_the_next_poll():
         src.poll()
     src.close()                                       # closing an unplugged port must not raise either
     assert world.opened[0].closed
+
+
+def test_unplug_on_windows_is_detected_within_a_second_although_the_lines_just_read_false():
+    # The Windows trap: after the adapter is pulled out, pyserial's .cts just returns False (no error), which looks
+    # exactly like "beam clear". Only `in_waiting` fails. The driver checks it every ~100 ms, so the unplug must
+    # be noticed well within 1 second of (fake) time.
+    clock = TickingClock()
+    world = SerialPortWorld(clock, lines={"cts": True})   # line asserted while plugged in
+    src = modem(world, clock, active="low")              # asserted = beam clear (so "False" would look like a car)
+    src.open()
+    world.unplug()
+    t_unplug = clock.mono()
+    edges = []
+    with pytest.raises(BeamPortError, match="unplugged"):
+        for _ in range(2000):                             # up to 2 s of 1 ms polls
+            edges += src.poll()
+    assert clock.mono() - t_unplug < 1.0
+    # The dead line reading False must NOT have been reported as a car: the driver checks the port before it
+    # reports any change.
+    assert edges == []
+
+
+def test_windows_modem_status_check_failing_means_unplugged():
+    # On Windows the driver can also ask GetCommModemStatus itself (pyserial ignores its result). Here a fake
+    # check says "the call failed" (False): that alone must count as unplugged.
+    clock = TickingClock()
+    world = SerialPortWorld(clock)
+    answers = [True]                                     # the check passes at open ...
+    src = ModemLineSource("COM5", "cts", "high", 1000, clock=clock, sleep=clock.sleep, serial_factory=world.factory,
+                          modem_status_check=lambda ser: answers[-1])
+    src.open()
+    answers.append(False)                                # ... then the Windows call starts failing
+    with pytest.raises(BeamPortError, match="GetCommModemStatus failed"):
+        for _ in range(200):
+            src.poll()
+
+
+def test_windows_modem_status_check_is_skipped_off_windows():
+    # On this test machine (not Windows) the optional ctypes check answers None = "cannot check": no error.
+    from rt.beam.sources import windows_modem_status_ok
+    import sys
+    if sys.platform != "win32":
+        assert windows_modem_status_ok(object()) is None
+
+
+def test_bytes_arriving_in_modem_line_mode_are_thrown_away():
+    # In modem-line mode bytes are not used; the health check reads them away so the driver's buffer never fills.
+    clock = TickingClock()
+    world = SerialPortWorld(clock)
+    src = modem(world, clock)
+    src.open()
+    world.serial.incoming += b"\x01\x02\x03"
+    for _ in range(150):                                 # 150 ms: at least one health check
+        src.poll()
+    assert src.bytes_discarded == 3 and not world.serial.incoming
 
 
 # ------------------------------------------------------------------------------------------------ byte-stream

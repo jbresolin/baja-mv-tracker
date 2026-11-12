@@ -182,7 +182,9 @@ def test_real_modem_driver_unplug_and_replug_with_a_fake_serial_port(cfg):
     run_for(svc, clock, 0.1)
     assert svc.status()["state"] == "open"
     world.unplug()
-    run_for(svc, clock, 0.01)
+    # Like real pyserial on Windows: the CTS line now just reads False (no error); the driver's ~100 ms port check
+    # (in_waiting) notices the unplug within a second.
+    run_for(svc, clock, 1.0)
     assert svc.status()["state"] == "lost"
     run_for(svc, clock, 5.0)
     assert svc.status()["state"] == "retrying"           # COM5 does not exist any more
