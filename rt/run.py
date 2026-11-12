@@ -13,7 +13,8 @@ options: --config FILE (only the keys it changes; default rt/config.toml), --set
   (read a file through the live-stream path, at real speed), --no-identity.
 Live camera (WP-L1): records the video to <folder of --out>/rec/ ([recording]), serves the status page on
 http://<this PC>:8765/ ([status]). For an unattended race day, start it through rt/supervise.py (rt\\run_lapline.bat).
-CPU only by default: CUDA is never used (onnxruntime CPU / OpenVINO CPU or Intel iGPU).
+Beam input (WP-L2): [beam] driver = modem-line / byte-stream / fake adds the timing sensor's crossing times to the
+same JSONL (rt/beam/). CPU only by default: CUDA is never used (onnxruntime CPU / OpenVINO CPU or Intel iGPU).
 """
 import argparse
 import json
@@ -139,6 +140,8 @@ def main():
         if board is not None:
             board.recorder = recorder
 
+    beam = start_beam(cfg, em, board, live_camera, log, warn)
+
     roster, teams = C.read_roster(a.event)
     m = cfg["models"]
     det = YoloOnnx(m["car_detector"], m["car_imgsz"], int(r["threads_detector"]), spinning=bool(r["ort_spinning"]),
@@ -200,6 +203,8 @@ def main():
                 n_frames += 1
                 if board is not None:
                     board.on_frame(fr)
+                if beam is not None:
+                    beam.on_frame(fr)           # LED latency ROI (only when beam.led_roi is set)
                 vid_t0 = fr.t if vid_t0 is None else vid_t0
                 vid_t1 = fr.t
                 if mon:
@@ -226,6 +231,9 @@ def main():
     for c in caps:
         if hasattr(c, "status"):
             st["camera"] = c.status()
+    if beam is not None:
+        beam.stop()
+        st["beam"] = beam.status()
     if timechecker is not None:
         timechecker.halt.set()
     if server is not None:
@@ -236,6 +244,28 @@ def main():
                                                     "det_ms_p50", "passes", "cpu")}, default=str))
     Path(str(out.with_suffix("")) + ".stats.json").write_text(json.dumps(st, indent=1, default=str))
     em.close()
+
+
+def start_beam(cfg, em, board, live_camera, log, warn):
+    """The beam input (rt/beam/, WP-L2) when beam.driver is not "off": its own two threads, its events in the same
+    JSONL, a section on the status page. It never touches the pass logic. Returns the BeamService or None."""
+    if str(cfg["beam"].get("driver", "off")).lower() == "off":
+        return None
+    from rt.beam import BeamService, PassBeamSink
+    try:
+        beam = BeamService(cfg, em.emit)
+    except ValueError as e:                   # a config mistake (driver / line / polarity name): say it, run without
+        warn("beam input NOT started: %s" % e)
+        return None
+    with em.lock:
+        em.sinks.append(PassBeamSink(beam))   # pass_end -> pass_beam (live association)
+    if board is not None:
+        board.beam = beam
+    if not live_camera:
+        warn("beam input is on but the source is not a live camera: beam and frame times will not line up")
+    beam.start()
+    log("beam input: driver %s, port %s (status page: Beam section)" % (beam.source.driver, beam.source.port))
+    return beam
 
 
 def is_camera(source):

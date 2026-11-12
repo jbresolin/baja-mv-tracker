@@ -7,6 +7,7 @@ Event types (one JSON object per line, see rt/README.md for every field):
   pass_end          the pass closed (re-attach windows expired): final t_enter / t_cross / t_exit
   pass_identity     the number read from the pass's crops (number, confidence, auto_confirm, top3, latency)
   info / warning    run start / end, clock warnings
+  beam, beam_edge, beam_break, beam_stuck, beam_poll, pass_beam, camera_latency   beam input (rt/beam/, WP-L2)
 """
 import csv
 import datetime as dt
@@ -16,7 +17,8 @@ import time
 import uuid
 from pathlib import Path
 
-T_KEYS = ("t_enter", "t_cross", "t_exit", "t_video")
+# Times rounded to the ms and given an _iso twin. t_edge / t_beam / t_last / t_since are the beam events' (WP-L2).
+T_KEYS = ("t_enter", "t_cross", "t_exit", "t_video", "t_edge", "t_beam", "t_last", "t_since")
 
 
 def iso(t):

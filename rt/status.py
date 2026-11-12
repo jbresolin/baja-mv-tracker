@@ -6,8 +6,9 @@ frontend build), meant to be opened from a phone on the LAN.
   http://<laptop>:8765/thumb/<pass_id>.jpg  a pass's thumbnail
 
 What it shows: processing fps and dropped frames; camera state and the image settings read back; the clock offset
-(red above 0.5 s); recording state and free disk; the last 20 passes with a thumbnail, the number read, confidence
-and t_cross. There are no controls.
+(red above 0.5 s); recording state and free disk; the beam input when it runs (port, line level, edges/min, last
+10 breaks, poll rate, stuck warning); the last 20 passes with a thumbnail, the number read, confidence and t_cross.
+There are no controls.
 
 Pieces: `StatusBoard` holds the state (the detection loop calls on_frame(), the event sink feeds passes);
 `StatusSink` is the rt/sinks.py sink that feeds it; `TimeChecker` re-measures the clock offset once a minute in the
@@ -53,6 +54,7 @@ class StatusBoard:
         self.thumbs = {}                              # pass_id -> (frame time, JPEG bytes)
         self.capture = None                           # set by run.py: the capture object (status(), dropped)
         self.recorder = None                          # set by run.py when recording
+        self.beam = None                              # set by run.py when the beam input runs (rt/beam/, WP-L2)
         self.time = dict(offset_s=None, source="not checked yet", warnings=[], checked=None)
         self.started_mono = self.clock.mono()
         self.started_wall = self.clock.wall()
@@ -166,6 +168,8 @@ class StatusBoard:
             warnings.append("disk low: %.1f GB free" % rec["free_gb"])
         if rec.get("disk_state") == "stopped":
             warnings.append("recording STOPPED: %.1f GB free" % rec["free_gb"])
+        beam = self.beam.status() if self.beam is not None else dict(enabled=False)
+        warnings += beam_warnings(beam)
         with self.lock:
             passes = [dict(p, t_enter_iso=iso(p["t_enter"]), t_cross_iso=iso(p["t_cross"]), thumb_iso=iso(p["thumb_t"]),
                            thumb_url=("/thumb/%d.jpg?v=%.3f" % (p["pass_id"], p["thumb_t"])) if p["thumb_t"] else None)
@@ -176,7 +180,23 @@ class StatusBoard:
                                     dropped=getattr(cap, "dropped", 0) if cap is not None else 0,
                                     last_frame_iso=iso(self.last_frame_t)),
                     camera=cam, clock=dict(self.time, bad=clock_bad, red_above_s=OFFSET_RED_S),
-                    recording=rec, passes=passes, warnings=warnings)
+                    recording=rec, beam=beam, passes=passes, warnings=warnings)
+
+
+def beam_warnings(beam):
+    """Red boxes for the beam: port not open (missing / unplugged), beam stuck, poll loop too slow."""
+    if not beam.get("enabled"):
+        return []
+    out = []
+    if beam.get("state") != "open":
+        out.append("beam %s: %s" % (beam.get("state"), beam.get("detail", "")))
+    if beam.get("stuck"):
+        out.append("beam STUCK for %.0f s (blocked or flickering): someone in the beam, misaligned, or wrong "
+                   "polarity" % beam.get("stuck_for_s", 0))
+    rate = (beam.get("poll") or {}).get("rate_hz")
+    if beam.get("driver") == "modem-line" and rate is not None and rate < 200:
+        out.append("beam poll rate only %.0f Hz (timing worse than 5 ms)" % rate)
+    return out
 
 
 class StatusSink(Sink):
@@ -268,6 +288,7 @@ def render_html(p):
 <h2>Clock offset</h2>%s
 <h2>Recording</h2><span class="%s">%s</span> %s<br><small>%s GB free (warn &lt; %s, stop &lt; %s) &middot; %s frames
 &middot; %s dropped &middot; %s</small>
+%s
 <h2>Last passes</h2><table><tr><th>thumbnail</th><th>number</th><th>confidence</th><th>t_cross</th></tr>%s</table>
 </body></html>""" % (
         CSS, _e(p["info"].get("event", "")), _e(p["now"]), p["uptime_s"], _e(p["info"].get("version", "")), warn,
@@ -278,7 +299,35 @@ def render_html(p):
         off_html,
         rec_cls, _e(rec.get("state")), _e(rec.get("file") or ""), _e(rec.get("free_gb")), _e(rec.get("warn_free_gb")),
         _e(rec.get("stop_free_gb")), _e(rec.get("frames")), _e(rec.get("dropped")), _e(rec.get("encoder") or ""),
-        "".join(rows))
+        render_beam(p.get("beam") or {}), "".join(rows))
+
+
+def render_beam(b):
+    """The Beam section of the page (empty when the beam input is off)."""
+    if not b.get("enabled"):
+        return ""
+    cls = "ok" if b.get("state") == "open" and not b.get("stuck") else "bad"
+    level = {1: "ACTIVE (blocked)", 0: "clear", None: "unknown"}.get(b.get("level"), b.get("level"))
+    poll = b.get("poll") or {}
+    poll_txt = ("%s Hz, max gap %s ms, %s late polls" % (poll.get("rate_hz"), poll.get("max_gap_ms"),
+                                                         poll.get("late_polls")) if poll else "not measured yet")
+    rows = "".join("<tr><td>%s</td><td>%s</td><td>%s s</td><td>%s</td></tr>" % (
+        _e(_t(x.get("t_beam_iso"))), _e(x.get("n_edges")), _e(x.get("duration_s")),
+        _e("" if x.get("pass_id") is None else "pass %s %s" % (x["pass_id"], "#%s" % x["number"]
+                                                                if x.get("number") is not None else "")))
+        for x in b.get("last_breaks", []))
+    a, led = b.get("association") or {}, b.get("led") or {}
+    led_txt = ("LED: %s measurements, last %s s, min %s s, ROI mean %s" % (
+        led.get("measurements"), led.get("last_latency_s"), led.get("min_latency_s"), led.get("last_mean"))
+        if led.get("enabled") else "LED latency off")
+    return """<h2>Beam</h2><span class="%s">%s</span> %s<br><small>%s on %s, line %s &middot; level <b>%s</b> &middot;
+%s edges/min (%s total) &middot; %s breaks &middot; poll %s &middot; stuck episodes %s &middot; passes matched %s /
+none %s / ambiguous %s &middot; %s</small>
+<table><tr><th>break (t_beam)</th><th>edges</th><th>duration</th><th>matched pass</th></tr>%s</table>""" % (
+        cls, _e("STUCK" if b.get("stuck") else b.get("state")), _e(b.get("detail", "")), _e(b.get("driver")),
+        _e(b.get("port")), _e(b.get("line")), _e(level), _e(b.get("edges_per_min")), _e(b.get("edges_total")),
+        _e(b.get("breaks_total")), _e(poll_txt), _e(b.get("stuck_episodes")), _e(a.get("matched")), _e(a.get("none")),
+        _e(a.get("ambiguous")), _e(led_txt), rows)
 
 
 class StatusServer:
