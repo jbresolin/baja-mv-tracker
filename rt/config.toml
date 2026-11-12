@@ -90,6 +90,8 @@ thumb_fps = 5                   # thumbnails kept per second for the pass list
 thumb_ring_s = 20               # seconds of thumbnails kept (a pass's thumbnail is the frame nearest its t_cross)
 fps_window_s = 10
 time_check_s = 60               # re-measure the clock offset this often
+required = false                # true: exit (code 3) if the port is busy. The launcher always asks for this
+                                # (--require-status), since it watches rt through the page
 
 [launch]                        # rt/supervise.py (rt\run_lapline.bat): one unattended rt
 name = "lapline"

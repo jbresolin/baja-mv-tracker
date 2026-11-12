@@ -1,5 +1,7 @@
-"""Tests of the launcher's restart rules (rt/supervise.py), with a fake rt process and a fake clock: no real process
-is started and no test sleeps.
+"""Tests of the launcher's restart rules (rt/supervise.py), with a fake rt process and a fake clock: the restart-rule
+tests start no real process and never sleep. (The last test, test_kill_tree_also_kills_grandchildren, is the
+exception: it starts two real, sleeping Python processes to check they are both killed; it waits only for them to
+start and stop, at most a few seconds.)
 
 The rules being checked:
   * rt exits -> start it again after 5 s, then 10, 20, 40, 60, 60 s if it keeps dying;
@@ -163,6 +165,26 @@ def test_rt_command_has_a_fresh_output_file_per_run(cfg):
     out = cmd[cmd.index("--out") + 1].replace("\\", "/")
     assert out.endswith("out/lapline/2026-11-21/lapline_09-15-02.jsonl")
     assert cmd[-1] == "--stats"
+    # The status page is on, so rt is told it is required: if its port is busy rt exits and says why, instead of
+    # running without it (the launcher would then kill it as "stalled" every ~90 s without a reason).
+    assert "--require-status" in cmd
+
+
+def test_rt_command_without_status_page_does_not_require_it(cfg):
+    cfg["launch"].update(event="27SE")
+    cfg["status"]["enabled"] = False
+    assert "--require-status" not in build_command(cfg, "rt/configs/lapline.toml", python="python")
+
+
+def test_busy_status_port_exit_is_explained_in_the_launcher_log():
+    # rt exits with code 3 when its status port is busy. The launcher still restarts it (the port may be freed),
+    # but its log names the reason, so whoever reads launcher.log knows what to fix.
+    w = World()
+    sup = w.supervisor()
+    w.run(sup, 1)
+    w.procs[-1].rc = 3
+    w.run(sup, 2)
+    assert "status page's port is busy" in sup.restarts[0][1]
 
 
 @pytest.mark.parametrize("rc", [0, 1, -9])

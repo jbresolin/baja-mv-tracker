@@ -17,6 +17,8 @@ import collections
 import datetime as dt
 import html
 import json
+import socket
+import sys
 import threading
 from bisect import bisect_left
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -43,7 +45,7 @@ class StatusBoard:
         self.thumb_w = int(s.get("thumb_width", 320))
         self.thumb_every_s = 1.0 / float(s.get("thumb_fps", 5))
         self.ring_s = float(s.get("thumb_ring_s", 20))
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()                 # re-entrant: on_event holds it while it calls helpers
         self.frame_monos = collections.deque()        # monotonic times of processed frames, last window_s
         self.frames = 0
         self.last_frame_t = None
@@ -96,37 +98,37 @@ class StatusBoard:
 
     def on_event(self, ev):
         """Called by StatusSink for every rt event."""
-        t = ev["type"]
-        if t not in ("pass_start", "pass_provisional", "pass_end", "pass_identity"):
+        kind = ev["type"]
+        if kind not in ("pass_start", "pass_provisional", "pass_end", "pass_identity"):
             return
-        pid = ev["pass_id"]
-        with self.lock:
-            p = self.passes.get(pid)
-            if p is None:
-                p = self.passes[pid] = dict(pass_id=pid, state="open", number=None, confidence=None,
-                                            auto_confirm=None, provisional=None, t_enter=None, t_cross=None,
-                                            team=None, thumb_t=None)
+        pass_id = ev["pass_id"]
+        with self.lock:                     # the web server thread reads these dicts: change them under the lock
+            entry = self.passes.get(pass_id)
+            if entry is None:
+                entry = self.passes[pass_id] = dict(pass_id=pass_id, state="open", number=None, confidence=None,
+                                                    auto_confirm=None, provisional=None, t_enter=None, t_cross=None,
+                                                    team=None, thumb_t=None)
                 while len(self.passes) > self.n_passes:
                     old, _ = self.passes.popitem(last=False)
                     self.thumbs.pop(old, None)
-        if t == "pass_start":
-            p["t_enter"] = ev.get("t_enter")
-            th = self.nearest_thumb(ev.get("t_video"))        # the frame being processed when the pass started
-            if th:
-                self._set_thumb(pid, th)
-        elif t == "pass_provisional":
-            p["provisional"] = ev.get("number")
-        elif t in ("pass_end", "pass_identity"):
-            p["t_enter"] = ev.get("t_enter", p["t_enter"])
-            p["t_cross"] = ev.get("t_cross", p["t_cross"])
-            if t == "pass_end":
-                p["state"] = "closed"
-                th = self.nearest_thumb(p["t_cross"])          # better: the frame where the car crosses the centre
-                if th:
-                    self._set_thumb(pid, th)
-            else:
-                p.update(state="read", number=ev.get("number"), confidence=ev.get("confidence"),
-                         auto_confirm=ev.get("auto_confirm"), team=ev.get("team"))
+            if kind == "pass_start":
+                entry["t_enter"] = ev.get("t_enter")
+                thumb = self.nearest_thumb(ev.get("t_video"))     # the frame being processed when the pass started
+                if thumb:
+                    self._set_thumb(pass_id, thumb)
+            elif kind == "pass_provisional":
+                entry["provisional"] = ev.get("number")
+            elif kind in ("pass_end", "pass_identity"):
+                entry["t_enter"] = ev.get("t_enter", entry["t_enter"])
+                entry["t_cross"] = ev.get("t_cross", entry["t_cross"])
+                if kind == "pass_end":
+                    entry["state"] = "closed"
+                    thumb = self.nearest_thumb(entry["t_cross"])  # better: the frame where the car crosses the centre
+                    if thumb:
+                        self._set_thumb(pass_id, thumb)
+                else:
+                    entry.update(state="read", number=ev.get("number"), confidence=ev.get("confidence"),
+                                 auto_confirm=ev.get("auto_confirm"), team=ev.get("team"))
 
     def _set_thumb(self, pid, th):
         with self.lock:
@@ -286,14 +288,51 @@ reads, %s corrupt, %s reopens, last frame %s s ago</small><table>%s</table>
         "".join(rows))
 
 
+class StatusHTTPServer(ThreadingHTTPServer):
+    """The stdlib HTTP server, but on Windows it refuses a port another program already uses. Python's HTTPServer
+    sets SO_REUSEADDR, and on Windows that lets a second program bind a port that is already listening (both
+    "own" it and requests go to either), so a busy port would go unnoticed. SO_EXCLUSIVEADDRUSE makes the bind
+    fail instead, as it does on Linux."""
+
+    daemon_threads = True
+    if sys.platform == "win32":
+        allow_reuse_address = False
+
+        def server_bind(self):
+            if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            super().server_bind()
+
+
+def start_status_server(board, bind, port, required, log=print, warn=print):
+    """Start the status page. If the port cannot be opened (another rt, or another program, uses it):
+      * required (rt started by the launcher, which watches rt through this page): say why and exit with
+        EXIT_STATUS_PORT_BUSY. Running on would be pointless: the launcher would see no page, call rt stalled and
+        kill it every ~90 s, forever, without saying why.
+      * not required (a manual run): warn and run without the page. Returns the server, or None."""
+    from .config import EXIT_STATUS_PORT_BUSY
+    try:
+        server = StatusServer(board, bind, int(port)).start()
+    except OSError as e:
+        msg = ("status page cannot listen on port %s (%s): another program, or another rt, is using it. Close it, "
+               "or set status.port to a free port in the config (the launcher reads the same setting)" % (port, e))
+        if required:
+            warn(msg + ". Exiting: the launcher needs the status page to watch rt.")
+            print("rt: " + msg, file=sys.stderr, flush=True)
+            raise SystemExit(EXIT_STATUS_PORT_BUSY)
+        warn(msg + ". Running without the status page.")
+        return None
+    log("status page: http://%s:%d/" % ("localhost" if bind in ("0.0.0.0", "") else bind, server.port))
+    return server
+
+
 class StatusServer:
     """Serves the board on (bind, port) from a background thread. stop() closes it."""
 
     def __init__(self, board, bind="0.0.0.0", port=8765, log=print):
         self.board = board
         handler = self._handler()
-        self.httpd = ThreadingHTTPServer((bind, int(port)), handler)
-        self.httpd.daemon_threads = True
+        self.httpd = StatusHTTPServer((bind, int(port)), handler)
         self.port = self.httpd.server_address[1]
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self.log = log

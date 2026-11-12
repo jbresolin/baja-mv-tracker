@@ -110,7 +110,10 @@ private networks when Windows asks).
   confidence and t_cross. `/status.json` has the same data. Read-only.
 * **Launcher** (`rt/supervise.py`, `rt\run_lapline.bat`, `[launch]`): restarts rt when it exits (5 s, doubling, max
   60 s; reset after a 10-min healthy run) or when the status page reports 0 fps (or does not answer) for 30 s
-  (after a 60 s start-up grace). It kills the whole process tree. Each run writes
+  (after a 60 s start-up grace). It kills the whole process tree. It starts rt with `--require-status`: if the
+  status port is busy (another rt, or another program), rt exits with code 3 and says why, and launcher.log names
+  the reason, instead of rt running blind and being killed as "stalled" every ~90 s. On Windows the page binds
+  its port exclusively (Python's default SO_REUSEADDR would let two programs share it silently). Each run writes
   `out/lapline/<date>/lapline_<time>.jsonl` (+ csv, stats, rec/); restarts are logged in `out/lapline/launcher.log`.
 
 Replay a recording through rt like any file (`--source out/lapline/<date>/rec/rec_....mkv`): when the file's
@@ -181,7 +184,7 @@ so the program makes no network calls unless you set it.
 | recording | warn_free_gb / stop_free_gb / h264_encoders | 20 / 5 / qsv, amf, x264 | disk guard; H.264 encoders probed in order at start |
 | recording | queue_frames / csv_flush_rows | 10 / 30 | frames waiting for ffmpeg (oldest dropped when full); frames.csv flush period |
 | recording | write_timeout_s / retry_wait_s / max_failures | 10 / 10 / 5 | watchdog: ffmpeg stuck or dead -> kill, new file after the wait; give up after this many failures in a row |
-| status | enabled / bind / port / passes / time_check_s | true / 0.0.0.0 / 8765 / 20 / 60 | status page |
+| status | enabled / bind / port / passes / time_check_s / required | true / 0.0.0.0 / 8765 / 20 / 60 / false | status page; `required` (or `--require-status`, which the launcher passes): exit with code 3 if the port is busy |
 | launch | event / source / out_dir / extra_args | "" / camera / out/lapline / [] | read by rt/supervise.py |
 | launch | restart_first_s / restart_max_s / healthy_reset_min / stall_s / startup_grace_s | 5 / 60 / 10 / 30 / 60 | restart rules |
 | clock | mode | auto | files: overlay (OBS clock) > creation_time > mtime-duration; `pts`, `system` also accepted |
