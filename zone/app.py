@@ -81,6 +81,10 @@ class ZoneApp:
         self.teach = TeachSession(zone.copy(), ptz, self.pose_source, cfg["teach"]["preset_base"],
                                   on_change=self.runtime.set_zone)
         self.selected = None
+        # "Modo ensino": the page may move the PTZ (jog, nudge, home, test a keyframe) only while this is on. Off at
+        # start, turned off by the big STOP, by PARADO and by entering AUTO, so a STOP also cancels a held jog (the
+        # page repeats the jog every 150 ms while a button is held: those repeats are refused from then on).
+        self.teach_mode = False
         self.latest = None               # (ZoneFrame, CycleResult)
         self.frame_lock = threading.Lock()
         self.last_frame_mono = clock.monotonic()
@@ -290,7 +294,7 @@ class ZoneApp:
                        nudge_units=self.cfg["teach"]["nudge_units"],
                        zoom_nudge_units=self.cfg["teach"]["zoom_nudge_units"],
                        jog_zoom_speed=self.cfg["teach"]["jog_zoom_speed"], selected=self.selected,
-                       allowed=self.runtime.director.mode != D.AUTO),
+                       allowed=self.runtime.director.mode != D.AUTO, teach_mode=self.teach_mode),
             frame=dict(size=list(fr.img.shape[1::-1]) if fr is not None and fr.img is not None else None,
                        age_s=round(self.clock.monotonic() - self.last_frame_mono, 1)),
             health=dict(self.health, fps=snap["fps"], dropped=self.source.dropped if self.source else 0,
@@ -322,9 +326,44 @@ class ZoneApp:
         return buf.tobytes() if ok else None
 
     # ------------------------------------------------------------------------------------------- page actions
-    def require_teach(self):
+    def require_teach(self, moves_ptz=False):
+        """Refuse teach actions in AUTO; refuse anything that moves the PTZ unless teach mode is on."""
         if self.runtime.director.mode == D.AUTO:
             raise TeachError("saia do AUTO antes de ensinar (use PARADO ou PASSIVO)")
+        if moves_ptz and not self.teach_mode:
+            raise TeachError("ligue o 'Modo ensino' para mover a PTZ")
+
+    def set_teach_mode(self, on):
+        if on and self.runtime.director.mode == D.AUTO:
+            raise TeachError("saia do AUTO antes de ligar o modo ensino")
+        was = self.teach_mode
+        self.teach_mode = bool(on)
+        if was and not self.teach_mode:
+            self._cancel_jog()
+        self._on_event(dict(type="teach_mode", new="ligado" if self.teach_mode else "desligado"))
+        return self.teach_mode
+
+    def _cancel_jog(self):
+        try:
+            self.pose_source.jog_stop()
+        except Exception:  # noqa: BLE001 (a dead PTZ must not break the STOP)
+            pass
+
+    def set_mode(self, mode):
+        """Mode buttons. Entering AUTO or PARADO ends teach mode (and any held jog)."""
+        ok, msg = self.runtime.set_mode(mode)
+        if ok and msg in (D.AUTO, D.STOPPED) and self.teach_mode:
+            self.teach_mode = False
+            if msg == D.STOPPED:
+                self._cancel_jog()
+        return ok, msg
+
+    def big_stop(self):
+        """The big red button: teach mode off first (so held-jog repeats are refused from now on), the runtime's
+        immediate stop, then the teach jog's own stop (zoom included)."""
+        self.teach_mode = False
+        self.runtime.big_stop()
+        self._cancel_jog()
 
     def save_zone(self):
         size = self.runtime.frame_size or self.teach.zone.image_size
@@ -340,10 +379,10 @@ def create_web(zapp: ZoneApp):
 
     web = FastAPI(title="zone")
 
-    def guard(fn, teach=False):
+    def guard(fn, teach=False, moves_ptz=False):
         try:
             if teach:
-                zapp.require_teach()
+                zapp.require_teach(moves_ptz)
             out = fn()
             return dict(ok=True, result=out)
         except TeachError as e:
@@ -373,25 +412,26 @@ def create_web(zapp: ZoneApp):
     # ---- operation
     @web.post("/api/mode")
     def mode(body: dict = Body(...)):
-        ok, msg = zapp.runtime.set_mode(body["mode"])
+        ok, msg = zapp.set_mode(body["mode"])
         if not ok:
             raise HTTPException(409, msg)
         return dict(ok=True, mode=msg)
 
     @web.post("/api/stop")
     def big_stop():
-        zapp.runtime.big_stop()
-        try:
-            zapp.pose_source.jog_stop()
-        except Exception:  # noqa: BLE001
-            pass
+        zapp.big_stop()
         return dict(ok=True)
+
+    # ---- teach mode (needed to move the PTZ from the page)
+    @web.post("/api/teach/mode")
+    def teach_mode(body: dict = Body(...)):
+        return guard(lambda: zapp.set_teach_mode(bool(body.get("on"))))
 
     # ---- teach: PTZ
     @web.post("/api/teach/jog")
     def jog(body: dict = Body(...)):
         return guard(lambda: zapp.pose_source.jog(int(body.get("pan", 0)), int(body.get("tilt", 0)),
-                                                  int(body.get("zoom", 0))), teach=True)
+                                                  int(body.get("zoom", 0))), teach=True, moves_ptz=True)
 
     @web.post("/api/teach/jog_stop")
     def jog_stop():
@@ -400,11 +440,12 @@ def create_web(zapp: ZoneApp):
     @web.post("/api/teach/nudge")
     def nudge(body: dict = Body(...)):
         return guard(lambda: zapp.pose_source.nudge(int(body.get("pan", 0)), int(body.get("tilt", 0)),
-                                                    int(body.get("zoom", 0)), int(body.get("speed", 8))), teach=True)
+                                                    int(body.get("zoom", 0)), int(body.get("speed", 8))), teach=True,
+                     moves_ptz=True)
 
     @web.post("/api/teach/home")
     def home():
-        return guard(lambda: zapp.pose_source.home(), teach=True)
+        return guard(lambda: zapp.pose_source.home(), teach=True, moves_ptz=True)
 
     @web.post("/api/teach/zero_here")
     def zero_here():
@@ -450,7 +491,7 @@ def create_web(zapp: ZoneApp):
 
     @web.post("/api/teach/goto")
     def goto(body: dict = Body(...)):
-        return guard(lambda: zapp.teach.goto(int(body["index"])), teach=True)
+        return guard(lambda: zapp.teach.goto(int(body["index"])), teach=True, moves_ptz=True)
 
     @web.post("/api/teach/select")
     def select(body: dict = Body(...)):

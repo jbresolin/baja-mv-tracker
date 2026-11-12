@@ -99,6 +99,12 @@ document.querySelectorAll("[data-jog]").forEach((b) => {
 document.querySelectorAll("[data-zoom]").forEach((b) => bindHold(b, 0, 0, +b.dataset.zoom));
 $("#jogStop").addEventListener("click", () => { stopJog(true); post("/api/teach/jog_stop"); });
 $("#home").addEventListener("click", () => post("/api/teach/home"));
+$("#teachMode").addEventListener("click", async () => {
+  if (!S) return;
+  stopJog(true);
+  await post("/api/teach/mode", { on: !S.teach.teach_mode });
+  poll();
+});
 $("#zeroHere").addEventListener("click", () => post("/api/teach/zero_here"));
 
 const KEYS = { ArrowLeft: [-1, 0, 0], ArrowRight: [1, 0, 0], ArrowUp: [0, 1, 0], ArrowDown: [0, -1, 0],
@@ -108,7 +114,7 @@ document.addEventListener("keydown", (e) => {
   if (e.target.tagName === "INPUT") return;
   if (e.key === "Escape") { e.preventDefault(); bigStop(); return; }
   const k = KEYS[e.key];
-  if (!k || keyDown === e.key) return;
+  if (!k || keyDown === e.key || !S || !S.teach.teach_mode) return;
   e.preventDefault();
   keyDown = e.key;
   startJog(...k);
@@ -189,7 +195,14 @@ function render(s) {
   $("#poseButtons").style.display = t.velocity_jog && t.pose_source !== "dead_reckoning" ? "none" : "flex";
   $("#home").style.display = t.pose_source === "commanded" ? "" : "none";
   $("#zeroHere").style.display = t.pose_source === "dead_reckoning" ? "" : "none";
-  document.querySelectorAll("[data-click],[data-jog],[data-zoom],#save,#setCorridor").forEach((b) => b.disabled = !t.allowed);
+  document.querySelectorAll("[data-click],#save,#setCorridor,#teachMode").forEach((b) => b.disabled = !t.allowed);
+  // moving the PTZ from the page needs teach mode (and never in AUTO)
+  const canMove = t.allowed && t.teach_mode;
+  document.querySelectorAll("[data-jog],[data-zoom],#jogStop,#home").forEach((b) => b.disabled = !canMove);
+  if (!canMove) stopJog(true);
+  const tm = $("#teachMode");
+  tm.textContent = "Modo ensino: " + (t.teach_mode ? "LIGADO" : "desligado");
+  tm.classList.toggle("on", t.teach_mode);
   renderPoints(z, t);
 
   const h = s.health;

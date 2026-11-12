@@ -154,3 +154,45 @@ def test_watchdog_kills_the_process_if_main_never_returns(tmp_path):
     clock.advance(21.0)
     app.check_frames()
     assert exits == [3]
+
+
+# ======================================================================================= STOP doesn't wait for vision
+class HungSpotter:
+    """A spotter (detector + tracker) whose detection never finishes until the test says so."""
+
+    def __init__(self):
+        self.entered, self.release = threading.Event(), threading.Event()
+        self.last_dets, self.last_ms = ([],), 0.0
+
+    def set_roi(self, roi):
+        pass
+
+    def process(self, img):
+        self.entered.set()
+        self.release.wait(10)
+        return []
+
+
+def test_big_stop_is_immediate_while_a_detection_is_running():
+    # Detection is the slow part of a cycle (50-150 ms, more on a busy laptop). It now runs outside the control lock,
+    # so the big STOP gets the lock at once (timeout 0 here) even while a detection is in progress.
+    import numpy as np
+    clock = FakeClock(0.0)
+    ptz = RecordingPtz(SimulatedPtz(PtzModel(), clock))
+    spotter = HungSpotter()
+    rt = ZoneRuntime(settings("B"), straight_zone(), ptz, clock, spotter=spotter)
+    rt.set_mode(D.AUTO)
+    ptz.calls.clear()
+    frame = ZoneFrame(np.zeros((1080, 1920, 3), np.uint8), clock.monotonic(), clock.wall(), 0)
+    th = threading.Thread(target=rt.cycle, args=(frame,), daemon=True)
+    th.start()
+    try:
+        assert spotter.entered.wait(5)              # the detection is running (and stuck) now
+        assert rt.big_stop(lock_timeout_s=0) is True
+        assert rt.director.mode == D.STOPPED        # switched right away, without waiting for the detection
+        assert ptz.calls[:2] == ["stop", "zoom_stop"]   # and the driver's stop was the very first thing sent
+    finally:
+        spotter.release.set()
+        th.join(5)
+    # the cycle that was running finishes in STOPPED: it sends no movement command afterwards
+    assert "pan_tilt_velocity" not in ptz.calls and "preset_recall" not in ptz.calls

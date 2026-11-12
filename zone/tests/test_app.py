@@ -72,6 +72,8 @@ def test_teaching_is_blocked_in_auto(tmp_path):
 def test_teach_through_the_api(tmp_path):
     client, app, ptz, clock = make(tmp_path, Zone())
     assert client.post("/api/teach/point", json={"x": 100, "y": 500}).json()["ok"]
+    # moving the PTZ from the page needs "teach mode" on (it starts off)
+    assert client.post("/api/teach/mode", json={"on": True}).json()["result"] is True
     client.post("/api/teach/jog", json={"pan": 8, "tilt": 0})
     clock.advance(1.0)
     client.post("/api/teach/jog_stop")
@@ -179,3 +181,44 @@ def test_health_probe_stays_off_the_wire_while_auto_drives_the_camera(tmp_path):
     ptz.calls.clear()
     app.check_health()
     assert "inquire_zoom" in ptz.calls
+
+
+# ======================================================================================================= teach mode
+def test_jog_needs_teach_mode(tmp_path):
+    # In PARADO (STOPPED) nothing should move the camera by accident: a jog is refused (HTTP 409 = "not now")
+    # until the operator turns teach mode on.
+    client, app, ptz, clock = make(tmp_path)
+    r = client.post("/api/teach/jog", json={"pan": 6})
+    assert r.status_code == 409 and "Modo ensino" in r.json()["detail"]
+    assert not ptz.is_moving()
+    client.post("/api/teach/mode", json={"on": True})
+    assert client.post("/api/teach/jog", json={"pan": 6}).status_code == 200
+    clock.advance(0.2)
+    assert ptz.is_moving()
+
+
+def test_big_stop_cancels_a_held_jog(tmp_path):
+    # The page repeats the jog every 150 ms while a button is held. After the big STOP, those repeats must be
+    # refused, or the camera would start moving again right after the STOP.
+    client, app, ptz, clock = make(tmp_path)
+    client.post("/api/teach/mode", json={"on": True})
+    client.post("/api/teach/jog", json={"pan": 6})
+    clock.advance(0.2)
+    assert client.post("/api/stop").json()["ok"]
+    assert app.teach_mode is False                          # the STOP turned teach mode off
+    assert client.post("/api/teach/jog", json={"pan": 6}).status_code == 409   # the next repeat is refused
+    clock.advance(1.0)
+    assert not ptz.is_moving()
+
+
+def test_teach_mode_ends_with_auto_and_parado_and_cannot_start_in_auto(tmp_path):
+    client, app, _, _ = make(tmp_path)
+    client.post("/api/teach/mode", json={"on": True})
+    client.post("/api/mode", json={"mode": "AUTO"})
+    assert app.teach_mode is False
+    assert client.post("/api/teach/mode", json={"on": True}).status_code == 409
+    client.post("/api/mode", json={"mode": "STOPPED"})
+    client.post("/api/teach/mode", json={"on": True})
+    client.post("/api/mode", json={"mode": "STOPPED"})       # pressing PARADO also ends it
+    assert app.teach_mode is False
+    assert client.get("/api/state").json()["teach"]["teach_mode"] is False

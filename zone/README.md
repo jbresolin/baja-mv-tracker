@@ -114,7 +114,8 @@ PTZ IP, report path, recording). `zone\run_zone.bat` picks `site.toml` up by its
 
 ### Teaching a zone (~15 min for 5-8 keyframes)
 
-1. Mode PARADO or PASSIVO (teaching is refused in AUTO).
+1. Mode PARADO or PASSIVO (teaching is refused in AUTO), then "Modo ensino" on: the page moves the PTZ (jog, nudge,
+   home, "testar") only in teach mode. PARAR, PARADO and AUTO turn it off (a held jog is cancelled with it).
 2. "Adicionar ponto", click the racing line upstream of the zone (the approach, where `v` is measured).
 3. Jog the PTZ (buttons or arrow keys, PageUp/PageDown for zoom) to frame a car at the entry. Click "Adicionar
    keyframe", then click that spot in the spotter image. The pose is read and a preset is stored (10, 11, ...).

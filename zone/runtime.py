@@ -6,10 +6,17 @@
 The same `ZoneRuntime` runs live in the app (zone/app.py, real or simulated PTZ, system clock) and offline in the
 replay harness (zone/tools/replay.py, SimulatedPtz on a fake clock), so what's measured offline is what runs live.
 
-Thread safety: the app's web handlers (mode buttons, big STOP, teach edits) and the frame loop share one lock.
-The big STOP never waits for it forever: if the frame loop is stuck while holding it (a hung detection or PTZ call),
-`big_stop()` gives up after `health.stop_lock_timeout_s`, sends the stop straight to the driver, and leaves a flag
-that the next cycle obeys.
+Thread safety: two locks.
+* `vision_lock`: the detector + tracker + progress part of a cycle (the slow part: ~50-150 ms of detection). Taken by
+  the frame loop and by zone edits (`set_zone`), which rebuild the ROI and the progress tracker.
+* `lock`: the director + controller part (decide, send the PTZ command). Taken by the frame loop, the mode buttons
+  and the big STOP. It is held only for the short control part, so a STOP never waits for a detection to finish.
+Lock order, always: vision_lock first, then lock (never the other way round), so they can't deadlock.
+
+The big STOP sends the driver's stop **first**, before taking any lock, then takes `lock` to switch the director to
+STOPPED (and sends the stop again through the controller, in case a velocity command was already on its way). It
+never waits for the lock forever: if the frame loop is stuck while holding it (a hung PTZ call), `big_stop()` gives
+up after `health.stop_lock_timeout_s` and leaves a flag that the next cycle obeys.
 """
 import json
 import threading
@@ -79,7 +86,8 @@ class ZoneRuntime:
         self.spotter = spotter
         self.log = log
         self.on_event_cb = on_event
-        self.lock = threading.RLock()
+        self.lock = threading.RLock()            # director + controller (see the module docstring)
+        self.vision_lock = threading.RLock()     # spotter + progress
         # how long the big STOP waits for the lock before stopping the camera directly (see big_stop)
         self.stop_lock_timeout_s = float(settings.cfg.get("health", {}).get("stop_lock_timeout_s", 0.5))
         self.stop_requested = False      # set by big_stop when it couldn't get the lock: the next cycle obeys it
@@ -107,7 +115,7 @@ class ZoneRuntime:
     def set_zone(self, zone: Zone):
         """Install a (new or edited) zone: rebuild the path, the pose curve and the ROI. Tracks restart; the learned
         speed profile is kept (after a big edit of the path, delete zone.speed.json and re-learn it in PASSIVE)."""
-        with self.lock:
+        with self.vision_lock, self.lock:
             self.zone = zone
             path = PathModel.build(zone)
             self.path = path
@@ -162,18 +170,23 @@ class ZoneRuntime:
             return True, mode
 
     def big_stop(self, lock_timeout_s=None):
-        """The big red button: STOPPED and a stop command right now. -> True if it got the lock and switched the
-        director to STOPPED, False if the frame loop is stuck holding the lock (then the camera was stopped directly
-        through the driver, and the next cycle switches to STOPPED as soon as the loop gets going again)."""
+        """The big red button: a stop command right now, then STOPPED.
+
+        1. The driver's stop goes out first, before any lock: it never waits for a detection or a control cycle.
+        2. Then the lock (held by the frame loop only for its short control part), to switch the director to STOPPED
+           and send the stop once more through the controller (a velocity command the loop had already decided on
+           may have gone out just after step 1: this second stop is the last word).
+        -> True if it got the lock, False if the frame loop is stuck holding it (a hung PTZ call): then the next
+        cycle switches to STOPPED as soon as the loop gets going again (`stop_requested`)."""
         timeout = self.stop_lock_timeout_s if lock_timeout_s is None else float(lock_timeout_s)
-        self.stop_requested = True
+        self.stop_requested = True       # first, so a cycle that is about to send a command sees it
+        self._direct_stop()
         got = self.lock.acquire(timeout=timeout) if timeout > 0 else self.lock.acquire(blocking=False)
         if not got:
-            # the frame loop is stuck inside a cycle (hung detector, hung PTZ call...): don't wait for it forever,
-            # talk to the driver directly. The driver has its own lock with a timeout, so this can't hang either.
-            self._direct_stop()
-            self._event(dict(type="warning", msg="big STOP: frame loop busy for %.1f s, stop sent directly to the PTZ"
-                             % timeout))
+            # the frame loop is stuck inside a cycle (hung PTZ call...): don't wait for it forever. The camera has
+            # already been told to stop (step 1), and the driver's own lock has a timeout, so that can't hang either.
+            self._event(dict(type="warning", msg="big STOP: control loop busy for %.1f s, stop sent directly to the "
+                             "PTZ; STOPPED as soon as the loop wakes up" % timeout))
             return False
         try:
             self._apply_stop("big_stop")
@@ -198,12 +211,12 @@ class ZoneRuntime:
 
     # ------------------------------------------------------------------------------------------- one cycle
     def cycle(self, frame, tracker_out=None) -> CycleResult:
-        """frame: ZoneFrame (img may be None when tracker_out is given, e.g. a cached replay)."""
-        with self.lock:
-            if self.stop_requested:
-                self._apply_stop("big_stop (delayed: the loop was busy)")
-            if hasattr(self.ptz, "tick"):
-                self.ptz.tick()                      # the simulator integrates its motion up to now
+        """frame: ZoneFrame (img may be None when tracker_out is given, e.g. a cached replay).
+
+        Two parts: vision (detector, tracker, progress) under `vision_lock`, then control (director, controller,
+        PTZ commands) under `lock`. The big STOP and the mode buttons only ever wait for the control part."""
+        # ---- vision: the slow part, outside the control lock
+        with self.vision_lock:
             if frame.img is not None:
                 self.frame_size = (frame.img.shape[1], frame.img.shape[0])
             n_dets, det_ms = 0, 0.0
@@ -212,6 +225,12 @@ class ZoneRuntime:
                 if self.spotter:
                     n_dets, det_ms = len(self.spotter.last_dets[0]), self.spotter.last_ms
             views = self.progress.update(frame.t, tracker_out) if self.progress else {}
+        # ---- control: short, under the lock the big STOP takes
+        with self.lock:
+            if self.stop_requested:
+                self._apply_stop("big_stop (delayed: the loop was busy)")
+            if hasattr(self.ptz, "tick"):
+                self.ptz.tick()                      # the simulator integrates its motion up to now
             now = self.clock.monotonic()
             decision = self.director.step(now, views)
             command = None
