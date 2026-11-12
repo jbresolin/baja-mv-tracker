@@ -998,6 +998,7 @@ class Characterizer:
         rep = r.get("repeatability", {})
         if rep.get("settle_s_p90") is not None:
             m.preset_settle_s = rep["settle_s_p90"]
+            m.preset_settle_measured = True  # the simulator's recalls then take this long
         units = r.get("units", {})
         for axis in ("pan", "tilt"):
             if units.get(f"{axis}_units_per_degree"):

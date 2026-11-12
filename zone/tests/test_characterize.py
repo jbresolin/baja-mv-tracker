@@ -151,7 +151,7 @@ def run_through_driver(model: PtzModel, options: BenchOptions | None = None, **c
 
 
 def test_camera_with_live_feedback_gives_branch_a_and_measures_the_speed_table(tmp_path):
-    truth = PtzModel()
+    truth = PtzModel(inquiry_poll_hz=50.0)  # a camera that can be polled at 50 Hz
     report, _ = run_on_sim(truth, tmp_path=tmp_path)
     assert report["verdict"]["branch"] == "A"
     assert report["feedback"]["while_moving"] == "yes"
@@ -234,6 +234,7 @@ def test_units_from_two_marks():
     def operator_aims_at_mark_b(message):
         if "mark B (pan)" in message:
             sim.pan.position += 1200.0  # as if João turned the camera 90 degrees with the joystick
+            clock.advance(5.0)  # which takes him a few seconds
 
     ui = ScriptedUI(numbers=[90.0, None], on_pause=operator_aims_at_mark_b)
     options = BenchOptions(quick=True, skip=("feedback", "speed_table", "latency", "absolute", "zoom", "repeatability"))
@@ -371,3 +372,27 @@ def test_a_camera_that_does_not_answer_max_speed_gets_the_safe_defaults():
     tilt_speeds = [payload[5] for name, payload in camera.received if name == "pan_tilt_drive"]
     assert max(tilt_speeds) == 20
     assert "20" in report["speed_table"]["tilt"] and "23" not in report["speed_table"]["tilt"]
+
+
+# --- S5: the simulator enforces the poll rate and the measured preset time ---------------------------------------
+
+
+def test_the_bench_finds_the_simulators_poll_rate_limit():
+    # The default simulated camera can be asked at most 20 times a second; asked faster, it repeats its last
+    # answer. The bench must see that 50 Hz gives stale answers and settle on 20 Hz.
+    report, _ = run_on_sim(PtzModel(), BenchOptions(quick=True, skip=("speed_table", "latency", "absolute", "zoom",
+                                                                       "repeatability")))
+    rates = report["feedback"]["rates"]
+    assert rates["50"]["ok"] is False and rates["20"]["ok"] is True
+    assert report["feedback"]["max_rate_hz"] == 20.0
+    assert report["model"]["inquiry_poll_hz"] == 20.0
+
+
+def test_measured_preset_time_round_trips_through_the_bench():
+    # A camera whose preset recalls take 1.2 s, wherever they start from. The bench measures it, and a simulator
+    # built from the report recalls presets in that time too.
+    truth = PtzModel(preset_settle_s=1.2, preset_settle_measured=True)
+    report, _ = run_on_sim(truth, BenchOptions(quick=True, skip=("speed_table", "latency", "absolute", "zoom")))
+    learned = PtzModel.from_dict(report["model"])
+    assert learned.preset_settle_measured is True
+    assert learned.preset_settle_s == pytest.approx(1.2, abs=0.15)  # the bench polls every 0.1 s

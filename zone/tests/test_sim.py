@@ -197,6 +197,55 @@ def test_define_preset_stores_without_moving():
     assert sim.true_zoom() == pytest.approx(1000.0)
 
 
+def test_preset_recall_takes_the_measured_settle_time():
+    # When the bench measured how long a preset recall takes (preset_settle_measured), the simulator's recalls take
+    # exactly that long after the command, near or far: 0.1 s latency + 1.4 s of travel = 1.5 s.
+    for distance in (50.0, 900.0):
+        clock, sim = make(preset_settle_s=1.5, preset_settle_measured=True)
+        sim.define_preset(1, pan=distance, tilt=0, zoom=0)
+        sim.preset_recall(1)
+        clock.advance(1.45)
+        assert sim.is_moving()
+        clock.advance(0.06)
+        assert sim.true_pan_tilt() == pytest.approx((distance, 0.0))
+        assert not sim.is_moving()
+
+
+def test_home_takes_the_measured_settle_time_too():
+    clock, sim = make(preset_settle_s=1.0, preset_settle_measured=True, ramp_s=0.0, command_latency_s=0.0)
+    sim.pan_tilt_velocity(2, 0)
+    clock.advance(3.0)  # 300 units away
+    sim.stop()
+    clock.advance(1.0)
+    sim.home()
+    clock.advance(0.95)
+    assert sim.is_moving()
+    clock.advance(0.06)
+    assert sim.true_pan_tilt() == pytest.approx((0.0, 0.0))
+
+
+def test_polling_faster_than_allowed_repeats_the_last_answer():
+    # This camera can be asked at most 10 times a second. Asked again 20 ms later, it repeats the old answer
+    # ("stale"), even though it has moved on since.
+    clock, sim = make(inquiry_poll_hz=10.0, ramp_s=0.0, command_latency_s=0.0)
+    sim.pan_tilt_velocity(2, 0)  # 100 units/s
+    clock.advance(0.5)
+    assert sim.inquire_pan_tilt() == (50, 0)
+    clock.advance(0.02)
+    assert sim.inquire_pan_tilt() == (50, 0)  # too soon: the same answer again
+    clock.advance(0.08)  # 0.1 s after the last real answer: allowed again
+    assert sim.inquire_pan_tilt() == (60, 0)
+
+
+def test_polling_faster_than_allowed_can_drop_the_answer():
+    # Same camera, but one that simply doesn't answer when asked too fast.
+    clock, sim = make(inquiry_poll_hz=10.0, inquiry_overpoll="drop")
+    assert sim.inquire_pan_tilt() == (0, 0)
+    clock.advance(0.02)
+    assert sim.inquire_pan_tilt() is None
+    assert sim.inquire_zoom() == 0  # zoom inquiries are counted separately
+
+
 def test_absolute_and_relative():
     clock, sim = make()
     sim.absolute_position(300, -50, 2, 2)
