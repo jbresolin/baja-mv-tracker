@@ -355,3 +355,19 @@ def test_safe_stop_retries_a_lost_stop():
     clock.advance(1.0)
     assert len(camera.lost) == 2
     assert not sim.is_moving()
+
+
+# --- S4: top speed steps -------------------------------------------------------------------------------------------
+
+
+def test_a_camera_that_does_not_answer_max_speed_gets_the_safe_defaults():
+    # The camera ignores the max-speed inquiry. The bench then uses pan 24 / tilt 20 (0x14) and never sends a
+    # tilt speed above 20, so it doesn't probe steps the camera may refuse.
+    report, _, camera = run_through_driver(
+        PtzModel(), BenchOptions(quick=True, skip=("feedback", "latency", "absolute", "zoom", "repeatability", "units")),
+        behaviour={"inquire_max_speed": "silent"})
+    connection = report["connection"]
+    assert (connection["pan_max_step_used"], connection["tilt_max_step_used"]) == (24, 20)
+    tilt_speeds = [payload[5] for name, payload in camera.received if name == "pan_tilt_drive"]
+    assert max(tilt_speeds) == 20
+    assert "20" in report["speed_table"]["tilt"] and "23" not in report["speed_table"]["tilt"]

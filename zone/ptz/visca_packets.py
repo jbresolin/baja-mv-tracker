@@ -40,12 +40,17 @@ PAYLOAD_CONTROL_REPLY = 0x0201
 HEADER_LENGTH = 8
 VISCA_PORT = 52381
 
-# Speed steps from the VISCA spec: pan 0x01-0x18 (1-24), tilt 0x01-0x17 (1-23), zoom 0-7.
-# ptz_test.py clamped pan/tilt to 18/17 *decimal*, which looks like hex misread as decimal; the bench probes the
-# full spec range and records which steps the camera accepts.
+# Speed steps from the VISCA spec: pan 0x01-0x18 (1-24), tilt 0x01-0x17 (1-23), zoom 0-7. These are the protocol's
+# ceilings; no packet ever carries more.
+# ptz_test.py clamped pan/tilt to 18/17 *decimal*, which looks like hex misread as decimal.
 PAN_STEP_MAX = 0x18
 TILT_STEP_MAX = 0x17
 ZOOM_STEP_MAX = 7
+# A given camera's top steps can be lower; many Sony-style cameras top out at pan 0x18, tilt 0x14. The driver uses
+# these until it learns better (the max-speed inquiry, or the numbers in a bench report), so a camera that has
+# never been asked is not sent a tilt speed it may refuse.
+DEFAULT_PAN_STEP_MAX = 0x18
+DEFAULT_TILT_STEP_MAX = 0x14
 
 PAN_LEFT, PAN_RIGHT, PAN_HOLD = 0x01, 0x02, 0x03
 TILT_UP, TILT_DOWN, TILT_HOLD = 0x01, 0x02, 0x03
@@ -84,9 +89,10 @@ def _signed(value: int, nibble_count: int) -> int:
 # --- commands ------------------------------------------------------------------------------------------------
 
 
-def pan_tilt_drive(pan_step: int, tilt_step: int) -> bytes:
+def pan_tilt_drive(pan_step: int, tilt_step: int, pan_max: int = PAN_STEP_MAX, tilt_max: int = TILT_STEP_MAX) -> bytes:
     """Drive pan and tilt at signed speed steps: + is right / up, - is left / down, 0 holds that axis.
 
+    Speeds are clamped to `pan_max` / `tilt_max` (the camera's top steps; never above the protocol's).
     Both zero gives the stop packet, byte for byte the same as ptz_test.py's `cmd_stop`.
     """
     if pan_step == 0 and tilt_step == 0:
@@ -94,8 +100,8 @@ def pan_tilt_drive(pan_step: int, tilt_step: int) -> bytes:
     pan_direction = PAN_HOLD if pan_step == 0 else (PAN_RIGHT if pan_step > 0 else PAN_LEFT)
     tilt_direction = TILT_HOLD if tilt_step == 0 else (TILT_UP if tilt_step > 0 else TILT_DOWN)
     # A held axis still needs a valid speed byte; ptz_test.py sent the minimum (1) there.
-    pan_speed = _clamp(abs(pan_step), 1, PAN_STEP_MAX)
-    tilt_speed = _clamp(abs(tilt_step), 1, TILT_STEP_MAX)
+    pan_speed = _clamp(abs(pan_step), 1, min(pan_max, PAN_STEP_MAX))
+    tilt_speed = _clamp(abs(tilt_step), 1, min(tilt_max, TILT_STEP_MAX))
     return bytes([COMMAND_HEADER, 0x01, 0x06, 0x01, pan_speed, tilt_speed, pan_direction, tilt_direction, TERMINATOR])
 
 
@@ -121,20 +127,24 @@ def zoom_direct(position: int) -> bytes:
     return bytes([COMMAND_HEADER, 0x01, 0x04, 0x47]) + _nibbles(_clamp(position, 0, 0xFFFF), 4) + bytes([TERMINATOR])
 
 
-def absolute_position(pan: int, tilt: int, pan_speed: int, tilt_speed: int) -> bytes:
-    """Move to signed raw (pan, tilt) at the given speed steps."""
+def absolute_position(pan: int, tilt: int, pan_speed: int, tilt_speed: int,
+                      pan_max: int = PAN_STEP_MAX, tilt_max: int = TILT_STEP_MAX) -> bytes:
+    """Move to signed raw (pan, tilt) at the given speed steps (clamped to `pan_max` / `tilt_max`)."""
     return (
-        bytes([COMMAND_HEADER, 0x01, 0x06, 0x02, _clamp(pan_speed, 1, PAN_STEP_MAX), _clamp(tilt_speed, 1, TILT_STEP_MAX)])
+        bytes([COMMAND_HEADER, 0x01, 0x06, 0x02, _clamp(pan_speed, 1, min(pan_max, PAN_STEP_MAX)),
+               _clamp(tilt_speed, 1, min(tilt_max, TILT_STEP_MAX))])
         + _nibbles(pan, 4)
         + _nibbles(tilt, 4)
         + bytes([TERMINATOR])
     )
 
 
-def relative_position(pan: int, tilt: int, pan_speed: int, tilt_speed: int) -> bytes:
-    """Move by signed raw (pan, tilt) from where the camera is."""
+def relative_position(pan: int, tilt: int, pan_speed: int, tilt_speed: int,
+                      pan_max: int = PAN_STEP_MAX, tilt_max: int = TILT_STEP_MAX) -> bytes:
+    """Move by signed raw (pan, tilt) from where the camera is (speeds clamped to `pan_max` / `tilt_max`)."""
     return (
-        bytes([COMMAND_HEADER, 0x01, 0x06, 0x03, _clamp(pan_speed, 1, PAN_STEP_MAX), _clamp(tilt_speed, 1, TILT_STEP_MAX)])
+        bytes([COMMAND_HEADER, 0x01, 0x06, 0x03, _clamp(pan_speed, 1, min(pan_max, PAN_STEP_MAX)),
+               _clamp(tilt_speed, 1, min(tilt_max, TILT_STEP_MAX))])
         + _nibbles(pan, 4)
         + _nibbles(tilt, 4)
         + bytes([TERMINATOR])

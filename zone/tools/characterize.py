@@ -38,6 +38,7 @@ from typing import Any, Callable, Sequence
 from zone.clock import Clock, SystemClock
 from zone.ptz.interface import Ptz
 from zone.ptz.sim import PtzModel
+from zone.ptz.visca_packets import DEFAULT_PAN_STEP_MAX, DEFAULT_TILT_STEP_MAX
 from zone.tools import bench_analysis as ba
 
 REPORT_SCHEMA = "zone.ptz.characterization/1"
@@ -112,7 +113,7 @@ class BenchOptions:
     home_preset: int | None = None  # recall this preset as home (None: the VISCA home command)
     repeat_preset: int | None = None  # preset used for repeatability (None: same as home)
     pan_max_step: int | None = None  # None: ask the camera, else the VISCA spec (24)
-    tilt_max_step: int | None = None  # None: ask the camera, else 23
+    tilt_max_step: int | None = None  # None: ask the camera, else 20 (0x14)
     quick: bool = False
     pan_travel: float = 1200.0  # raw units one speed measurement may travel (~90 deg at 0.075 deg/unit)
     tilt_travel: float = 400.0  # ~30 deg
@@ -172,8 +173,8 @@ class Characterizer:
         self.updates_at_max_rate_hz: float | None = None  # updates/s while polling at max_rate_hz
         self.refresh_limited = False  # answers fast, but from a position cache refreshed more slowly
         self.settle_stable_s = SETTLE_STABLE_S  # unchanged this long = at rest (longer for a slow-refresh camera)
-        self.pan_max = 24
-        self.tilt_max = 23
+        self.pan_max = DEFAULT_PAN_STEP_MAX
+        self.tilt_max = DEFAULT_TILT_STEP_MAX
         self.rates: dict[str, dict[int, float]] = {}  # "pan+" -> {step: units/s (signed)}
 
     # --- plumbing --------------------------------------------------------------------------------------------
@@ -336,13 +337,18 @@ class Characterizer:
         info["max_speed_inquiry"] = list(max_speed) if max_speed else "unsupported"
         version = self.ptz.inquire_version() if hasattr(self.ptz, "inquire_version") else None
         info["version_raw"] = version.hex(" ") if version else "unsupported"
-        pan_max, tilt_max = 24, 23
+        pan_max, tilt_max, source = DEFAULT_PAN_STEP_MAX, DEFAULT_TILT_STEP_MAX, "default (no usable max-speed answer)"
         if max_speed and 1 <= max_speed[0] <= 0x18 and 1 <= max_speed[1] <= 0x18:
-            pan_max, tilt_max = max_speed
+            pan_max, tilt_max, source = max_speed[0], min(max_speed[1], 0x17), "max-speed inquiry"
+        if self.o.pan_max_step or self.o.tilt_max_step:
+            source = "command line"
         self.pan_max = self.o.pan_max_step or pan_max
         self.tilt_max = self.o.tilt_max_step or tilt_max
+        if hasattr(self.ptz, "set_step_max"):
+            self.ptz.set_step_max(self.pan_max, self.tilt_max)  # the driver clamps every speed to these
         info["pan_max_step_used"] = self.pan_max
         info["tilt_max_step_used"] = self.tilt_max
+        info["max_step_source"] = source
         rest = self.ptz.inquire_pan_tilt()
         self.pt_inquiry = rest is not None
         info["pan_tilt_at_start"] = list(rest) if rest else None
@@ -1023,6 +1029,11 @@ def summarize(report: dict[str, Any]) -> str:
         if isinstance(report.get(name), dict) and "error" in report[name]:
             lines.append(f"!! section {name} failed: {report[name]['error']}")
 
+    conn = report.get("connection", {})
+    if conn.get("pan_max_step_used"):
+        lines.append(f"Top speed steps used: pan {conn['pan_max_step_used']}, tilt {conn['tilt_max_step_used']} "
+                     f"({conn.get('max_step_source')})")
+
     fb = report.get("feedback", {})
     if fb:
         at_rest = fb.get("pan_tilt_at_rest", {})
@@ -1133,8 +1144,8 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     ap.add_argument("--timeout", type=float, default=0.2, help="reply timeout per command, s (default 0.2)")
     ap.add_argument("--home-preset", type=int, help="preset (0-based) to use as home; default: VISCA home command")
     ap.add_argument("--repeat-preset", type=int, help="preset (0-based) for the repeatability test; default: home")
-    ap.add_argument("--pan-max-step", type=int, help="top pan speed step (default: ask the camera, else 24)")
-    ap.add_argument("--tilt-max-step", type=int, help="top tilt speed step (default: ask the camera, else 23)")
+    ap.add_argument("--pan-max-step", type=int, help="top pan speed step (default: ask the camera, else 24 = 0x18)")
+    ap.add_argument("--tilt-max-step", type=int, help="top tilt speed step (default: ask the camera, else 20 = 0x14)")
     ap.add_argument("--quick", action="store_true", help="measure ~10 speed steps per axis instead of all")
     ap.add_argument("--pan-travel", type=float, default=1200.0, help="raw units per speed measurement (pan)")
     ap.add_argument("--tilt-travel", type=float, default=400.0, help="raw units per speed measurement (tilt)")

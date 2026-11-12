@@ -116,6 +116,9 @@ class ViscaPtz:
         transport: the datagram link; default a real UDP socket to host:port.
         watchdog: run the dead-man thread. Tests pass False and call `check_deadlines()` themselves.
         reset_sequence: send the sequence-reset control message on connect.
+        pan_step_max, tilt_step_max: the camera's top speed steps, e.g. from a bench report. Speeds above them are
+            clamped. Left out: the max-speed inquiry's answer once `inquire_max_speed()` has been called, until
+            then pan 0x18 / tilt 0x14.
     """
 
     def __init__(
@@ -128,6 +131,8 @@ class ViscaPtz:
         transport: Transport | None = None,
         watchdog: bool = True,
         reset_sequence: bool = True,
+        pan_step_max: int | None = None,
+        tilt_step_max: int | None = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -159,6 +164,10 @@ class ViscaPtz:
                       "stop_retries": 0, "stop_failures": 0}
         self.last_inquiry: CommandResult | None = None
         self.sequence_reset_status: str | None = None
+        # Top speed steps: speeds sent are clamped to these. `step_max_source` says where they came from.
+        self.pan_step_max = pan_step_max or packets.DEFAULT_PAN_STEP_MAX
+        self.tilt_step_max = tilt_step_max or packets.DEFAULT_TILT_STEP_MAX
+        self.step_max_source = "given" if (pan_step_max or tilt_step_max) else "default"
         if reset_sequence:
             self.reset_sequence()
         # Last resort on a normal exit (end of script, an exception, Ctrl+C): stop the camera. close() removes it.
@@ -173,7 +182,8 @@ class ViscaPtz:
     def pan_tilt_velocity(self, pan_step: int, tilt_step: int, ttl: float | None = None) -> CommandResult:
         if pan_step == 0 and tilt_step == 0:
             return self.stop()  # the same packet; going through stop() gives it the retries
-        return self.command(packets.pan_tilt_drive(pan_step, tilt_step), what="pan_tilt_velocity", pan_tilt_ttl=ttl)
+        return self.command(packets.pan_tilt_drive(pan_step, tilt_step, self.pan_step_max, self.tilt_step_max),
+                            what="pan_tilt_velocity", pan_tilt_ttl=ttl)
 
     def stop(self) -> CommandResult:
         """Stop pan and tilt. If the camera doesn't ACK it, the dead-man thread keeps re-sending it (up to 2 s)."""
@@ -192,12 +202,12 @@ class ViscaPtz:
         return self.command(packets.zoom_direct(position), what="zoom_direct", zoom_ttl=None)
 
     def absolute_position(self, pan: int, tilt: int, pan_speed: int, tilt_speed: int) -> CommandResult:
-        return self.command(packets.absolute_position(pan, tilt, pan_speed, tilt_speed), what="absolute_position",
-                            pan_tilt_ttl=None)
+        return self.command(packets.absolute_position(pan, tilt, pan_speed, tilt_speed, self.pan_step_max,
+                                                      self.tilt_step_max), what="absolute_position", pan_tilt_ttl=None)
 
     def relative_position(self, pan: int, tilt: int, pan_speed: int, tilt_speed: int) -> CommandResult:
-        return self.command(packets.relative_position(pan, tilt, pan_speed, tilt_speed), what="relative_position",
-                            pan_tilt_ttl=None)
+        return self.command(packets.relative_position(pan, tilt, pan_speed, tilt_speed, self.pan_step_max,
+                                                      self.tilt_step_max), what="relative_position", pan_tilt_ttl=None)
 
     def inquire_pan_tilt(self) -> tuple[int, int] | None:
         result = self.inquire(packets.pan_tilt_position_inquiry(), packets.parse_pan_tilt_position, "inquire_pan_tilt")
@@ -231,8 +241,23 @@ class ViscaPtz:
     # --- extras the bench script uses ----------------------------------------------------------------------------
 
     def inquire_max_speed(self) -> tuple[int, int] | None:
+        """Ask the camera for its top (pan, tilt) speed steps. A plausible answer becomes the clamp for later
+        commands, unless top steps were given explicitly (constructor or `set_step_max`)."""
         result = self.inquire(packets.pan_tilt_max_speed_inquiry(), packets.parse_max_speed, "inquire_max_speed")
-        return result.value if result.ok else None  # type: ignore[return-value]
+        if not result.ok:
+            return None
+        pan_max, tilt_max = result.value  # type: ignore[misc]
+        if self.step_max_source != "given" and 1 <= pan_max <= packets.PAN_STEP_MAX and 1 <= tilt_max <= 0x18:
+            self.pan_step_max, self.tilt_step_max = pan_max, min(tilt_max, packets.TILT_STEP_MAX)
+            self.step_max_source = "camera"
+        return result.value  # type: ignore[return-value]
+
+    def set_step_max(self, pan_step_max: int, tilt_step_max: int) -> None:
+        """Set the top speed steps explicitly (e.g. from a bench report or the command line); speeds above them
+        are clamped from now on, and the max-speed inquiry no longer changes them."""
+        self.pan_step_max = max(1, min(pan_step_max, packets.PAN_STEP_MAX))
+        self.tilt_step_max = max(1, min(tilt_step_max, packets.TILT_STEP_MAX))
+        self.step_max_source = "given"
 
     def inquire_version(self) -> bytes | None:
         result = self.inquire(packets.version_inquiry(), None, "inquire_version")

@@ -297,6 +297,40 @@ def test_extra_inquiries(rig):
     assert rig.ptz.inquire_version().startswith(bytes([0x90, 0x50]))
 
 
+# --- S4: never send a speed above the camera's top step ------------------------------------------------------------
+
+
+def drive_speeds(rig: Rig) -> tuple[int, int]:
+    """The (pan, tilt) speed bytes of the last pan/tilt drive packet the driver sent."""
+    drive = [p for p in sent_payloads(rig) if p[:4] == bytes([0x81, 0x01, 0x06, 0x01])][-1]
+    return drive[4], drive[5]
+
+
+def test_before_asking_the_camera_tilt_is_clamped_to_0x14(rig):
+    # We don't know this camera's top tilt step yet, so the safe default 0x14 (20) applies.
+    rig.ptz.pan_tilt_velocity(24, 23)
+    assert drive_speeds(rig) == (0x18, 0x14)
+    assert rig.ptz.step_max_source == "default"
+
+
+def test_the_max_speed_answer_becomes_the_clamp(rig):
+    assert rig.ptz.inquire_max_speed() == (24, 23)  # the fake camera says: pan 24, tilt 23
+    rig.ptz.pan_tilt_velocity(30, 30)
+    assert drive_speeds(rig) == (24, 23)
+    assert rig.ptz.step_max_source == "camera"
+
+
+def test_top_steps_given_explicitly_win_over_the_camera():
+    clock = FakeClock()
+    camera = FakeViscaCamera(SimulatedPtz(PtzModel(), clock))
+    transport = FakeTransport(camera, clock)
+    ptz = ViscaPtz("camera", clock=clock, transport=transport, watchdog=False, pan_step_max=16, tilt_step_max=12)
+    ptz.inquire_max_speed()  # the camera says 24/23, but we were told 16/12 (e.g. from a bench report)
+    ptz.pan_tilt_velocity(-24, -23)
+    drive = [d[8:] for d in transport.sent if d[8:12] == bytes([0x81, 0x01, 0x06, 0x01])][-1]
+    assert (drive[4], drive[5]) == (16, 12)
+
+
 # --- the dead-man switch ----------------------------------------------------------------------------------------
 
 
