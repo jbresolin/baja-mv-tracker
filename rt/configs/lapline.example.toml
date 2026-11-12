@@ -79,7 +79,10 @@ passes = 20
 time_check_s = 60
 
 [clock]
-ntp_server = ""                 # at the event: the MikroTik's address, so the page shows the measured offset
+ntp_server = "192.168.88.1"     # PLACEHOLDER: set the event router's IP (192.168.88.1 is a MikroTik's default). rt
+                                # asks it for the time (SNTP) at start and every minute: the primary clock check,
+                                # shown on the status page (red above 0.5 s). The router must answer NTP (MikroTik:
+                                # enable its NTP server). "" = no network check, only Windows' own sync status.
 offset_s = 0.0                  # manual correction only if the PC clock can't be synced
 
 [lapapp]

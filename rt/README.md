@@ -149,10 +149,12 @@ python rt/run.py --source <file | camera | camera index | rtsp/http url> --event
 * Validation tools (they need pandas, and are not needed at the race): `rt/eval_26se.py` (replay metrics vs the
   human laps, and an online-vs-offline pass-logic check), `rt/loadtest.py` (real-time CPU/RAM matrix).
 
-Live sources use the system clock. At start, `rt/timesync.py` checks Windows time sync (`w32tm /query /status`).
-**It warns loudly when the PC is not synced.** The session-1 PC was 80 s ahead of the lap server. Fix it with
-Settings > Time > Sync now, or set `clock.offset_s`. `clock.ntp_server` adds an SNTP check. It is off by default,
-so the program makes no network calls unless you set it.
+Live sources use the system clock. At start and every minute, `rt/timesync.py` checks it. **It warns loudly when
+the PC is not synced.** The session-1 PC was 80 s ahead of the lap server. Fix it with Settings > Time > Sync now, or
+set `clock.offset_s`. The primary check is SNTP against `clock.ntp_server` (the lap-line example config sets it to
+a placeholder for the event router: set the real IP); it is empty in `rt/config.toml`, so a plain run makes no
+network calls. Windows' own status (`w32tm /query /status [/verbose]`) is read by its layout (field order and
+value shapes), so a pt-BR Windows with Portuguese labels and a cp850 console works too.
 
 ## Config reference (`rt/config.toml`; a user config only needs the keys it changes)
 
