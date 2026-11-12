@@ -1,4 +1,15 @@
-"""Tests for zone/app.py: the web page's API (mode buttons, big STOP, teach), with a simulated PTZ and no camera."""
+"""Tests for zone/app.py: the web page's API (mode buttons, big STOP, teach, health), with a simulated PTZ and no
+camera.
+
+How these tests work, for a first-time reader:
+* The page talks to the program through small web requests ("POST /api/mode with {mode: AUTO}"). FastAPI's
+  `TestClient` sends those requests straight to the program, in memory: no browser, no network, no server.
+* The PTZ is `SimulatedPtz`, a model of a camera that moves only when the test moves time forward.
+* Time is a `FakeClock`: it stands still until a test calls `clock.advance(seconds)`. So "wait half a second" is
+  instant and always gives the same result.
+* HTTP status codes seen here: 200 = done, 409 = "refused right now" (e.g. teaching while in AUTO), 204 = "nothing
+  to send" (no frame yet).
+"""
 from pathlib import Path
 
 import numpy as np
@@ -19,6 +30,8 @@ from zone.zonefile import Zone  # noqa: E402
 
 
 def make(tmp_path, zone=None):
+    """Build the whole app around a simulated PTZ: -> (client to send page requests, app, PTZ, clock).
+    `tmp_path` is a fresh empty folder pytest gives each test (the zone file and logs go there)."""
     cfg = C.load(None, ["ptz.driver=sim"])
     st = C.build(cfg)
     clock = FakeClock(0.0)
@@ -29,6 +42,7 @@ def make(tmp_path, zone=None):
 
 
 def test_state_and_page(tmp_path):
+    # the page's state request answers, the program starts in STOPPED (PARADO), and the page files are served
     client, app, _, _ = make(tmp_path)
     s = client.get("/api/state").json()
     assert s["runtime"]["director"]["mode"] == "STOPPED"
@@ -38,6 +52,7 @@ def test_state_and_page(tmp_path):
 
 
 def test_mode_buttons(tmp_path):
+    # pressing PASSIVO then AUTO on the page changes the mode of the program
     client, app, _, _ = make(tmp_path)
     assert client.post("/api/mode", json={"mode": "PASSIVE"}).json()["mode"] == "PASSIVE"
     assert client.post("/api/mode", json={"mode": "AUTO"}).json()["mode"] == "AUTO"
@@ -45,6 +60,7 @@ def test_mode_buttons(tmp_path):
 
 
 def test_auto_is_refused_without_a_taught_zone(tmp_path):
+    # Zone() is an empty zone (nothing taught): AUTO would have nothing to follow, so it is refused (409)
     client, app, _, _ = make(tmp_path, Zone())
     r = client.post("/api/mode", json={"mode": "AUTO"})
     assert r.status_code == 409
@@ -52,17 +68,19 @@ def test_auto_is_refused_without_a_taught_zone(tmp_path):
 
 
 def test_big_stop(tmp_path):
+    # the camera is turning (speed step 12) in AUTO; the big PARAR button must stop it and switch to STOPPED
     client, app, ptz, clock = make(tmp_path)
     client.post("/api/mode", json={"mode": "AUTO"})
     ptz.pan_tilt_velocity(12, 0)
-    clock.advance(0.5)
+    clock.advance(0.5)                       # half a second later it is moving
     assert client.post("/api/stop").json()["ok"]
-    clock.advance(0.5)
+    clock.advance(0.5)                       # half a second for the camera to brake
     assert not ptz.is_moving()
     assert app.runtime.director.mode == "STOPPED"
 
 
 def test_teaching_is_blocked_in_auto(tmp_path):
+    # while AUTO drives the camera, the teach controls must not move it (409 = refused, with a pt-BR reason)
     client, app, _, _ = make(tmp_path)
     client.post("/api/mode", json={"mode": "AUTO"})
     r = client.post("/api/teach/jog", json={"pan": 6})
@@ -70,6 +88,8 @@ def test_teaching_is_blocked_in_auto(tmp_path):
 
 
 def test_teach_through_the_api(tmp_path):
+    # The whole teach workflow as the page does it: add a path point, jog the camera, add two keyframes (each reads
+    # the camera's pose and stores a preset), try an invalid corridor width, save the zone file.
     client, app, ptz, clock = make(tmp_path, Zone())
     assert client.post("/api/teach/point", json={"x": 100, "y": 500}).json()["ok"]
     # moving the PTZ from the page needs "teach mode" on (it starts off)
@@ -89,15 +109,18 @@ def test_teach_through_the_api(tmp_path):
 
 
 def test_frame_endpoint(tmp_path):
+    # the page refreshes the live spotter picture from /frame.jpg: nothing before the first frame, a JPEG after
     client, app, _, _ = make(tmp_path)
     assert client.get("/frame.jpg").status_code == 204           # no frame yet
     img = np.zeros((1080, 1920, 3), np.uint8)
+    # pretend the frame loop has processed one black 1080p frame (normally the camera thread does this)
     app.latest = (ZoneFrame(img, 0.0, 0.0, 0), CycleResult(0.0, 0.0, {}, Decision("none"), None, []))
     r = client.get("/frame.jpg")
-    assert r.status_code == 200 and r.content[:2] == b"\xff\xd8"  # a JPEG
+    assert r.status_code == 200 and r.content[:2] == b"\xff\xd8"  # every JPEG file starts with these two bytes
 
 
 def test_health_disk_and_ptz(tmp_path):
+    # one health check: free disk space is measured, and the simulated PTZ answers the probe (reachable)
     client, app, _, _ = make(tmp_path)
     app.check_health()
     h = client.get("/api/state").json()["health"]

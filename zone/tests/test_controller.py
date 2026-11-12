@@ -1,7 +1,19 @@
 """Tests for zone/controller.py, against the simulated PTZ on a fake clock (no camera, no real time).
 
+Words used below, for a first-time reader:
+* `s` is how far the car is through the zone: 0 = at the entry keyframe, 1 = at the exit keyframe. `v` is how fast
+  s grows, per second (v = 0.25 means the car crosses the zone in 4 s).
+* A "pose" is where the camera points: pan (left/right), tilt (up/down), zoom, in the camera's raw units.
+* The controller turns "the car is at s, moving at v" into speed commands for the camera ("speed steps": whole
+  numbers, the camera only has a few dozen speeds).
+* "Branch A" cameras tell us where they are while moving (an "inquiry"); "Branch B" cameras don't, so the
+  controller estimates it from its own commands ("dead reckoning").
+* `SimulatedPtz` is a model of the camera; `FakeClock` is a clock that only moves when the test calls
+  `clock.advance(seconds)`, so every run gives the same numbers and takes no real time.
+
 The zone used here: keyframes at s = 0, 0.5, 1 with pan 0, 400, 800 (raw units), so the camera must turn 800 units
-while the car crosses the zone. A car at v = 0.25 /s needs pan rate 800 * 0.25 = 200 units/s."""
+while the car crosses the zone. A car at v = 0.25 /s needs pan rate 800 * 0.25 = 200 units/s. 14.4 raw units are
+about 1 degree."""
 import pytest
 
 from zone.controller import Controller
@@ -36,6 +48,9 @@ class Spy:
 
 
 def setup(branch, inquiry_mode=None, pan_sign=1, sets=()):
+    """A controller driving a simulated camera, parked at the entry like at the start of a pass.
+    -> (controller, simulator, spy that records the calls, clock, settings). `sets` changes config values, as
+    `--set` does on the command line (e.g. "controller.k_pan=0.5")."""
     model = PtzModel(inquiry_mode=inquiry_mode or ("always" if branch == "A" else "never"), pan_sign=pan_sign)
     st = settings(branch, model=model, sets=sets)
     clock = FakeClock(0.0)
@@ -83,6 +98,8 @@ def test_follows_a_constant_speed_car(branch):
 
 
 def test_every_velocity_command_carries_the_ttl():
+    # TTL = "time to live": every speed command tells the camera "stop by yourself if you hear nothing more from me
+    # within 0.3 s". That's what stops the camera if the program dies. Every single command must carry it.
     ctrl, sim, spy, clock, st = setup("B")
     follow_car(ctrl, sim, clock, t_end=1.0)
     ttls = [kw.get("ttl") for name, a, kw in spy.calls if name == "pan_tilt_velocity"]
@@ -90,6 +107,7 @@ def test_every_velocity_command_carries_the_ttl():
 
 
 def test_a_stalled_loop_stops_the_camera_by_itself():
+    # the same safety net seen from the camera: follow a car, then send nothing more (as if the program froze)
     ctrl, sim, spy, clock, st = setup("B")
     follow_car(ctrl, sim, clock, t_end=1.5)
     assert sim.is_moving()
@@ -102,6 +120,7 @@ def test_a_stalled_loop_stops_the_camera_by_itself():
 
 
 def test_branch_a_polls_inquiry_and_uses_feedback():
+    # Branch A: the controller asks the camera where it is (inquire_pan_tilt) and corrects with that answer
     ctrl, sim, spy, clock, st = setup("A")
     _, cmd = follow_car(ctrl, sim, clock, t_end=2.0)
     assert spy.count("inquire_pan_tilt") >= 10
@@ -109,6 +128,7 @@ def test_branch_a_polls_inquiry_and_uses_feedback():
 
 
 def test_branch_a_poll_rate_is_capped():
+    # ...but not more often than configured: too many questions would crowd out the speed commands
     ctrl, sim, spy, clock, st = setup("A", sets=["controller.inquiry_hz=5"])
     follow_car(ctrl, sim, clock, t_end=2.0)
     assert spy.count("inquire_pan_tilt") <= 11      # 5 Hz over ~2 s (+1)
@@ -131,6 +151,8 @@ def test_branch_b_never_asks_the_camera_and_trusts_dead_reckoning_only_after_a_r
 
 
 def test_branch_b_dead_reckoning_matches_the_camera():
+    # Branch B never asks the camera; its own estimate of where the camera is (from the commands it sent and the
+    # camera's measured speeds) must stay close to the truth, which only the simulator knows (true_pan_tilt)
     ctrl, sim, spy, clock, st = setup("B")
     _, cmd = follow_car(ctrl, sim, clock, t_end=2.0)
     assert cmd.pose_now.pan == pytest.approx(sim.true_pan_tilt()[0], abs=15)
@@ -147,6 +169,8 @@ def test_camera_whose_pan_counts_the_other_way():
 
 
 def test_zoom_is_rate_limited_loosened_and_thresholded():
+    # Zoom is sent as an absolute position, not a speed. Three rules: at most every 0.5 s, framed looser than
+    # taught (loosen 0.5 = halfway between fully wide and the taught zoom), and only when it changed enough.
     ctrl, sim, spy, clock, st = setup("B", sets=["controller.zoom_loosen=0.5", "controller.zoom_min_interval_s=0.5",
                                                  "controller.zoom_threshold=100"])
     follow_car(ctrl, sim, clock, t_end=4.0)
@@ -162,6 +186,7 @@ def test_zoom_is_rate_limited_loosened_and_thresholded():
 
 
 def test_stop_halts_the_camera():
+    # stop() (big STOP, end of a pass): after a short braking time the camera doesn't move any more
     ctrl, sim, spy, clock, st = setup("B")
     follow_car(ctrl, sim, clock, t_end=1.5)
     ctrl.stop()

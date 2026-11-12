@@ -1687,3 +1687,19 @@ the October wide-angle recording and the deployed models were not available on t
   and taking the union fixed it.
 * **Lock window.** "Lock the first track with s >= s_lock" also matches a car already at s = 0.7 when the camera gets
   back to the entry; chasing it from the entry gives ~70 degrees of error. Only cars within s_lock + 0.15 are locked.
+
+### Session 3, review fixes (PR #3, 2026-11-12)
+
+* **Correction:** `ZoneFrame.t` was the frame's *arrival* time, so the lookahead missed the webcam's capture
+  latency (~0.1 s). It is now the picture time (arrival - `rt.capture.live_latency_s`, default 0.1 s, to be measured
+  on the bench); `controller.latency_s` is the PTZ command latency only.
+* **Correction:** the spotter recording was an `.mp4` (unreadable after a crash) and the replay read our own
+  recordings at their nominal pts. Now `.mkv`, and the replay takes the real grab times from the `.frames.csv` sidecar.
+* A cycle stuck in a hung PTZ call used to block the watchdog's shutdown (and the big STOP) on the runtime lock, so
+  the launcher never restarted. Now: STOP goes to the driver first and waits for the lock at most 0.5 s; the
+  watchdog `os._exit(3)`s when the shutdown takes more than `health.shutdown_grace_s`. Detection runs outside the
+  control lock, so the STOP never waits for it.
+* "PTZ reachable" was True before anything had answered; it's now unknown until a command or inquiry answers, and
+  the health probe stays off the wire while AUTO drives the camera.
+* New: divergence guard (drop the car when the target stays > 15 degrees from the estimated pose for > 5 cycles) and a
+  `strict` config profile (pure feed-forward Branch B) for the Sunday comparison.
