@@ -3,7 +3,9 @@ clock (epoch seconds). Sources:
 
 * video file: ffmpeg pipe, `framestep` = round(fps / det_fps) (exactly the offline evaluation's sampling; LESSONS
   WP9: never `select`, it duplicates frames), frame time = file start + pts. File start from the OBS clock overlay
-  when present (26SE), else the container creation_time, else mtime - duration. `realtime=True` paces frames at real
+  when present (26SE), else the container creation_time, else mtime - duration. An rt recording (rt/recorder.py)
+  has a `<name>.frames.csv` next to it with the true time of every frame: when it is there, frame n gets its time
+  from row n (the file's own frame rate is only nominal). `realtime=True` paces frames at real
   speed and drops frames when detection falls behind (as a live source would); otherwise every frame is processed.
 * USB camera (`camera`, an index, or the [camera] config; rt/livecam.py): every camera frame is read, ~10 fps are
   kept; frame time = system clock when the frame is received minus a configured latency; recorded by
@@ -11,6 +13,7 @@ clock (epoch seconds). Sources:
 * rtsp/http/udp URL (ffmpeg pipe, `fps` filter): frame time = system clock at arrival minus a configured latency.
 Live sources never block: a full queue drops the frame.
 """
+import csv
 import datetime as dt
 import json
 import os
@@ -112,6 +115,33 @@ def file_start_epoch(path, info, mode, log=print):
     if mode == "auto":
         return os.path.getmtime(path) - info["duration"], "mtime-duration"
     raise SystemExit("clock mode %s not available for %s" % (mode, path))
+
+
+def load_frame_times(video_path):
+    """The per-frame wall times of an rt recording: `<video>.frames.csv` (written by rt/recorder.py: columns n,
+    t_wall, t_mono, camera_frame_no; row n = frame n of the video). Returns a list of epoch seconds, or None when
+    there is no such file. A last line cut short (power loss while writing) is ignored."""
+    csv_path = Path(video_path).with_suffix(".frames.csv")
+    if not csv_path.exists():
+        return None
+    times = []
+    with open(csv_path, encoding="utf-8", newline="") as f:
+        for row in csv.DictReader(f):
+            if not row.get("t_mono"):      # t_mono comes after t_wall: if it is missing, t_wall may be cut short
+                break
+            try:
+                times.append(float(row["t_wall"]))
+            except (KeyError, TypeError, ValueError):
+                break
+    return times or None
+
+
+def recorded_frame_time(frame_times, frame_no, fps):
+    """Time of video frame `frame_no` from the frames.csv times; past the end of the list (a CSV not fully flushed
+    when the recording stopped), continue from the last known frame at the nominal rate."""
+    if frame_no < len(frame_times):
+        return frame_times[frame_no]
+    return frame_times[-1] + (frame_no - (len(frame_times) - 1)) / fps
 
 
 def parse_start(s, base_epoch):
@@ -218,7 +248,12 @@ class FileCapture(Capture):
         self.path = Path(path)
         self.realtime = realtime
         self.info = probe(c["ffprobe"], self.path)
-        self.base, self.clock_how = file_start_epoch(self.path, self.info, cfg["clock"]["mode"], log)
+        self.frame_times = load_frame_times(self.path) if cfg["clock"]["mode"] == "auto" else None
+        if self.frame_times:
+            self.base = self.frame_times[0]
+            self.clock_how = "frames.csv (the recorded time of each frame)"
+        else:
+            self.base, self.clock_how = file_start_epoch(self.path, self.info, cfg["clock"]["mode"], log)
         self.ss = max(0.0, parse_start(start, self.base) or 0.0)
         self.duration = float(duration) if duration else None
         self.step = max(1, int(round(self.info["fps"] / self.det_fps)))
@@ -250,25 +285,30 @@ class FileCapture(Capture):
         if (self.w, self.h) != (self.info["w"], self.info["h"]):
             vf += ",scale=%d:%d" % (self.w, self.h)
         cmd += ["-vf", vf, "-fps_mode", "passthrough", "-an", "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
-        n = self.w * self.h * 3
-        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=n * 2)
+        frame_bytes = self.w * self.h * 3
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=frame_bytes * 2)
         if self.cfg["runtime"].get("affinity_decoder", True):
             set_affinity(self.proc.pid, self.cfg["runtime"].get("affinity"), self.log)
         t0 = time.monotonic()
-        k = 0
+        fps = self.info["fps"]
+        sampled_no = 0
         while not self.stop_ev.is_set():
-            buf = self.proc.stdout.read(n)
-            if len(buf) < n:
+            buf = self.proc.stdout.read(frame_bytes)
+            if len(buf) < frame_bytes:
                 break
-            pts = self.ss + k * self.step / self.info["fps"]
+            pts = self.ss + sampled_no * self.step / fps
             if self.realtime:
                 due = t0 + (pts - self.ss)
-                d = due - time.monotonic()
-                if d > 0:
-                    time.sleep(d)
+                wait_s = due - time.monotonic()
+                if wait_s > 0:
+                    time.sleep(wait_s)
+            if self.frame_times:
+                t_frame = recorded_frame_time(self.frame_times, int(round(pts * fps)), fps)
+            else:
+                t_frame = self.base + pts
             img = np.frombuffer(buf, np.uint8).reshape(self.h, self.w, 3)
-            self._push(Frame(img, self.base + pts + self.offset, pts, k, time.monotonic()), block=not self.realtime)
-            k += 1
+            self._push(Frame(img, t_frame + self.offset, pts, sampled_no, time.monotonic()), block=not self.realtime)
+            sampled_no += 1
         self.proc.stdout.close()
         self.proc.wait()
 

@@ -437,3 +437,49 @@ def test_real_ffmpeg_writes_a_playable_file(cfg, tmp_path, kind):
     side = json.loads(path.with_suffix(".json").read_text())
     assert side["frames"] == 30 and side["ffmpeg_returncode"] == 0
     assert path.with_suffix(".ffmpeg.log").exists()
+
+
+# ------------------------------------------------------------------------------------------------ replay
+def test_frame_times_from_the_csv(tmp_path):
+    # load_frame_times reads the recorded time of each frame. If the laptop lost power while a row was being
+    # written, the last line is cut short: it is ignored instead of crashing the replay.
+    from rt.capture import load_frame_times, recorded_frame_time
+
+    video = tmp_path / "rec_x.mkv"
+    assert load_frame_times(video) is None                       # no CSV next to the file
+    video.with_suffix(".frames.csv").write_text("n,t_wall,t_mono,camera_frame_no\n0,100.0,5.0,0\n1,100.1,5.1,3\n"
+                                                "2,100.35,5.35,10\n3,100.4")
+    times = load_frame_times(video)
+    assert times == [100.0, 100.1, 100.35]
+    # Past the end of the CSV, times continue from the last row at the nominal rate (10 fps here).
+    assert recorded_frame_time(times, 2, 10.0) == 100.35
+    assert recorded_frame_time(times, 4, 10.0) == pytest.approx(100.55)
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+                    reason="ffmpeg/ffprobe not on PATH")
+def test_replay_of_a_recording_uses_the_frames_csv_times(cfg, tmp_path):
+    # Record 20 frames whose real spacing is uneven (0.1 s and 0.15 s alternately: missed camera frames). The video
+    # file itself plays at a nominal 10 fps, so frame 19 would be at +1.9 s from it, while it really was at
+    # +2.35 s. Replaying the file through rt (FileCapture, as `run.py --source rec_....mkv` does) must give each
+    # frame its recorded time from the .frames.csv.
+    from rt.capture import FileCapture
+
+    cfg["recording"]["queue_frames"] = 100
+    rec = Recorder(cfg, tmp_path, fps=10, version="test", log=lambda m: None, encoder="libx264")
+    rec.start()
+    t_wall, recorded = 1_800_000_000.0, []
+    for frame_no in range(20):
+        recorded.append(t_wall)
+        rec.offer(np.full((48, 64, 3), frame_no * 10, np.uint8), t_wall, 100.0 + (t_wall - 1_800_000_000.0),
+                  frame_no)
+        t_wall += 0.1 if frame_no % 2 == 0 else 0.15
+    rec.stop()
+    assert len(rec.segments) == 1                    # 0.15 s < 0.2 s: no split
+
+    cfg["capture"]["fps"] = 10.0                     # process every frame of the 10 fps file
+    replay = FileCapture(cfg, rec.segments[0], log=lambda m: None)
+    assert replay.clock_how.startswith("frames.csv")
+    replay.start()
+    times = [frame.t for frame in replay.frames()]
+    assert times == pytest.approx(recorded, abs=1e-6)
