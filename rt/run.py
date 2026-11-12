@@ -119,6 +119,14 @@ def main():
     warn = lambda m: em.emit(dict(type="warning", msg=m))  # noqa: E731
 
     version = software_version()
+    from rt.wintimer import python_check, raise_timer_resolution
+    python_info, python_warning = python_check()
+    log(python_info)
+    if python_warning:
+        warn(python_warning)
+    timer_note = raise_timer_resolution()           # Windows: 1 ms sleeps for the beam's 1 kHz poll
+    if timer_note:
+        log(timer_note)
     live_camera = any(is_camera(s) for s in a.source)
     server = timechecker = recorder = None
     if board is not None:

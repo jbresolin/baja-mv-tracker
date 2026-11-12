@@ -159,7 +159,8 @@ of `rt/configs/lapline.toml` (example and every key: `rt/configs/lapline.example
   DirectShow frames are stamped after `retrieve()` (decode included), so frame times run late by the decode time
   too; `assoc_offset_s` and the LED latency absorb it.
   At 1 kHz an edge is stamped within ~1 ms (the `poll_gap_ms` field says how long the gap before it was). Windows:
-  Python 3.11+ sleeps with a high-resolution timer, so 1 kHz is reachable; the `beam_poll` event (every 60 s) and
+  Python 3.11+ sleeps with a high-resolution timer, and rt also calls `timeBeginPeriod(1)` at start (1 ms timer
+  tick, undone at exit; rt/wintimer.py), so 1 kHz is reachable; rt logs `sys.version` and warns below 3.11; the `beam_poll` event (every 60 s) and
   the status page show the achieved rate and the largest gap.
 * **One break per car, in software.** A tube-frame car blocks the beam several times (nose, driver, firewall,
   wheels). Edges less than `group_gap_s` (0.25 s) apart form one `beam_break`; its first edge is the crossing time.
