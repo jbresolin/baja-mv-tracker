@@ -1140,7 +1140,9 @@ def summarize(report: dict[str, Any]) -> str:
     lat = report.get("latency", {})
     if lat:
         lines.append("")
-        if lat.get("method") == "polling":
+        if lat.get("skipped"):
+            lines.append("3. Latency: skipped")
+        elif lat.get("method") == "polling":
             lines.append(f"3. Latency (polled at {lat.get('poll_hz')} Hz, resolution {lat.get('resolution_s')} s): "
                          f"start {lat.get('latency_s_p50')} s, ramp {lat.get('ramp_s_p50')} s, "
                          f"stop {lat.get('stop_latency_s_p50')} s, stop ramp {lat.get('stop_ramp_s_p50')} s")
