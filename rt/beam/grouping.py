@@ -111,7 +111,10 @@ class BreakGrouper:
         return dict(b, duration_s=round(b["last_mono"] - b["first_mono"], 4))
 
     def status(self, now_mono):
-        """For the status page: is a stuck episode going on, and since how long."""
-        if self.stuck is None:
+        """For the status page: is a stuck episode going on, and since how long. Called from the status page's
+        thread while the dispatcher thread may be changing `self.stuck`: read it ONCE into a local, so it cannot
+        become None between the check and the use."""
+        stuck = self.stuck
+        if stuck is None:
             return dict(stuck=False)
-        return dict(stuck=True, stuck_for_s=round(now_mono - self.stuck["since_mono"], 1))
+        return dict(stuck=True, stuck_for_s=round(now_mono - stuck["since_mono"], 1))

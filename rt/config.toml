@@ -185,6 +185,7 @@ advance_guard_s = 0.02          # breaks are closed this far behind "now" (the r
 reopen_first_s = 1              # port missing / unplugged: retry after 1 s, doubling ...
 reopen_max_s = 30               # ... up to 30 s
 max_edge_events_per_s = 100     # beam_edge lines written per second at most (a noisy line still groups, counted)
+queue_max = 10000               # beam reader -> dispatcher queue bound (full: the oldest item is dropped, counted)
 poll_report_s = 60              # beam_poll event (achieved poll rate and jitter) this often
 assoc_window_s = 1.0            # live: a pass_end gets t_beam if exactly one break is within this of its t_cross
 assoc_offset_s = 0.0            # live: expected t_cross - t_beam (camera centre line vs beam); fuse_beam.py measures it

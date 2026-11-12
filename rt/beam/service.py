@@ -61,7 +61,11 @@ class BeamService:
         self.poll_report_s = float(b.get("poll_report_s", 60))
         self.led = LedWatcher(b.get("led_roi") or [], float(b.get("led_threshold", 128)))
         self.led_max_latency = float(b.get("led_max_latency_s", 0.5))
-        self.q = queue.SimpleQueue()          # reader thread / detection loop / event sink -> dispatcher
+        # reader thread / detection loop / event sink -> dispatcher. Bounded: if the dispatcher ever stops, the
+        # oldest items are dropped (and counted) instead of eating the laptop's memory over a race day.
+        self.q = queue.Queue(maxsize=int(b.get("queue_max", 10000)))
+        self.queue_dropped = 0
+        self.drop_lock = threading.Lock()
         self.halt = threading.Event()
         self.threads = []
         self.lock = threading.Lock()          # guards the status numbers below (read by the status page thread)
@@ -86,7 +90,7 @@ class BeamService:
         self.level = None
         self.recent_breaks = collections.deque(maxlen=2000)   # for association (newest last)
         self.last_breaks = collections.deque(maxlen=10)       # for the status page
-        self.break_passes = {}                                # break_id -> [pass ids matched to it]
+        self.break_passes = collections.OrderedDict()         # break_id -> [pass ids matched to it] (last 2000)
         self.pass_numbers = {}                                # pass_id -> number read (status page only)
         self.breaks_total = 0
         self.stuck_episodes = 0
@@ -113,7 +117,7 @@ class BeamService:
                 return
             self.port_open, self.polled_since_open = True, False
             self.last_poll_report = self.clock.mono()
-            self.q.put(("opened", info, self.clock.mono(), self.clock.wall()))
+            self._put(("opened", info, self.clock.mono(), self.clock.wall()))
             return
         try:
             edges = self.source.poll()
@@ -126,7 +130,7 @@ class BeamService:
             self.polled_since_open = True
             self.backoff.reset()          # the port works: the next failure starts again at the short wait
         for e in edges:
-            self.q.put(("edge", e))
+            self._put(("edge", e))
         now = self.clock.mono()
         # Every edge stamped up to `now` is queued (any later edge will be stamped later than this), except one the
         # driver is still holding back (byte-stream: a message not finished yet).
@@ -134,20 +138,35 @@ class BeamService:
         self.reader_horizon_mono = now if held is None else min(now, held)
         if now - self.last_poll_report >= self.poll_report_s:
             self.last_poll_report = now
-            self.q.put(("poll", self.source.poll_stats.report(now)))
+            self._put(("poll", self.source.poll_stats.report(now)))
+
+    def _put(self, item):
+        """Queue an item for the dispatcher. Never blocks: when the queue is full the OLDEST item is dropped and
+        counted (status page: queue_dropped)."""
+        while True:
+            try:
+                self.q.put_nowait(item)
+                return
+            except queue.Full:
+                try:
+                    self.q.get_nowait()
+                    with self.drop_lock:
+                        self.queue_dropped += 1
+                except queue.Empty:
+                    pass
 
     def _schedule_reopen(self, state, why):
         wait = self.backoff.next()
         now = self.clock.mono()
         self.next_open_mono = now + wait
-        self.q.put((state, "%s; next try in %.0f s" % (why, wait), now, self.clock.wall()))
+        self._put((state, "%s; next try in %.0f s" % (why, wait), now, self.clock.wall()))
 
     def _reader_loop(self):
         while not self.halt.is_set():
             try:
                 self.reader_step()
             except Exception as e:  # noqa: BLE001 (an unexpected driver error must not kill the beam thread)
-                self.q.put(("error", "beam reader: %s: %s" % (type(e).__name__, e)))
+                self._put(("error", "beam reader: %s: %s" % (type(e).__name__, e)))
                 try:
                     self.source.close()
                 except Exception:  # noqa: BLE001
@@ -164,17 +183,17 @@ class BeamService:
         try:
             mean = self.led.update(fr.img)
             if mean is not None:
-                self.q.put(("led", fr.t_cap, fr.t, fr.idx, mean))
+                self._put(("led", fr.t_cap, fr.t, fr.idx, mean))
         except Exception as e:  # noqa: BLE001
-            self.q.put(("error", "beam LED ROI: %s" % e))
+            self._put(("error", "beam LED ROI: %s" % e))
 
     def on_event(self, ev):
         """Called (through PassBeamSink) for every rt event, from inside rt's emitter: only queue, never emit here
         (the emitter's lock is held)."""
         if ev.get("type") == "pass_end":
-            self.q.put(("pass", ev))
+            self._put(("pass", ev))
         elif ev.get("type") == "pass_identity":
-            self.q.put(("number", ev.get("pass_id"), ev.get("number")))
+            self._put(("number", ev.get("pass_id"), ev.get("number")))
 
     # ================================================================== dispatcher thread
     def dispatch_step(self, timeout=0.05):
@@ -336,6 +355,7 @@ class BeamService:
         now_mono = self.clock.mono()
         for p, arrived_mono in self.pending_passes:
             if p.get("t_cross") is None:
+                self._emit_pass_beam(p)       # "none" with a reason: never dropped silently
                 continue
             # A break that could still match must have started by t_cross - offset + window, and is closed
             # group_gap_s after its last edge. Wait for that, but never more than window + 5 s after the pass_end
@@ -350,6 +370,13 @@ class BeamService:
         self.pending_passes = still
 
     def _emit_pass_beam(self, p):
+        if p.get("t_cross") is None:
+            with self.lock:
+                self.assoc_counts["none"] += 1
+            self.emit(dict(type="pass_beam", pass_id=p.get("pass_id"), status="none", t_cross=None, n_candidates=0,
+                           candidates=[], window_s=self.assoc_window, offset_s=self.assoc_offset,
+                           reason="pass has no t_cross"))
+            return
         status, b, cands = associate_pass(p["t_cross"], self.recent_breaks, self.assoc_window, self.assoc_offset)
         ev = dict(type="pass_beam", pass_id=p["pass_id"], status=status, t_cross=p["t_cross"],
                   n_candidates=len(cands), candidates=[c["break_id"] for c in cands],
@@ -359,6 +386,8 @@ class BeamService:
             ev.update(t_beam=b["t_beam"], break_id=b["break_id"],
                       beam_minus_cross_s=round(b["t_beam"] - p["t_cross"], 4), break_also_matched_to=shared)
             self.break_passes.setdefault(b["break_id"], []).append(p["pass_id"])
+            while len(self.break_passes) > 2000:          # only recent breaks can still be matched
+                self.break_passes.popitem(last=False)
             with self.lock:
                 for lb in self.last_breaks:
                     if lb["break_id"] == b["break_id"]:
@@ -426,7 +455,7 @@ class BeamService:
                        association=dict(self.assoc_counts, window_s=self.assoc_window, offset_s=self.assoc_offset),
                        led=dict(self.led_stats, enabled=self.led.roi is not None, roi=self.led.roi,
                                 last_mean=None if self.led.last_mean is None else round(self.led.last_mean, 1)),
-                       opens=self.opens)
+                       opens=self.opens, queue_dropped=self.queue_dropped)
         out.update(self.grouper.status(now))
         return out
 
@@ -439,7 +468,12 @@ class BeamService:
         return self
 
     def stop(self, timeout=2.0):
-        """Stop both threads, write what is still queued, finish an open break, close the port."""
+        """Stop both threads, write what is still queued, finish an open break, close the port.
+
+        The final dispatch runs in THIS thread, so it must only run when the dispatcher thread has really ended
+        (two threads must never run dispatch_step at once). If a thread does not end within `timeout`, the port is
+        still closed (that also unblocks a reader stuck in a read) but the final dispatch is skipped, with a
+        warning."""
         self.halt.set()
         for t in self.threads:
             t.join(timeout)
@@ -447,6 +481,11 @@ class BeamService:
             self.source.close()
         except Exception:  # noqa: BLE001
             pass
+        still_running = [t.name for t in self.threads if t.is_alive()]
+        if still_running:
+            self._warn("beam: %s did not stop within %.0f s; the last queued beam events are not written" % (
+                ", ".join(still_running), timeout))
+            return
         self.dispatch_step(timeout=0)
         for rec in self.grouper.disconnect(self.clock.mono(), self.clock.wall()):
             self._on_record(rec)

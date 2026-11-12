@@ -177,6 +177,20 @@ def load_human_laps(dump_path):
         gt.SQL = saved
 
 
+def as_car_number(value):
+    """A car number as an int, or None when it is missing or not a number ("?", "12a", "", None)."""
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def numbers_agree(vision_number, human_car):
+    """True / False when both numbers are real numbers, None when either is missing or not numeric."""
+    a, b = as_car_number(vision_number), as_car_number(human_car)
+    return None if a is None or b is None else a == b
+
+
 def compare_human(rows, laps, video_minus_server=0.0, window_s=6.0):
     """Match human laps to fused crossings one-to-one (nearest first, within window_s) and fill the human columns.
     Laps outside the time span of the run are ignored. Returns the extra rows for unmatched human laps."""
@@ -196,7 +210,7 @@ def compare_human(rows, laps, video_minus_server=0.0, window_s=6.0):
         r, lap = rows[i], laps[j]
         r.update(human_car=lap["car"], human_lap=lap["lap"], t_human=lap["t_video"],
                  fused_minus_human_s=round(r["t_fused"] - lap["t_video"], 3),
-                 number_agrees=None if r.get("number") is None else int(r["number"]) == int(lap["car"]))
+                 number_agrees=numbers_agree(r.get("number"), lap["car"]))
     return [dict(kind="human_only", run=None, human_car=lap["car"], human_lap=lap["lap"], t_human=lap["t_video"],
                  t_fused=lap["t_video"]) for j, lap in enumerate(laps) if j not in used_l]
 

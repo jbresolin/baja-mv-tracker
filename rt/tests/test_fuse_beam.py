@@ -160,3 +160,14 @@ def test_command_line_prints_a_summary(run_file, tmp_path, capsys):
     out = capsys.readouterr().out
     assert "match 6, shared_break (side by side) 1, pass_no_break 1, break_no_pass 1" in out
     assert "5 clean matches" in out
+
+
+def test_non_numeric_numbers_never_crash_the_comparison():
+    # The vision number can be missing or odd ("?", "12a"); the human count could be too. The comparison must then
+    # say "unknown" (None), not crash the whole offline report.
+    assert fuse_beam.numbers_agree("12", 12) is True
+    assert fuse_beam.numbers_agree(12, "13") is False
+    assert fuse_beam.numbers_agree("?", 12) is None
+    assert fuse_beam.numbers_agree("12a", 12) is None
+    assert fuse_beam.numbers_agree(None, 12) is None
+    assert fuse_beam.numbers_agree(12, "") is None

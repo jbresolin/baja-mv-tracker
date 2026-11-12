@@ -489,3 +489,60 @@ def test_grouping_time_is_behind_now_by_the_guard(cfg):
     assert svc._grouping_time(now, now - 0.5) == pytest.approx(now - 0.5)
     # A reader silent for more than 1 s does not hold the grouping back.
     assert svc._grouping_time(now, now - 5.0) == pytest.approx(now - 0.02)
+
+
+# ------------------------------------------------------------------------------------------------ small rules
+def test_a_pass_without_t_cross_gets_pass_beam_none_not_silence(cfg):
+    # A pass_end without a crossing time cannot be matched, but it must still get its pass_beam answer ("none",
+    # with the reason), so every pass_end has exactly one pass_beam in the JSONL.
+    svc, events, clock = make_service(cfg, [])
+    run_for(svc, clock, 0.1)
+    svc.on_event(dict(type="pass_end", pass_id=7, t_cross=None))
+    run_for(svc, clock, 0.1)
+    (pb,) = of_type(events, "pass_beam")
+    assert pb["pass_id"] == 7 and pb["status"] == "none" and pb["reason"] == "pass has no t_cross"
+    assert svc.status()["association"]["none"] == 1
+
+
+def test_queue_is_bounded_and_drops_the_oldest(cfg):
+    # If the dispatcher ever stopped, the queue must not grow without limit for a whole race day: with
+    # queue_max = 5, putting 8 items keeps the newest 5 and counts 3 dropped.
+    svc, events, clock = make_service(cfg, [], queue_max=5)
+    for k in range(8):
+        svc._put(("number", k, str(k)))
+    assert svc.q.qsize() == 5
+    assert svc.status()["queue_dropped"] == 3
+    assert svc.q.get_nowait() == ("number", 3, "3")   # 0, 1, 2 were dropped (the oldest)
+
+
+def test_break_to_pass_memory_is_trimmed(cfg):
+    # break_passes remembers which passes matched which break; over a race day it must not grow forever.
+    svc, events, clock = make_service(cfg, [])
+    for k in range(2500):
+        svc.recent_breaks.clear()
+        svc.recent_breaks.append(dict(break_id=k, t_beam=float(k)))
+        svc._emit_pass_beam(dict(pass_id=k, t_cross=float(k)))
+    assert len(svc.break_passes) == 2000
+    assert 2499 in svc.break_passes and 0 not in svc.break_passes
+
+
+def test_stop_skips_the_final_dispatch_while_a_thread_is_still_alive(cfg):
+    # stop() writes what is still queued from the CALLING thread. If the dispatcher thread were still running,
+    # two threads would handle the queue at once. Here a fake "thread" that never ends: stop() must warn and
+    # leave the queue alone.
+    svc, events, clock = make_service(cfg, [])
+
+    class NeverEndingThread:
+        name = "beam-dispatch"
+
+        def join(self, timeout):
+            pass
+
+        def is_alive(self):
+            return True
+
+    svc.threads = [NeverEndingThread()]
+    svc._put(("number", 1, "12"))
+    svc.stop(timeout=0.01)
+    assert svc.q.qsize() == 1                          # not dispatched by stop()
+    assert any("did not stop" in e["msg"] for e in of_type(events, "warning"))

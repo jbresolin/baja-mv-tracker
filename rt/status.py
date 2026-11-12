@@ -197,6 +197,8 @@ def beam_warnings(beam):
     if beam.get("stuck"):
         out.append("beam STUCK for %.0f s (blocked or flickering): someone in the beam, misaligned, or wrong "
                    "polarity" % beam.get("stuck_for_s", 0))
+    if beam.get("queue_dropped"):
+        out.append("beam: %d queued items dropped (the beam dispatcher fell behind)" % beam["queue_dropped"])
     rate = (beam.get("poll") or {}).get("rate_hz")
     if beam.get("driver") == "modem-line" and rate is not None and rate < 200:
         out.append("beam poll rate only %.0f Hz (timing worse than 5 ms)" % rate)

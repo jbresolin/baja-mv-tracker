@@ -189,3 +189,27 @@ def test_break_ids_count_up():
     g = BreakGrouper(0.25)
     ids = [b["break_id"] for b in breaks_of(run(g, pulse(100.0) + pulse(101.0) + pulse(102.0), 103.0))]
     assert ids == [0, 1, 2]
+
+
+def test_status_reads_the_stuck_episode_once_so_a_concurrent_clear_cannot_crash_it():
+    # The status page runs in its own thread. While it builds the page, the dispatcher thread may clear the stuck
+    # episode (set `stuck` to None). If status() read `self.stuck` twice ("is it None?" then "since when?") the
+    # second read could get None and crash. Here a grouper whose `stuck` changes to None right after the first
+    # read imitates that unlucky timing: status() must still answer.
+    class VanishingStuckGrouper(BreakGrouper):
+        reads = 0
+
+        @property
+        def stuck(self):
+            VanishingStuckGrouper.reads += 1
+            # first read: a stuck episode since t=100; every later read: already cleared
+            return dict(since_mono=100.0) if VanishingStuckGrouper.reads == 1 else None
+
+        @stuck.setter
+        def stuck(self, value):
+            pass                     # BreakGrouper.__init__ sets it; ignored here
+
+    g = VanishingStuckGrouper()
+    VanishingStuckGrouper.reads = 0
+    assert g.status(130.0) == dict(stuck=True, stuck_for_s=30.0)
+    assert VanishingStuckGrouper.reads == 1
