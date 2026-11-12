@@ -396,3 +396,26 @@ def test_measured_preset_time_round_trips_through_the_bench():
     learned = PtzModel.from_dict(report["model"])
     assert learned.preset_settle_measured is True
     assert learned.preset_settle_s == pytest.approx(1.2, abs=0.15)  # the bench polls every 0.1 s
+
+
+# --- S6: the minimum smooth step ----------------------------------------------------------------------------------
+
+
+def test_a_smooth_camera_is_smooth_from_step_1():
+    # The simulator moves perfectly smoothly at every step. At step 1 it moves ~13 units/s, i.e. well under one
+    # unit between two polls, so the whole-unit positions read 0, 0, 1, 1, 1, 2... Judged by the spread of the
+    # interval rates alone that looks jerky (the bench used to report pan 3 / tilt 4 here). Judged against a
+    # straight line, every sample is within half a unit: smooth from step 1.
+    report, _ = run_on_sim(PtzModel(), BenchOptions(quick=True, skip=("latency", "absolute", "zoom", "repeatability")))
+    assert report["speed_table"]["method"] == "moving"
+    assert report["speed_table"]["pan_min_smooth_step"] == 1
+    assert report["speed_table"]["tilt_min_smooth_step"] == 1
+
+
+def test_stepped_motion_is_not_smooth_even_at_slow_speed():
+    # A camera that crawls in visible steps: holds still for 0.4 s, then jumps 5 units. Same average speed as a
+    # slow smooth move, but far off a straight line, and the interval rates are wildly uneven.
+    stepped = [(k * 0.05, 5 * int(k * 0.05 / 0.4)) for k in range(40)]
+    smooth = [(k * 0.05, round(12.5 * k * 0.05)) for k in range(40)]
+    assert ba.is_smooth(smooth) is True
+    assert ba.is_smooth(stepped) is False

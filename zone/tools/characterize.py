@@ -45,7 +45,6 @@ REPORT_SCHEMA = "zone.ptz.characterization/1"
 FEEDBACK_RATES_HZ = (5, 10, 20, 50)
 QUICK_STEPS_PAN = (1, 2, 3, 4, 6, 8, 12, 16, 20, 24)
 QUICK_STEPS_TILT = (1, 2, 3, 4, 6, 8, 12, 16, 20, 23)
-SMOOTH_CV_LIMIT = 0.35  # interval-rate std/mean below this counts as smooth
 SETTLE_STABLE_S = 0.3  # position unchanged this long = at rest
 FIXED_WAIT_S = 5.0  # wait used after a move when position can't be read
 STOP_ATTEMPTS = 3  # safe_stop sends each stop up to this many times until the camera ACKs it
@@ -503,7 +502,11 @@ class Characterizer:
             tail_rate = ba.fit_rate(tail)
             row[sign] = {
                 "rate": _r(rate, 2),
+                # Smooth = even interval rates, or every sample within 1 unit of a straight line. The second matters
+                # at slow speeds: whole-unit positions (0, 0, 1, 1, 2...) make even a perfect move look jerky by cv.
+                "smooth": ba.is_smooth(window),
                 "smoothness_cv": _r(ba.smoothness_cv(window)),
+                "fit_residual_max": _r(ba.fit_residual_max(window), 2),
                 "travel": (samples[-1][1] - samples[0][1]) if samples else None,
                 "hit_limit": bool(rate and tail_rate is not None and abs(tail_rate) < 0.5 * abs(rate)),
                 "samples": len(window),
@@ -551,7 +554,7 @@ class Characterizer:
                 rate = cell.get("rate")
                 if not rate:
                     ok = False
-                elif method == "moving" and (cell.get("smoothness_cv") is None or cell["smoothness_cv"] > SMOOTH_CV_LIMIT):
+                elif method == "moving" and cell.get("smooth") is not True:
                     ok = False
             if ok:
                 return int(step)
