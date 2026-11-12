@@ -137,7 +137,7 @@ report too.
 
 ```
 python -m zone.tools.detect_check --video wide.mp4 --zone zones/oct.json --passes 23      # AUTOPTZ-16
-python -m zone.tools.replay --video spotter.mp4 --zone zones/zone.json --report reports/ptz1/report.json
+python -m zone.tools.replay --video out/zone/spotter_<start>.mkv --zone zones/zone.json --report reports/ptz1/report.json
 python -m zone.tools.replay --tracks out/zone/replay_x/tracks.json --zone ... --set controller.k_pan=1.0
 ```
 
@@ -152,7 +152,7 @@ and `tracks.json` (re-run the control part alone with other settings).
 
 * `zone_<start>.jsonl`: one line per control cycle (grab time, tracks with s / v / lateral offset, director state,
   target pose, commanded steps, pan_now and its source), plus mode changes and events. `mono` + `wall` on every line.
-* `spotter_<start>.mp4` + `.frames.csv` (wall and monotonic grab time of every frame) + `.json`.
+* `spotter_<start>.mkv` (Matroska: readable after a crash) + `.frames.csv` (wall and monotonic grab time of every frame) + `.json`.
 * `ptz_<start>.mkv` + `.json` (the PTZ's own H.264, copied).
 
 Tests: no camera, no real time (fake clock, `SimulatedPtz`, synthetic cars in `zone/testing.py`).

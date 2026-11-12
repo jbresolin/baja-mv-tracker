@@ -1,7 +1,9 @@
 """Spotter recording, without opening the webcam twice: the frames the tracker already grabbed are piped to an
 ffmpeg encoder in a background thread.
 
-* The file name carries the wall-clock start time: `spotter_YYYYmmdd-HHMMSS.mp4`.
+* The file name carries the wall-clock start time: `spotter_YYYYmmdd-HHMMSS.mkv`. Matroska, like the PTZ recording,
+  because it stays readable up to the last written cluster when the process dies or the laptop loses power; an mp4
+  is unreadable until ffmpeg writes its index at the very end.
 * A sidecar `spotter_YYYYmmdd-HHMMSS.frames.csv` lists every written frame: index, grab wall time, grab monotonic
   time. That's what lines the video up with the control log, and what the replay harness reads (`--frames`).
 * The encoder never slows the tracker down: frames go through a bounded queue, and when it's full the frame is
@@ -29,7 +31,7 @@ class SpotterRecorder:
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.fps, self.size = float(fps), (int(size[0]), int(size[1]))
         base = "spotter_%s" % stamp(t_wall0)
-        self.path = self.out_dir / (base + ".mp4")
+        self.path = self.out_dir / (base + ".mkv")
         self.frames_path = self.out_dir / (base + ".frames.csv")
         self.meta_path = self.out_dir / (base + ".json")
         self.q = queue.Queue(maxsize=int(queue_size))
@@ -39,7 +41,7 @@ class SpotterRecorder:
         self.log = log
         w, h = self.size
         cmd = [ffmpeg, "-v", "error", "-nostdin", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", "%dx%d" % (w, h),
-               "-r", "%g" % self.fps, "-i", "-"] + list(codec_args) + [str(self.path)]
+               "-r", "%g" % self.fps, "-i", "-"] + list(codec_args) + ["-f", "matroska", str(self.path)]
         self.cmd = cmd
         self.meta_path.write_text(json.dumps(dict(start_wall=t_wall0, start_iso=dt.datetime.fromtimestamp(
             t_wall0).astimezone().isoformat(timespec="milliseconds"), fps=self.fps, size=list(self.size),

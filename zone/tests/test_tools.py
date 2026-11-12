@@ -130,3 +130,4 @@ def test_replay_finds_the_sidecar_next_to_the_video_by_itself(recording, tmp_pat
     replay.main(["--video", str(video), "--zone", str(recording / "zone.json"), "--detector", "blobs",
                  "--out", str(out2), "--no-frames"])
     assert json.loads((out2 / "tracks.json").read_text())["frames"][30][0] == pytest.approx(3.0)
+
