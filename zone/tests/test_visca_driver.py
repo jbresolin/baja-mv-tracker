@@ -331,6 +331,116 @@ def test_watchdog_thread_starts_and_stops():
     assert not ptz._watchdog.is_alive()
 
 
+# --- S2: a lost stop must not leave the camera moving ------------------------------------------------------------
+#
+# A stop is a single UDP datagram; the network can lose it. If nobody notices, the camera keeps turning. The driver
+# now keeps re-sending a stop that wasn't acknowledged, from the dead-man thread, for up to 2 seconds.
+# `camera.lose_next[payload] = N` makes the fake network lose the next N packets with that content.
+
+STOP = packets.pan_tilt_stop()
+
+
+def test_lost_ttl_stops_are_retried_until_the_camera_acks():
+    rig = make_rig()
+    rig.camera.lose_next[STOP] = 2  # the first two stop packets never arrive
+    rig.ptz.pan_tilt_velocity(8, 0, ttl=0.3)
+    rig.clock.advance(0.4)  # the TTL has run out
+    rig.ptz.check_deadlines()  # dead-man stop #1: lost (the driver waits its 200 ms timeout for the ACK)
+    assert rig.sim.is_moving()
+    rig.ptz.check_deadlines()  # the next watchdog tick re-sends it: lost again
+    rig.ptz.check_deadlines()  # third try arrives and is ACKed
+    rig.clock.advance(1.0)
+    assert not rig.sim.is_moving()
+    assert rig.camera.lost == [STOP, STOP]
+    assert rig.ptz.stats["ttl_stops"] == 1 and rig.ptz.stats["stop_retries"] == 2
+    rig.ptz.check_deadlines()  # once ACKed, nothing more is sent
+    assert stops_sent(rig) == 3
+
+
+def test_a_lost_explicit_stop_is_retried_by_the_dead_man():
+    rig = make_rig()
+    rig.ptz.pan_tilt_velocity(8, 0)  # no TTL at all
+    rig.camera.lose_next[STOP] = 1
+    assert rig.ptz.stop().status == TIMEOUT  # our own stop got lost...
+    rig.ptz.check_deadlines()  # ...so the next watchdog tick sends it again
+    rig.clock.advance(1.0)
+    assert not rig.sim.is_moving()
+    assert rig.ptz.stats["stop_retries"] == 1
+
+
+def test_a_lost_zoom_stop_is_retried_too():
+    rig = make_rig()
+    rig.ptz.zoom_velocity(3)
+    rig.camera.lose_next[packets.zoom_stop()] = 1
+    assert rig.ptz.zoom_stop().status == TIMEOUT
+    rig.ptz.check_deadlines()
+    rig.clock.advance(1.0)
+    assert not rig.sim.is_moving()
+
+
+def test_stop_retries_give_up_after_two_seconds():
+    rig = make_rig()
+    rig.camera.lose_next[STOP] = 1000  # the network loses every stop
+    rig.ptz.pan_tilt_velocity(8, 0, ttl=0.1)
+    rig.clock.advance(0.2)
+    for _ in range(30):  # 30 watchdog ticks, each spending a 200 ms timeout: 6 s of fake time
+        rig.ptz.check_deadlines()
+    # It tried for 2 s (about 10 attempts of 200 ms each), then gave up instead of hogging the link forever.
+    assert 8 <= stops_sent(rig) <= 12
+    assert rig.ptz.stats["stop_failures"] == 1
+
+
+def test_a_new_command_cancels_the_stop_retries():
+    rig = make_rig()
+    rig.ptz.pan_tilt_velocity(8, 0)
+    rig.camera.lose_next[STOP] = 1
+    rig.ptz.stop()  # lost
+    rig.ptz.pan_tilt_velocity(-5, 0, ttl=1.0)  # the controller moves on: this command wins
+    rig.ptz.check_deadlines()
+    assert stops_sent(rig) == 1  # only the lost one: no retry stopped the new motion
+    rig.clock.advance(0.5)
+    assert rig.sim.is_moving()
+
+
+def test_atexit_handler_stops_the_camera(monkeypatch):
+    # Python runs functions registered with `atexit` when the program ends normally (also after Ctrl+C).
+    # We catch the registration instead of really exiting, then call the handler by hand.
+    registered, unregistered = [], []
+    monkeypatch.setattr("zone.ptz.visca.atexit.register", registered.append)
+    monkeypatch.setattr("zone.ptz.visca.atexit.unregister", unregistered.append)
+    rig = make_rig()
+    assert registered == [rig.ptz._stop_at_exit]
+    rig.ptz.pan_tilt_velocity(8, 0)
+    rig.ptz.zoom_velocity(2)
+    registered[0]()  # "the program is exiting"
+    assert sent_payloads(rig)[-2:] == [STOP, packets.zoom_stop()]
+    rig.clock.advance(1.0)
+    assert not rig.sim.is_moving()
+    rig.ptz.close()  # a clean close removes the handler, and the handler does nothing after close
+    assert unregistered == [rig.ptz._stop_at_exit]
+    before = len(rig.transport.sent)
+    registered[0]()
+    assert len(rig.transport.sent) == before
+
+
+def test_the_real_watchdog_thread_fires_the_dead_man():
+    # Every other dead-man test calls check_deadlines() by hand. Here the driver's own background thread does it:
+    # we only move the fake clock past the TTL, then give the thread a moment (real time, a few ms) to notice.
+    import time
+    clock = FakeClock()
+    sim = SimulatedPtz(PtzModel(), clock)
+    ptz = ViscaPtz("camera", clock=clock, transport=FakeTransport(FakeViscaCamera(sim), clock), watchdog=True)
+    try:
+        ptz.pan_tilt_velocity(8, 0, ttl=0.3)
+        clock.advance(0.5)
+        give_up_at = time.monotonic() + 2.0  # generous for slow CI machines; normally done in ~10 ms
+        while ptz.stats["ttl_stops"] == 0 and time.monotonic() < give_up_at:
+            time.sleep(0.002)
+        assert ptz.stats["ttl_stops"] == 1
+    finally:
+        ptz.close()
+
+
 # --- logging ----------------------------------------------------------------------------------------------------
 
 

@@ -20,6 +20,13 @@ The camera itself has no dead-man: if the controller crashes after "pan right", 
 `pan_tilt_velocity(..., ttl=0.3)` sets a deadline: if no newer pan/tilt command arrives within 0.3 s, a background
 thread sends `stop`. The controller keeps the motion alive by repeating its command, which it does every cycle anyway.
 
+A stop can get lost (it is one UDP datagram). So a stop that the camera doesn't acknowledge, whether the dead-man's
+or one the caller sent with `stop()` / `zoom_stop()`, stays "armed": the dead-man thread sends it again on every
+tick until the camera ACKs it, for up to `STOP_RETRY_WINDOW_S` (2 s), then gives up and logs it. A newer command for
+that axis cancels the retries. When the Python process exits normally (including Ctrl+C) an `atexit` handler sends
+stop and zoom stop as a last resort. A process that is killed (Task Manager, closing the console window, a power
+cut) runs no Python code at all, so nothing can stop the camera then.
+
 Logging
 -------
 With `log_path`, every datagram sent and received is appended to a JSONL file with both clocks: `mono` (monotonic,
@@ -27,6 +34,7 @@ for durations) and `wall` (Unix time, to line up with video recordings). The ben
 """
 from __future__ import annotations
 
+import atexit
 import contextlib
 import json
 import socket
@@ -42,6 +50,7 @@ from zone.ptz.interface import ACKED, ANSWERED, COMPLETED, ERROR, TIMEOUT, Comma
 DEFAULT_TIMEOUT = 0.2
 WATCHDOG_PERIOD = 0.01  # how often the dead-man thread checks deadlines (seconds, real time)
 RECENT_SEQUENCES = 64  # how many sent sequence numbers we remember, to recognise late replies
+STOP_RETRY_WINDOW_S = 2.0  # keep re-sending an unacknowledged stop for this long, then give up (and log it)
 
 
 class Transport(Protocol):
@@ -135,13 +144,20 @@ class ViscaPtz:
         # Dead-man deadlines (clock.monotonic() values), None when nothing is armed.
         self._pan_tilt_deadline: float | None = None
         self._zoom_deadline: float | None = None
+        # While a stop is being retried (it wasn't ACKed), the time we give up retrying it. None: not retrying.
+        self._pan_tilt_stop_retry_until: float | None = None
+        self._zoom_stop_retry_until: float | None = None
         self._closed = threading.Event()
         # What the driver noticed about the camera. The bench report copies these.
-        self.stats = {"sent": 0, "timeouts": 0, "errors": 0, "unmatched_replies": 0, "ttl_stops": 0}
+        # stop_retries: stops sent again because the previous one wasn't ACKed; stop_failures: gave up after 2 s.
+        self.stats = {"sent": 0, "timeouts": 0, "errors": 0, "unmatched_replies": 0, "ttl_stops": 0,
+                      "stop_retries": 0, "stop_failures": 0}
         self.last_inquiry: CommandResult | None = None
         self.sequence_reset_status: str | None = None
         if reset_sequence:
             self.reset_sequence()
+        # Last resort on a normal exit (end of script, an exception, Ctrl+C): stop the camera. close() removes it.
+        atexit.register(self._stop_at_exit)
         self._watchdog: threading.Thread | None = None
         if watchdog:
             self._watchdog = threading.Thread(target=self._watchdog_loop, name="visca-deadman", daemon=True)
@@ -150,18 +166,22 @@ class ViscaPtz:
     # --- the Ptz interface ---------------------------------------------------------------------------------------
 
     def pan_tilt_velocity(self, pan_step: int, tilt_step: int, ttl: float | None = None) -> CommandResult:
-        moving = pan_step != 0 or tilt_step != 0
-        return self.command(packets.pan_tilt_drive(pan_step, tilt_step), what="pan_tilt_velocity",
-                            pan_tilt_ttl=ttl if moving else None)
+        if pan_step == 0 and tilt_step == 0:
+            return self.stop()  # the same packet; going through stop() gives it the retries
+        return self.command(packets.pan_tilt_drive(pan_step, tilt_step), what="pan_tilt_velocity", pan_tilt_ttl=ttl)
 
     def stop(self) -> CommandResult:
-        return self.command(packets.pan_tilt_stop(), what="stop", pan_tilt_ttl=None)
+        """Stop pan and tilt. If the camera doesn't ACK it, the dead-man thread keeps re-sending it (up to 2 s)."""
+        return self._stop_command(packets.pan_tilt_stop(), "stop", "pan_tilt")
 
     def zoom_velocity(self, step: int, ttl: float | None = None) -> CommandResult:
-        return self.command(packets.zoom_drive(step), what="zoom_velocity", zoom_ttl=ttl if step != 0 else None)
+        if step == 0:
+            return self.zoom_stop()
+        return self.command(packets.zoom_drive(step), what="zoom_velocity", zoom_ttl=ttl)
 
     def zoom_stop(self) -> CommandResult:
-        return self.command(packets.zoom_stop(), what="zoom_stop", zoom_ttl=None)
+        """Stop zooming, with the same retries as `stop()`."""
+        return self._stop_command(packets.zoom_stop(), "zoom_stop", "zoom")
 
     def zoom_direct(self, position: int) -> CommandResult:
         return self.command(packets.zoom_direct(position), what="zoom_direct", zoom_ttl=None)
@@ -193,6 +213,7 @@ class ViscaPtz:
 
     def close(self) -> None:
         """Stop the dead-man thread and close the socket and the log. Does not move the camera."""
+        atexit.unregister(self._stop_at_exit)
         self._closed.set()
         if self._watchdog is not None:
             self._watchdog.join(timeout=1.0)
@@ -280,12 +301,33 @@ class ViscaPtz:
         send, so the dead-man thread can never slip an old stop in after a newer velocity command.
         """
         def arm(now: float) -> None:
+            # A newer command for an axis replaces whatever was pending for it, including a stop being retried.
             if pan_tilt_ttl is not ViscaPtz._KEEP:
                 self._pan_tilt_deadline = None if pan_tilt_ttl is None else now + float(pan_tilt_ttl)  # type: ignore[arg-type]
+                self._pan_tilt_stop_retry_until = None
             if zoom_ttl is not ViscaPtz._KEEP:
                 self._zoom_deadline = None if zoom_ttl is None else now + float(zoom_ttl)  # type: ignore[arg-type]
+                self._zoom_stop_retry_until = None
 
         return self._request(payload, packets.PAYLOAD_COMMAND, None, what, wait_for_completion, arm)
+
+    def _stop_command(self, payload: bytes, what: str, axis: str) -> CommandResult:
+        """Send a stop for `axis` ("pan_tilt" or "zoom"). If it isn't ACKed, leave that axis's dead-man deadline
+        expired so the dead-man thread re-sends the stop on its next tick (see `check_deadlines`).
+
+        Both steps happen under the request lock, so a velocity command can't slip in between and be stopped."""
+        def arm(now: float) -> None:
+            setattr(self, f"_{axis}_deadline", None)
+            setattr(self, f"_{axis}_stop_retry_until", None)
+
+        def after(result: CommandResult) -> None:
+            if not result.ok and not self._closed.is_set():
+                sent_at = result.sent_at if result.sent_at is not None else self.clock.monotonic()
+                setattr(self, f"_{axis}_deadline", sent_at)  # already expired: retry on the next tick
+                setattr(self, f"_{axis}_stop_retry_until", sent_at + STOP_RETRY_WINDOW_S)
+                self._log_event("stop_not_acked", axis=axis, status=result.status)
+
+        return self._request(payload, packets.PAYLOAD_COMMAND, None, what, False, arm, after)
 
     def inquire(
         self, payload: bytes, parser: Callable[[bytes], object] | None, what: str = "inquiry"
@@ -303,7 +345,9 @@ class ViscaPtz:
         what: str,
         wait_for_completion: bool,
         arm: Callable[[float], None] | None,
+        after: Callable[[CommandResult], None] | None = None,
     ) -> CommandResult:
+        """Send one request and wait for its reply, holding the lock. `after(result)` runs while still holding it."""
         started = self.clock.monotonic()
         # One deadline for the whole call. Everything below waits only for what is left of it, so the caller is
         # never blocked longer than `timeout` (before, lock wait + sequence reset + reply wait could add up to 3x).
@@ -313,7 +357,10 @@ class ViscaPtz:
             self.stats["timeouts"] += 1
             return CommandResult(TIMEOUT, sent_at=started)
         try:
-            return self._exchange_locked(payload, payload_type, parser, what, wait_for_completion, arm, deadline)
+            result = self._exchange_locked(payload, payload_type, parser, what, wait_for_completion, arm, deadline)
+            if after is not None:
+                after(result)
+            return result
         finally:
             self._lock.release()
 
@@ -421,7 +468,8 @@ class ViscaPtz:
     # --- the dead-man switch -------------------------------------------------------------------------------------
 
     def check_deadlines(self) -> None:
-        """Send stop / zoom stop for every TTL that has run out. The watchdog thread calls this ~100x a second.
+        """Send stop / zoom stop for every TTL that has run out, and re-send stops that weren't ACKed. The watchdog
+        thread calls this ~100x a second.
 
         The check and the stop happen under the request lock, so a velocity command that renews the deadline is
         either entirely before (and the deadline is no longer expired) or entirely after (and moves the camera
@@ -430,19 +478,46 @@ class ViscaPtz:
         if not self._lock.acquire(timeout=self.timeout):
             return
         try:
-            now = self.clock.monotonic()
-            if self._pan_tilt_deadline is not None and now >= self._pan_tilt_deadline:
-                self._pan_tilt_deadline = None
-                self.stats["ttl_stops"] += 1
-                self._log_event("ttl_stop", axis="pan_tilt")
-                self._exchange_locked(packets.pan_tilt_stop(), packets.PAYLOAD_COMMAND, None, "ttl_stop", False, None)
-            if self._zoom_deadline is not None and now >= self._zoom_deadline:
-                self._zoom_deadline = None
-                self.stats["ttl_stops"] += 1
-                self._log_event("ttl_stop", axis="zoom")
-                self._exchange_locked(packets.zoom_stop(), packets.PAYLOAD_COMMAND, None, "ttl_zoom_stop", False, None)
+            self._expire_locked("pan_tilt", packets.pan_tilt_stop(), "ttl_stop")
+            self._expire_locked("zoom", packets.zoom_stop(), "ttl_zoom_stop")
         finally:
             self._lock.release()
+
+    def _expire_locked(self, axis: str, stop_payload: bytes, what: str) -> None:
+        """If `axis`'s deadline has passed, send its stop. The deadline stays armed (so the next tick sends the stop
+        again) until the camera ACKs it, or until STOP_RETRY_WINDOW_S after the first attempt. The caller holds the
+        lock."""
+        deadline = getattr(self, f"_{axis}_deadline")
+        now = self.clock.monotonic()
+        if deadline is None or now < deadline:
+            return
+        retry_until = getattr(self, f"_{axis}_stop_retry_until")
+        if retry_until is None:
+            # The TTL ran out just now: the first dead-man stop.
+            self.stats["ttl_stops"] += 1
+            self._log_event("ttl_stop", axis=axis)
+            retry_until = now + STOP_RETRY_WINDOW_S
+            setattr(self, f"_{axis}_stop_retry_until", retry_until)
+        else:
+            self.stats["stop_retries"] += 1
+            self._log_event("stop_retry", axis=axis)
+        result = self._exchange_locked(stop_payload, packets.PAYLOAD_COMMAND, None, what, False, None)
+        if result.ok:
+            setattr(self, f"_{axis}_deadline", None)
+            setattr(self, f"_{axis}_stop_retry_until", None)
+        elif self.clock.monotonic() >= retry_until:
+            setattr(self, f"_{axis}_deadline", None)
+            setattr(self, f"_{axis}_stop_retry_until", None)
+            self.stats["stop_failures"] += 1
+            self._log_event("stop_gave_up", axis=axis, seconds=STOP_RETRY_WINDOW_S)
+
+    def _stop_at_exit(self) -> None:
+        """Registered with `atexit`: stop pan/tilt and zoom when Python exits without calling close()."""
+        if self._closed.is_set():
+            return
+        for stop in (self.stop, self.zoom_stop):
+            with contextlib.suppress(Exception):
+                stop()
 
     def _watchdog_loop(self) -> None:
         while not self._closed.wait(WATCHDOG_PERIOD):

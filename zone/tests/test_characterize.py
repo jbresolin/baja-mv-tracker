@@ -9,6 +9,7 @@ import json
 import pytest
 
 from zone.clock import FakeClock
+from zone.ptz import visca_packets as packets
 from zone.ptz.fake_camera import FakeTransport, FakeViscaCamera
 from zone.ptz.sim import PtzModel, SimulatedPtz
 from zone.ptz.visca import ViscaPtz
@@ -330,3 +331,22 @@ def test_a_camera_refreshing_at_20_hz_passes_at_20_but_not_at_50():
     assert report["feedback"]["rates"]["50"]["ok"] is False
     assert report["feedback"]["max_rate_hz"] == 20.0
     assert report["verdict"]["branch"] == "A"
+
+
+# --- S2: the bench retries its stops -------------------------------------------------------------------------------
+
+
+def test_safe_stop_retries_a_lost_stop():
+    # The network loses the first two stop packets. The bench's safe_stop tries up to 3 times, so the third gets
+    # through and the camera stops, even without the driver's dead-man thread (switched off in these tests).
+    clock = FakeClock()
+    sim = SimulatedPtz(PtzModel(), clock)
+    camera = FakeViscaCamera(sim)
+    ptz = ViscaPtz("fake", clock=clock, transport=FakeTransport(camera, clock), watchdog=False)
+    bench = Characterizer(ptz, clock, ScriptedUI(), BenchOptions(quick=True))
+    ptz.pan_tilt_velocity(10, 0)
+    camera.lose_next[packets.pan_tilt_stop()] = 2
+    bench.safe_stop()
+    clock.advance(1.0)
+    assert len(camera.lost) == 2
+    assert not sim.is_moving()

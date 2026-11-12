@@ -47,6 +47,7 @@ QUICK_STEPS_TILT = (1, 2, 3, 4, 6, 8, 12, 16, 20, 23)
 SMOOTH_CV_LIMIT = 0.35  # interval-rate std/mean below this counts as smooth
 SETTLE_STABLE_S = 0.3  # position unchanged this long = at rest
 FIXED_WAIT_S = 5.0  # wait used after a move when position can't be read
+STOP_ATTEMPTS = 3  # safe_stop sends each stop up to this many times until the camera ACKs it
 EPSILON_S = 1e-6  # times this close count as equal (float sums like 0.1 + 0.2 are never exact)
 
 
@@ -189,11 +190,17 @@ class Characterizer:
         (self.out_dir / "report.json").write_text(json.dumps(self.report, indent=2), encoding="utf-8")
 
     def safe_stop(self) -> None:
+        """Stop pan/tilt and zoom, trying each up to STOP_ATTEMPTS times until the camera accepts it. Never raises.
+
+        (The driver also keeps re-sending an unacknowledged stop from its dead-man thread; this is belt and braces
+        for the moments that matter most: the end of a run, a failed section, Ctrl+C.)"""
         for action in (self.ptz.stop, self.ptz.zoom_stop):
-            try:
-                action()
-            except Exception:  # noqa: BLE001 - stopping must not raise
-                pass
+            for _ in range(STOP_ATTEMPTS):
+                try:
+                    if action().ok:
+                        break
+                except Exception:  # noqa: BLE001 - stopping must not raise
+                    pass
 
     def section(self, name: str, fn: Callable[[], dict[str, Any]]) -> None:
         if name in self.o.skip:

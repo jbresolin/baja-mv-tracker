@@ -28,6 +28,10 @@ python -m zone.tools.characterize --ip 192.168.1.50 --out reports/smtav-a/
   asks for two marks a known angle apart to get units per degree. Type nothing to skip, or pass
   `--pan-units-per-degree` if the camera documents it.
 - `--skip zoom,units` skips sections. Ctrl+C stops the camera and keeps what was measured.
+- **Stopping.** Ctrl+C stops the camera and keeps what was measured. A stop the camera doesn't acknowledge is
+  re-sent for up to 2 s, and on any normal exit the driver sends stop + zoom stop once more. But a process that is
+  **killed** (Task Manager, closing the console window, `kill -9`, a power cut) runs no code at all and **cannot
+  stop the camera**: if that happens mid-move, stop it with the remote, the web UI or a preset.
 - Output: `report.json` (everything, plus a `model` section the simulator loads with `PtzModel.from_report`),
   `summary.txt` (ends with the Branch A/B verdict), `visca_log.jsonl` (every datagram, monotonic and wall clock).
 
