@@ -222,3 +222,20 @@ def test_teach_mode_ends_with_auto_and_parado_and_cannot_start_in_auto(tmp_path)
     client.post("/api/mode", json={"mode": "STOPPED"})       # pressing PARADO also ends it
     assert app.teach_mode is False
     assert client.get("/api/state").json()["teach"]["teach_mode"] is False
+
+
+def test_page_asks_for_the_zoom_when_the_camera_cant_tell_it(tmp_path):
+    # a camera without zoom inquiry: the page gets a flag to show its "type the zoom" field, and a keyframe sent
+    # without a zoom is refused (409) instead of being stored with a made-up zoom
+    cfg = C.load(None, ["ptz.driver=sim"])
+    clock = FakeClock(0.0)
+    ptz = SimulatedPtz(PtzModel(zoom_inquiry_mode="never"), clock)
+    app = ZoneApp(cfg, C.build(cfg), ptz, clock, Zone(), tmp_path / "zone.json", tmp_path / "out", log=lambda m: None)
+    client = TestClient(create_web(app))
+    r = client.post("/api/teach/point", json={"x": 300, "y": 500, "keyframe": True})
+    assert r.status_code == 409 and "zoom" in r.json()["detail"]
+    assert client.get("/api/state").json()["teach"]["zoom_unknown"] is True
+    r = client.post("/api/teach/point", json={"x": 300, "y": 500, "keyframe": True, "zoom": 2500})
+    assert r.json()["result"]["keyframe"]["zoom"] == 2500
+    assert client.post("/api/teach/keyframe_zoom", json={"index": 0, "zoom": 2700}).json()["ok"]
+    assert app.teach.zone.points[0].keyframe.zoom == 2700

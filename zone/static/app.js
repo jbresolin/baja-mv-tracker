@@ -41,7 +41,7 @@ $("#frame").addEventListener("click", async (ev) => {
     if (S.teach.selected === null || S.teach.selected === undefined) { msg("selecione um ponto na lista primeiro"); return; }
     await post("/api/teach/move", { index: S.teach.selected, x, y });
   } else {
-    const r = await post("/api/teach/point", { x, y, keyframe: clickMode === "keyframe" });
+    const r = await post("/api/teach/point", { x, y, keyframe: clickMode === "keyframe", zoom: typedZoom() });
     if (r && clickMode === "keyframe") msg("keyframe gravado no preset " + r.result.keyframe.preset);
   }
   setClickMode(null);
@@ -131,8 +131,14 @@ $("#save").addEventListener("click", async () => {
 
 async function act(url, index, confirmText) {
   if (confirmText && !confirm(confirmText)) return;
-  await post(url, { index });
+  await post(url, { index, zoom: typedZoom() });
   poll();
+}
+
+// cameras without a zoom inquiry: the operator types the zoom of each keyframe (null = not typed)
+function typedZoom() {
+  const v = $("#kfZoom").value;
+  return S && S.teach.zoom_unknown && v !== "" ? +v : null;
 }
 
 function renderPoints(z, t) {
@@ -157,6 +163,12 @@ function renderPoints(z, t) {
       add("re-ensinar", () => act("/api/teach/reteach", p.i, "Gravar o enquadramento atual neste keyframe?"),
           "gravar o enquadramento atual");
       add("→caminho", () => act("/api/teach/unkeyframe", p.i), "virar ponto de caminho");
+      if (t.zoom_unknown || (kf.pose_source || "").includes("zoom_manual")) {
+        add("zoom", async () => {
+          const v = prompt(`Zoom do keyframe P${kf.preset} (${t.zoom_limits[0]}..${t.zoom_limits[1]})`, kf.zoom);
+          if (v !== null && v !== "") { await post("/api/teach/keyframe_zoom", { index: p.i, zoom: +v }); poll(); }
+        }, "digitar o zoom deste keyframe");
+      }
     } else {
       add("→keyframe", () => act("/api/teach/make_keyframe", p.i, "Usar o enquadramento atual neste ponto?"),
           "usar o enquadramento atual");
@@ -203,6 +215,8 @@ function render(s) {
   const tm = $("#teachMode");
   tm.textContent = "Modo ensino: " + (t.teach_mode ? "LIGADO" : "desligado");
   tm.classList.toggle("on", t.teach_mode);
+  $("#zoomWarn").style.display = t.zoom_unknown ? "flex" : "none";
+  $("#kfZoom").min = t.zoom_limits[0]; $("#kfZoom").max = t.zoom_limits[1];
   renderPoints(z, t);
 
   const h = s.health;
@@ -246,7 +260,7 @@ async function pollPose() {
     try {
       const r = await fetch("/api/teach/pose");
       const j = await r.json();
-      $("#poseNow").textContent = j.result ? `pan ${j.result[0]} · tilt ${j.result[1]} · zoom ${j.result[2]}` : "desconhecida";
+      $("#poseNow").textContent = j.result ? `pan ${j.result[0]} · tilt ${j.result[1]} · zoom ${j.result[2] === null ? "?" : j.result[2]}` : "desconhecida";
     } catch (e) { /* ignore */ }
   }
   setTimeout(pollPose, 1000);

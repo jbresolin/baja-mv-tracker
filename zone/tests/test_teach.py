@@ -120,11 +120,33 @@ def test_keyframe_fails_cleanly_when_the_pose_is_unknown():
     assert s.zone.points == []                          # nothing half-added
 
 
-def test_zoom_without_inquiry_is_marked_approximate():
+def test_zoom_without_inquiry_is_asked_for_never_guessed():
+    # Some cameras answer the pan/tilt inquiry but not the zoom one. The keyframe's zoom used to be stored as 0
+    # without a word (0 = fully wide: the controller would then zoom all the way out at that keyframe). Now the
+    # keyframe is refused until the operator types a zoom on the page, and the typed value is recorded as such.
     sim, clock = rig(zoom_inquiry_mode="never")
+    src = InquirySource(sim, clock)
+    s = TeachSession(Zone(), sim, src)
+    with pytest.raises(TeachError, match="zoom"):
+        s.add_point(1, 2, keyframe=True)                 # no zoom typed: refused...
+    assert s.zone.points == []                           # ...and nothing half-added
+    assert src.zoom_readable is False                    # the page shows its "type the zoom" warning from this
+    p = s.add_point(1, 2, keyframe=True, zoom=3000)      # with the operator's zoom: accepted
+    assert p.keyframe.zoom == 3000 and p.keyframe.pose_source == "inquiry+zoom_manual"
+    # it can be corrected later without re-teaching the framing
+    s.set_keyframe_zoom(0, "3500")
+    assert s.zone.points[0].keyframe.zoom == 3500
+    with pytest.raises(TeachError):
+        s.set_keyframe_zoom(0, "muito")                  # not a number: refused, value unchanged
+    assert s.zone.points[0].keyframe.zoom == 3500
+
+
+def test_a_camera_that_reads_its_zoom_ignores_a_typed_one():
+    sim, clock = rig()                                   # zoom inquiry works
     s = TeachSession(Zone(), sim, InquirySource(sim, clock))
-    p = s.add_point(1, 2, keyframe=True)
-    assert p.keyframe.approximate and p.keyframe.zoom == 0
+    p = s.add_point(1, 2, keyframe=True, zoom=9999)
+    assert p.keyframe.zoom == sim.true_zoom() != 9999   # the camera's own value wins
+    assert p.keyframe.pose_source == "inquiry"
 
 
 # ------------------------------------------------------------------------------------------------ pose sources

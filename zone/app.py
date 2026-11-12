@@ -294,7 +294,9 @@ class ZoneApp:
                        nudge_units=self.cfg["teach"]["nudge_units"],
                        zoom_nudge_units=self.cfg["teach"]["zoom_nudge_units"],
                        jog_zoom_speed=self.cfg["teach"]["jog_zoom_speed"], selected=self.selected,
-                       allowed=self.runtime.director.mode != D.AUTO, teach_mode=self.teach_mode),
+                       allowed=self.runtime.director.mode != D.AUTO, teach_mode=self.teach_mode,
+                       zoom_unknown=getattr(self.pose_source, "zoom_readable", True) is False,
+                       zoom_limits=list(self.settings.report.model.zoom_limits)),
             frame=dict(size=list(fr.img.shape[1::-1]) if fr is not None and fr.img is not None else None,
                        age_s=round(self.clock.monotonic() - self.last_frame_mono, 1)),
             health=dict(self.health, fps=snap["fps"], dropped=self.source.dropped if self.source else 0,
@@ -460,7 +462,7 @@ def create_web(zapp: ZoneApp):
     def add_point(body: dict = Body(...)):
         def go():
             pt = zapp.teach.add_point(float(body["x"]), float(body["y"]), bool(body.get("keyframe")),
-                                      body.get("insert_at"))
+                                      body.get("insert_at"), zoom=body.get("zoom"))
             return pt.to_dict()
         return guard(go, teach=True)
 
@@ -479,7 +481,7 @@ def create_web(zapp: ZoneApp):
 
     @web.post("/api/teach/make_keyframe")
     def make_keyframe(body: dict = Body(...)):
-        return guard(lambda: zapp.teach.make_keyframe(int(body["index"])), teach=True)
+        return guard(lambda: zapp.teach.make_keyframe(int(body["index"]), body.get("zoom")), teach=True)
 
     @web.post("/api/teach/unkeyframe")
     def unkeyframe(body: dict = Body(...)):
@@ -487,7 +489,11 @@ def create_web(zapp: ZoneApp):
 
     @web.post("/api/teach/reteach")
     def reteach(body: dict = Body(...)):
-        return guard(lambda: zapp.teach.reteach(int(body["index"])), teach=True)
+        return guard(lambda: zapp.teach.reteach(int(body["index"]), body.get("zoom")), teach=True)
+
+    @web.post("/api/teach/keyframe_zoom")
+    def keyframe_zoom(body: dict = Body(...)):
+        return guard(lambda: zapp.teach.set_keyframe_zoom(int(body["index"]), body["zoom"]), teach=True)
 
     @web.post("/api/teach/goto")
     def goto(body: dict = Body(...)):

@@ -78,6 +78,10 @@
         <button id="addKf" data-click="keyframe">Adicionar keyframe</button>
         <button id="movePt" data-click="move">Mover ponto</button>
       </div>
+      <div class="row" id="zoomWarn" style="display:none;color:var(--amber)">
+        Esta PTZ não informa o zoom: digite o zoom de cada keyframe antes de gravá-lo.
+        <label>zoom <input id="kfZoom" type="number" min="0" step="100"></label>
+      </div>
       <div class="row">
         <label>Corredor (px, meia largura) <input id="corridor" type="number" min="5" max="1000" step="5"></label>
         <button id="setCorridor">Aplicar</button>

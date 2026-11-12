@@ -72,16 +72,17 @@ class InquirySource(PoseSource):
     def __init__(self, ptz, clock, ttl_s=0.3):
         super().__init__(ptz, clock, ttl_s)
         self.approximate = False
+        self.zoom_readable = None        # unknown until the first read; False -> the page asks for the zoom
 
     def read(self):
+        """-> (pan, tilt, zoom), with zoom None when the camera doesn't answer the zoom inquiry (some don't). The
+        teach session then asks the operator for the zoom instead of silently storing a made-up value."""
         pt = self.ptz.inquire_pan_tilt()
         if pt is None:
             return None
         z = self.ptz.inquire_zoom()
-        # zoom inquiry unsupported: keep the pan/tilt (what matters most) with zoom 0, and mark it approximate so
-        # the operator knows the zoom of this keyframe wasn't read
-        self.approximate = z is None
-        return int(pt[0]), int(pt[1]), int(z) if z is not None else 0
+        self.zoom_readable = z is not None
+        return int(pt[0]), int(pt[1]), int(z) if z is not None else None
 
 
 class CommandedSource(PoseSource):
@@ -224,19 +225,29 @@ class TeachSession:
             raise TeachError("ponto %s não existe" % i)
         return int(i)
 
-    def _capture_keyframe(self, preset):
+    def _capture_keyframe(self, preset, zoom=None):
+        """Read the current pose and store it in `preset`. `zoom`: the operator's zoom value, used only when the
+        camera can't tell its zoom (no zoom inquiry); then it is required, never guessed."""
         pose = self.source.read()
         if pose is None:
             raise TeachError("não consegui ler a posição da PTZ (modo %s)" % self.source.name)
+        pan, tilt, z = pose
+        how = self.source.name
+        if z is None:
+            if zoom is None or str(zoom).strip() == "":
+                raise TeachError("esta PTZ não informa o zoom: digite o zoom deste keyframe no campo 'zoom' e tente "
+                                 "de novo")
+            z = _zoom_value(zoom)
+            how += "+zoom_manual"
         r = self.ptz.preset_store(int(preset))
         if r is not None and not getattr(r, "ok", True):
             raise TeachError("a PTZ não confirmou a gravação do preset %d" % preset)
-        return Keyframe(pose[0], pose[1], pose[2], int(preset), self.source.approximate, self.source.name)
+        return Keyframe(pan, tilt, z, int(preset), self.source.approximate, how)
 
-    def add_point(self, x, y, keyframe=False, insert_at=None):
+    def add_point(self, x, y, keyframe=False, insert_at=None, zoom=None):
         """Add a path point (or a keyframe at the current PTZ framing). Appended at the end unless insert_at."""
         with self.lock:
-            kf = self._capture_keyframe(self.zone.next_free_preset(self.preset_base)) if keyframe else None
+            kf = self._capture_keyframe(self.zone.next_free_preset(self.preset_base), zoom) if keyframe else None
             pt = PathPoint(float(x), float(y), kf)
             if insert_at is None:
                 self.zone.points.append(pt)
@@ -275,23 +286,35 @@ class TeachSession:
             self.zone.points[i].keyframe = None
             self._changed()
 
-    def make_keyframe(self, i):
+    def make_keyframe(self, i, zoom=None):
         """Attach the current PTZ framing to an existing path point."""
         with self.lock:
             i = self._check_index(i)
             p = self.zone.points[i]
             preset = p.keyframe.preset if p.keyframe else self.zone.next_free_preset(self.preset_base)
-            p.keyframe = self._capture_keyframe(preset)
+            p.keyframe = self._capture_keyframe(preset, zoom)
             self._changed()
 
-    def reteach(self, i):
+    def reteach(self, i, zoom=None):
         """Store the current framing in keyframe i (same preset number)."""
         with self.lock:
             i = self._check_index(i)
             p = self.zone.points[i]
             if p.keyframe is None:
                 raise TeachError("o ponto %d não é keyframe" % i)
-            p.keyframe = self._capture_keyframe(p.keyframe.preset)
+            p.keyframe = self._capture_keyframe(p.keyframe.preset, zoom)
+            self._changed()
+
+    def set_keyframe_zoom(self, i, zoom):
+        """Type in the zoom of keyframe i (for cameras that can't tell their zoom). The preset is not touched."""
+        with self.lock:
+            i = self._check_index(i)
+            kf = self.zone.points[i].keyframe
+            if kf is None:
+                raise TeachError("o ponto %d não é keyframe" % i)
+            kf.zoom = _zoom_value(zoom)
+            if "zoom_manual" not in kf.pose_source:
+                kf.pose_source += "+zoom_manual"
             self._changed()
 
     def goto(self, i):
@@ -324,3 +347,13 @@ class TeachSession:
             backup = zonefile.save(self.zone, path)
             self.dirty = False
             return backup
+
+
+def _zoom_value(zoom):
+    try:
+        z = int(round(float(zoom)))
+    except (TypeError, ValueError):
+        raise TeachError("zoom inválido: %r" % (zoom,)) from None
+    if not 0 <= z <= 65535:
+        raise TeachError("zoom fora de 0..65535: %d" % z)
+    return z
