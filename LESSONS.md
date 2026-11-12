@@ -1681,3 +1681,34 @@ tracker, models and the file capture are unchanged, so the 26SE replay numbers a
   rt checks the first frame and falls back to OpenCV decoding), the DirectShow `auto_exposure` value that means
   "manual" (driver-dependent; the read-back on the status page tells), w32tm "Phase Offset" parsing on a non-English
   Windows (shows "unknown" then; set `clock.ntp_server` for a real SNTP measurement), QSV/AMF on the T14.
+
+## Session 3: beam input for rt/ (WP-L2, AUTOPTZ-23, 2026-11-12)
+
+Code: `rt/beam/` (`sources.py` drivers modem-line / byte-stream / fake, `grouping.py` edges -> breaks + stuck beam,
+`associate.py` live pass rule + LED watcher, `service.py` reader + dispatcher threads), `rt/tools/beam_probe.py`,
+`rt/tools/fuse_beam.py`, `[beam]` in `rt/config.toml` and `rt/configs/lapline.example.toml` (off by default), a Beam
+section on the status page, tests `rt/tests/test_beam_*.py` + `test_fuse_beam.py`. Pass logic, tracker and models are
+unchanged (beam results are separate `pass_beam` events), so the 26SE replay numbers above still hold. Written before
+the adapter arrived: how the pulse reaches the PC (a modem line or bytes) is still unknown, hence two drivers and the
+probe.
+
+* **Clocks**: beam edges are stamped with the same `time.time()` / `time.monotonic()` pair as frames at `grab()`.
+  `t_beam` gets `clock.offset_s` like frames but NOT `capture.live_latency_s` (a camera property), so `t_cross -
+  t_beam` = camera latency + where the camera's centre line sits relative to the beam + the pass logic's definition
+  of t_cross. fuse_beam.py estimates that offset from clean single matches; `assoc_offset_s` takes it for live use.
+* **Isolation**: the reader thread does nothing but read and stamp (it never takes rt's emitter lock or writes a
+  file); a dispatcher thread writes the events. rt's `Emitter` holds a non-reentrant lock while calling sinks, so the
+  sink that feeds `pass_end` to the beam may only queue; emitting from inside a sink would deadlock.
+* **Live association waits for its window**: a pass is decided only after `t_cross - offset + window + group_gap`
+  (in practice at once, since `pass_end` comes ~10 s after the car), and at most `window + 5 s` after it arrived so a
+  wall-clock jump cannot hold it forever.
+* **LED latency is quantised by the 10 fps processing**: a value is grab time of the first processed frame showing the
+  LED minus the edge, i.e. latency + 0-100 ms. Use the minimum of many `clean` values. Multi-pulse cars make the
+  pairing ambiguous (`clean` = false).
+* **Launcher fix (same PR)**: PR #1's launcher killed rt after 30 s of fps = 0 even when rt's own page said the camera
+  was lost and rt was reopening it. Now `lost` / `retrying` / `opening` with a live status page is left to rt; an
+  unreachable page, or fps = 0 while the camera says `streaming`, is still a stall.
+* Checked here without hardware: byte-stream with real pyserial on a Linux pty (3 messages 50 ms apart -> 1 break
+  with 3 pulses). Modem-line on a pty fails at the DTR ioctl ("Inappropriate ioctl") and correctly shows `retrying`;
+  it needs a real adapter. Not verified: the CP2102's modem-line read rate on Windows (expected ~1 kHz with Python
+  3.11+'s high-resolution sleep; the `beam_poll` event and the status page show the real rate).
