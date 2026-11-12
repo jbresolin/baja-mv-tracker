@@ -1656,3 +1656,28 @@ On the teacher's passes (harness, all crops): r2 + pq_spl_full top-1 82.1%, rule
 * The deploy files themselves were validated end to end: `e2e_26se.py --panel-weights deploy/models/panel.onnx --recog
   pq_spl_all` on the cars_*_all passes reproduces the .pt numbers exactly (n: 77.4% / 61% at 100%; s: 78.6% / 60% at
   99.3%). `e2e_26se.py` now accepts an .onnx panel detector.
+
+## Session 3: field-ready live capture for rt/ (WP-L1, 2026-11-12)
+
+Code: `rt/camsource.py` (camera interface, OpenCV/DirectShow + fake), `rt/livecam.py` (grab/retrieve decimation,
+two-clock timestamps, reconnect), `rt/recorder.py`, `rt/status.py`, `rt/supervise.py` + `rt/run_lapline.bat`,
+`rt/configs/lapline.example.toml`, tests in `rt/tests/` (pytest; fake camera, fake clock, fake process). Pass logic,
+tracker, models and the file capture are unchanged, so the 26SE replay numbers above still hold.
+
+* **Recording disk use, measured on 26SE 1080p frames (grass and trees, 10 frames of 11-29-49.mkv)**: one JPEG is
+  611 KB at quality 80 and 822 KB at quality 90. MJPEG copy = 66-89 GB/h at 30 fps, 22-30 GB/h at 10 fps: too much
+  for a race day on a laptop disk. H.264 x264 veryfast CRF 23, GOP 2 s, 10 fps: 70 MB per minute = **~4.2 GB/h**
+  (1 min of the same file). Hence the default `recording.mode = "h264"` (QuickSync / AMF if they work, else x264),
+  only the processed 10 fps; `mjpeg` copy stays an option. A webcam's own MJPEG quality may be lower than q80:
+  check the real file size on the laptop.
+* **Frame timestamps moved to grab()** for the USB camera (before: `time.time()` after `read()`, i.e. after the
+  decode). Every frame also carries `time.monotonic()` of the same grab (`Frame.t_cap`), and a `clock_map` event
+  once a minute relates the two clocks (for the beam input, WP-L2).
+* **Decimation tolerance must depend on the camera rate**: a fixed quarter of the 100 ms period (25 ms) picked frame
+  5 instead of 6 on a 60 fps camera (frame interval 16.7 ms). The tolerance is now 40% of the camera's frame interval,
+  capped at 25 ms.
+* `queue.Queue.get()` without a timeout blocks Ctrl+C on Windows; `Capture.frames()` now polls with a 0.5 s timeout.
+* Not verified on hardware yet (no webcam on this PC): DirectShow raw MJPEG passthrough (`CAP_PROP_CONVERT_RGB = 0`;
+  rt checks the first frame and falls back to OpenCV decoding), the DirectShow `auto_exposure` value that means
+  "manual" (driver-dependent; the read-back on the status page tells), w32tm "Phase Offset" parsing on a non-English
+  Windows (shows "unknown" then; set `clock.ntp_server` for a real SNTP measurement), QSV/AMF on the T14.

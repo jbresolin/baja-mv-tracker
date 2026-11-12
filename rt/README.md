@@ -3,7 +3,7 @@
 Runs track-side on a modest laptop, CPU only (or an Intel iGPU through OpenVINO):
 
 ```
-capture (file / camera / rtsp)  ->  car detector @ 10 fps  ->  ByteTrack (numpy)  ->  online pass logic
+capture (file / USB camera / rtsp)  ->  car detector @ 10 fps  ->  ByteTrack (numpy)  ->  online pass logic
    -> pass_start / pass_end events  ->  identity worker (async): number-panel detector -> recognizer -> boxed vote
    -> roster number  ->  pass_provisional / pass_identity events  ->  JSONL + CSV (+ LapAppSink stub)
 ```
@@ -19,7 +19,7 @@ and the vote is WP10b's `vote_boxed` with the val-picked tau / k. Results and ca
 Python 3.11+ (3.13 tested) and ffmpeg/ffprobe on PATH (Windows: `winget install Gyan.FFmpeg`). Then:
 
 ```
-pip install onnxruntime numpy opencv-python psutil          # psutil: CPU/RAM stats, CPU affinity (optional)
+pip install onnxruntime numpy opencv-python psutil          # psutil: CPU/RAM stats, CPU affinity, launcher kill
 pip install openvino                                        # optional: Intel CPU / iGPU backend
 ```
 
@@ -47,10 +47,65 @@ Measured on the 3900X and extrapolated x2 (throttled U-series). Details: LESSONS
 * Race day: `--set runtime.priority=high`. If OBS runs too, pin rt to 2 cores (`--affinity 2,4`): that config
   kept up with 0 dropped frames through the 26SE finish on this PC.
 
+## Lap-line node: live USB camera, unattended (WP-L1)
+
+One command on the lap-line laptop, for a whole race day:
+
+```
+copy rt\configs\lapline.example.toml rt\configs\lapline.toml     (then set launch.event and camera.device)
+python rt\run.py --list-cameras                                    (prints each camera's device path)
+rt\run_lapline.bat                                                 (starts rt, restarts it if it dies or stalls)
+```
+
+Then open `http://<laptop IP>:8765/` on a phone on the same network (allow Python through the Windows firewall for
+private networks when Windows asks).
+
+* **Camera** (`rt/livecam.py`, `rt/camsource.py`, `[camera]`): DirectShow on Windows, MJPG FOURCC set explicitly,
+  1920x1080 @ 30 fps; what the driver gives is read back and logged, and a camera that will not do MJPG fails loudly
+  (and is retried). `grab()` takes every frame, `retrieve()` only the ~10 fps that are processed: the other 2/3 are
+  never decoded. With `raw_mjpeg` the camera's JPEG bytes are retrieved and only processed frames are decoded.
+  Select the camera by device path (`camera.device`), never by name: identical webcams share a name. Image settings
+  (`[camera.settings]`: manual exposure, gain, white balance, focus) are applied at every open and read back; a
+  setting the camera does not support is a warning. If the camera disappears, rt keeps running and reopens it
+  (1 s, doubling, max 30 s).
+* **Timestamps**: each frame is stamped at `grab()` with the wall clock (`t`, what every event uses) and the monotonic
+  clock (`t_cap`). A `clock_map` event once a minute relates the two (for the beam input, WP-L2).
+* **Recording** (`rt/recorder.py`, `[recording]`): the processed frames (exactly what rt saw) go to
+  `<folder of --out>/rec/rec_<date>_<time>.mkv`, one file per 30 min, with a `.json` sidecar (start time on both
+  clocks, camera settings read back, software version, encoder) and a `.frames.csv` (true time of every frame).
+  Default H.264 (QuickSync, AMF, else x264 veryfast): ~4 GB/h at 10 fps. `mode = "mjpeg"` copies the camera JPEGs
+  without re-encoding but needs ~20-30 GB/h at 10 fps (66-89 GB/h at 30 fps), measured on 26SE frames. It never
+  slows detection (a full queue drops frames from the recording, counted). Under 20 GB free the status page warns;
+  under 5 GB recording stops (detection goes on) until space is back above 20 GB. The ffmpeg process is the only
+  extra consumer; it reads frames from rt through a pipe, so the webcam has one handle.
+* **Status page** (`rt/status.py`, `[status]`): processing fps and dropped frames, camera state and settings read
+  back, clock offset (red above 0.5 s; `clock.ntp_server` = the event router for a measured SNTP offset, else the
+  Windows time service's phase offset), recording state and free disk, last 20 passes with thumbnail, number,
+  confidence and t_cross. `/status.json` has the same data. Read-only.
+* **Launcher** (`rt/supervise.py`, `rt\run_lapline.bat`, `[launch]`): restarts rt when it exits (5 s, doubling, max
+  60 s; reset after a 10-min healthy run) or when the status page reports 0 fps (or does not answer) for 30 s
+  (after a 60 s start-up grace). It kills the whole process tree. Each run writes
+  `out/lapline/<date>/lapline_<time>.jsonl` (+ csv, stats, rec/); restarts are logged in `out/lapline/launcher.log`.
+
+Replay a recording through rt like any file (`--source out/lapline/<date>/rec/rec_....mkv`): its `creation_time` tag
+is the segment's wall-clock start.
+
+## Tests
+
+```
+pip install -r rt/requirements-test.txt
+python -m pytest rt/tests -v
+```
+
+No camera, GPU or footage needed: the capture runs on a fake camera and a fake clock, the launcher on a fake process.
+`rt/tests/test_e2e_clip.py` also runs the whole pipeline on a 7.5 s 26SE clip (`rt/tests/fixtures/`, car 14 at
+11:45:17) when the ONNX models are present (it must find one pass and read 14); otherwise it is skipped. Every test
+explains what it checks and why in plain words.
+
 ## Run
 
 ```
-python rt/run.py --source <file | camera index | rtsp/http url> --event <EV> [--config my.toml] [--realtime]
+python rt/run.py --source <file | camera | camera index | rtsp/http url> --event <EV> [--config my.toml] [--realtime]
                  [--out passes.jsonl] [--set section.key=value ...] [--threads N] [--affinity 2,4] [--stats]
 ```
 
@@ -89,7 +144,16 @@ so the program makes no network calls unless you set it.
 | capture | max_width | 1920 | downscale wider sources at decode (4K -> 1080p); 0 = native |
 | capture | decode_threads / queue_size | 0 / 4 | ffmpeg decoder threads; frames buffered before detection |
 | capture | hwaccel | none | ffmpeg `-hwaccel` (`d3d11va` / `qsv` on an Intel laptop): software decode of a 1080p30 camera costs ~0.6 core here, ~1 core on the laptop |
-| capture | camera_* / live_latency_s | 1920x1080@30, 0 | OpenCV camera settings; known capture latency subtracted from live frame times |
+| capture | live_latency_s | 0 | known capture latency subtracted from live frame times |
+| camera | backend / device / width / height / fps / fourcc | auto / 0 / 1920 / 1080 / 30 / MJPG | USB camera (rt/livecam.py); `device` = index or device path (`--list-cameras`) |
+| camera | require_fourcc / raw_mjpeg | true / true | fail if not MJPG; retrieve JPEG bytes, decode only processed frames |
+| camera | lost_after_failed_grabs / reopen_first_s / reopen_max_s / clock_map_every_s | 30 / 1 / 30 / 60 | camera lost after ~1.5 s without frames; reopen backoff; clock_map event period |
+| camera.settings | exposure, gain, auto_exposure, auto_wb, wb_temperature, autofocus, focus, ... | (none) | OpenCV CAP_PROP_* names, backend units; applied at each open and read back |
+| recording | mode / all_frames / segment_min | h264 / false / 30 | h264, mjpeg (copy) or off; record every camera frame (mjpeg only); file length |
+| recording | warn_free_gb / stop_free_gb / h264_encoders | 20 / 5 / qsv, amf, x264 | disk guard; H.264 encoders tried in order |
+| status | enabled / bind / port / passes / time_check_s | true / 0.0.0.0 / 8765 / 20 / 60 | status page |
+| launch | event / source / out_dir / extra_args | "" / camera / out/lapline / [] | read by rt/supervise.py |
+| launch | restart_first_s / restart_max_s / healthy_reset_min / stall_s / startup_grace_s | 5 / 60 / 10 / 30 / 60 | restart rules |
 | clock | mode | auto | files: overlay (OBS clock) > creation_time > mtime-duration; `pts`, `system` also accepted |
 | clock | offset_s / video_minus_server_s | 0 / 0 | correction added to frame times / this PC minus the lap server (LapAppSink) |
 | detection | conf / nms_iou | 0.15 / 0.7 | as the offline tracking stage |
@@ -118,6 +182,8 @@ the frame being processed). Times are epoch seconds of the video PC's clock, eac
 | type | when | fields |
 |---|---|---|
 | `info`, `warning` | start / end / clock problems | `msg` |
+| `camera` | live camera state change (opening, streaming, lost, retrying, stopped) | `state`, `detail` |
+| `clock_map` | live camera, once a minute | `grab_wall` (epoch), `grab_mono` (time.monotonic), `wall_minus_mono`, `grab_no` |
 | `pass_start` | a track becomes foreground (box > 0.2 H, bottom > 0.4 H, 6 frames: ~0.6 s after the car appears) and joins no open pass | `pass_id`, `t_enter`, `box` (first box, normalised x1 y1 x2 y2), `hmax` |
 | `pass_provisional` | first confident read while the pass is open (same rule as auto-confirm) | `pass_id`, `number`, `confidence`, `support`, `n_read`, `top3` |
 | `pass_end` | the pass closed: all its tracks gone and 10 s without a box (the re-attach windows expired) | `pass_id`, `t_enter`, `t_cross`, `t_exit`, `dwell_s`, `n_frames`, `n_tracks`, `tracks`, `exited`, `hmax`, `n_crops` |
@@ -145,8 +211,10 @@ the frame being processed). Times are epoch seconds of the video PC's clock, eac
   the reviewer flow (`contagem_decisao`); and server-clock anchoring (`ancora_*` columns).
 * **PTZ interface**: only the events above (`pass_start` with the entry box, `pass_provisional` with the number).
   The transport (UDP / websocket / HTTP) is still to be decided. Add a `Sink` subclass for it.
-* **Camera capture** (`--source 0`) and **RTSP** are written but untested here: there is no camera on the
-  benchmarking PC. The RTSP path was exercised with `--as-live` on a file.
+* **USB camera capture** (WP-L1) is tested with a fake camera (rt/tests) and a paced fake camera through run.py; it
+  has not met a real webcam yet. DirectShow raw MJPEG passthrough (`raw_mjpeg`) depends on the OpenCV build: if it
+  does not work, rt notices on the first frame, decodes in OpenCV and says so in the log. **RTSP** is written but
+  untested here; it was exercised with `--as-live` on a file.
 * **OpenVINO GPU (Intel iGPU)**: implemented with static shapes and a fallback to ORT CPU, but untested here
   (Ryzen, no Intel GPU). OpenVINO CPU was tested. Run `rt/bench_laptop.py` on the laptop.
 * Re-ID for mud cars (car 1), a pass minimum in seconds instead of frames, and the exposure of time sync to the lap
