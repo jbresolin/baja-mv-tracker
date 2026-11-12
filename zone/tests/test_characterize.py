@@ -193,7 +193,8 @@ def test_camera_without_inquiry_still_gets_a_report():
     assert report["speed_table"]["method"] == "unsupported"
     assert report["zoom"]["inquiry_at_rest"] is False
     assert report["verdict"]["branch"] == "B"
-    assert "error" not in json.dumps({k: v for k, v in report.items() if k != "model"})
+    # No section failed ("driver_stats" is left out: it always has an "errors" counter).
+    assert "error" not in json.dumps({k: v for k, v in report.items() if k not in ("model", "driver_stats")})
 
 
 def test_unsupported_absolute_positioning_is_recorded():
@@ -321,6 +322,10 @@ def test_live_camera_gives_branch_a_through_the_real_driver():
     assert report["verdict"]["branch"] == "A"
     best = report["feedback"]["rates"][str(int(report["feedback"]["max_rate_hz"]))]
     assert best["ok"] and best["updates_hz"] >= 0.9 * best["answers_hz"]
+    # The driver's own counters end up in the report and the summary (S3: unmatched replies among them).
+    assert report["driver_stats"]["unmatched_replies"] == 0
+    assert report["driver_stats"]["sequence_echo"] is True
+    assert "0 unmatched replies" in summarize(report)
 
 
 def test_a_camera_refreshing_at_20_hz_passes_at_20_but_not_at_50():

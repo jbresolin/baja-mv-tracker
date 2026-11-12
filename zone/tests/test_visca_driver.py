@@ -220,6 +220,49 @@ def test_camera_that_answers_without_the_ip_header():
     assert rig.ptz.inquire_zoom() == 0
 
 
+# --- S3: replies with sequence numbers we never sent ---------------------------------------------------------------
+#
+# Every request carries a sequence number and the camera copies it into its reply, so the driver can tell which
+# request a reply belongs to. A reply can arrive very late, e.g. after a sequence reset, when numbering has started
+# again at 1. Such a reply must never be taken as the answer to the request we are waiting for now.
+
+
+def inquiry_answer(pan: int, tilt: int, sequence: int) -> bytes:
+    """A complete pan/tilt answer datagram, as the camera would send it for request `sequence`."""
+    return packets.wrap(packets.encode_pan_tilt_answer(pan, tilt), packets.PAYLOAD_REPLY, sequence)
+
+
+def test_a_late_reply_from_before_a_reset_is_not_taken_as_the_answer(rig):
+    for _ in range(5):
+        rig.ptz.stop()  # requests 1..5; the camera echoes their numbers, so the driver knows it does
+    assert rig.ptz.sequence_echo is True
+    rig.ptz.reset_sequence()  # numbering starts again at 1
+    # A very late answer to old request 5 arrives, claiming the camera is at (999, 999)...
+    rig.transport.inject(inquiry_answer(999, 999, 5))
+    # ...while we wait for the answer to our new inquiry (new number 1). We must get the real (0, 0).
+    assert rig.ptz.inquire_pan_tilt() == (0, 0)
+
+
+def test_a_reply_with_a_number_never_sent_is_dropped_and_counted(rig):
+    rig.ptz.stop()  # learn that the camera echoes sequence numbers
+    rig.transport.inject(inquiry_answer(999, 999, 4242))  # nobody ever sent request 4242
+    assert rig.ptz.inquire_pan_tilt() == (0, 0)
+    assert rig.ptz.stats["unmatched_replies"] == 1
+
+
+def test_a_reply_numbered_zero_is_dropped_from_a_camera_that_echoes(rig):
+    rig.ptz.stop()
+    rig.transport.inject(inquiry_answer(999, 999, 0))
+    assert rig.ptz.inquire_pan_tilt() == (0, 0)
+    assert rig.ptz.sequence_echo is True  # one stray 0 doesn't change our mind
+
+
+def test_a_camera_that_always_answers_with_zero_is_detected():
+    rig = make_rig(echo_sequence=False)  # this fake camera numbers every reply 0
+    assert rig.ptz.inquire_pan_tilt() == (0, 0)  # accepted: we can't do better with such a camera
+    assert rig.ptz.sequence_echo is False
+
+
 # --- inquiries --------------------------------------------------------------------------------------------------
 
 

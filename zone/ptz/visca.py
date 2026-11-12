@@ -141,6 +141,11 @@ class ViscaPtz:
         self._recent: deque[int] = deque(maxlen=RECENT_SEQUENCES)
         self._late_completions: dict[int, tuple[float, str]] = {}
         self._needs_reset = False
+        # Does the camera copy our sequence number into its replies? None until we know. Most do (True). Some
+        # cheap ones always answer with sequence 0 (False): for those, a reply's number can't tell which request
+        # it answers, so we take whatever comes as the answer to the current one.
+        self.sequence_echo: bool | None = None
+        self._unknown_sequence_seen: int | None = None  # a never-sent number seen once while sequence_echo was None
         # Dead-man deadlines (clock.monotonic() values), None when nothing is armed.
         self._pan_tilt_deadline: float | None = None
         self._zoom_deadline: float | None = None
@@ -265,7 +270,9 @@ class ViscaPtz:
         self._transport.send(datagram)
         self._log("tx", datagram, sent_at, what="sequence_reset")
         self._sequence = 1
-        self._recent.clear()
+        # `_recent` is deliberately kept: a reply to a request sent before the reset can still arrive late, and it
+        # must be recognised as late rather than taken for the answer to a new request. Numbers drop out of it as
+        # they are reused (see _exchange_locked).
         status = TIMEOUT
         if deadline is None:
             deadline = sent_at + self.timeout
@@ -386,6 +393,8 @@ class ViscaPtz:
             self._reset_sequence_locked(deadline)
         sequence = self._sequence
         self._sequence = ((self._sequence + 1) & 0xFFFFFFFF) or 1
+        if sequence in self._recent:
+            self._recent.remove(sequence)  # reused after a reset: from now on it means this request
         self._recent.append(sequence)
         datagram = packets.wrap(payload, payload_type, sequence)
         sent_at = self.clock.monotonic()
@@ -427,8 +436,15 @@ class ViscaPtz:
                 if reply.sequence in self._recent:
                     self._remember_late(reply, now)  # an answer to an earlier request
                     continue
-                # A sequence number we never sent: some cameras don't echo it. Take it as ours, but count it.
+                # A sequence number we never sent. Counted either way; taken as the answer only from a camera
+                # known not to echo sequence numbers, otherwise dropped (it may be a late reply from before a
+                # reset, or from another program talking to the camera).
                 self.stats["unmatched_replies"] += 1
+                if not self._camera_ignores_sequence(reply.sequence):
+                    self._log_event("unmatched_reply_dropped", seq=reply.sequence, waiting_for=sequence)
+                    continue
+            elif reply.sequence == sequence:
+                self.sequence_echo = True
             kind = reply.kind
             if kind == packets.ERROR:
                 self.stats["errors"] += 1
@@ -452,6 +468,21 @@ class ViscaPtz:
         self.stats["timeouts"] += 1
         self._log_event("timeout", sequence=sequence)
         return CommandResult(TIMEOUT, sequence, sent_at)
+
+    def _camera_ignores_sequence(self, unknown: int) -> bool:
+        """Decide, from a reply carrying a number we never sent, whether this camera just doesn't echo sequence
+        numbers. Once a camera has echoed one correctly, it does (False). Before that, a reply numbered 0 (we never
+        send 0) or the same unknown number twice in a row means it doesn't (True)."""
+        if self.sequence_echo is True:
+            return False
+        if self.sequence_echo is False:
+            return True
+        if unknown == 0 or unknown == self._unknown_sequence_seen:
+            self.sequence_echo = False
+            self._log_event("camera_does_not_echo_sequence", seq=unknown)
+            return True
+        self._unknown_sequence_seen = unknown
+        return False
 
     def _note_stray(self, datagram: bytes, now: float) -> None:
         self._log("rx", datagram, now)

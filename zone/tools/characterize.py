@@ -317,6 +317,10 @@ class Characterizer:
         finally:
             self.safe_stop()
         self.report["model"] = self.build_model().to_dict()
+        stats = getattr(self.ptz, "stats", None)  # the real driver counts timeouts, unmatched replies, retries...
+        if isinstance(stats, dict):
+            self.report["driver_stats"] = dict(stats)
+            self.report["driver_stats"]["sequence_echo"] = getattr(self.ptz, "sequence_echo", None)
         branch, reason = ba.verdict(self.while_moving, self.max_rate_hz, self.updates_at_max_rate_hz,
                                     refresh_hz=self.update_rate_hz)
         self.report["verdict"] = {"branch": branch, "reason": reason}
@@ -1100,6 +1104,17 @@ def summarize(report: dict[str, Any]) -> str:
         lines.append(f"7. Units: pan {u.get('pan_units_per_degree')} units/deg ({u.get('pan_source')}), "
                      f"tilt {u.get('tilt_units_per_degree')} units/deg ({u.get('tilt_source')})")
 
+    ds = report.get("driver_stats")
+    if ds:
+        lines.append("")
+        lines.append(f"Driver: {ds.get('sent')} sent, {ds.get('timeouts')} timeouts, {ds.get('errors')} errors, "
+                     f"{ds.get('unmatched_replies')} unmatched replies, {ds.get('ttl_stops')} dead-man stops, "
+                     f"{ds.get('stop_retries')} stop retries, {ds.get('stop_failures')} stops given up; camera echoes "
+                     f"sequence numbers: {ds.get('sequence_echo')}")
+        if ds.get("unmatched_replies") and ds.get("sequence_echo") is not False:
+            lines.append("   !! replies with sequence numbers never sent were dropped: another program talking to "
+                         "the camera, or very late replies? Check visca_log.jsonl")
+
     v = report.get("verdict", {})
     lines.append("")
     lines.append(f"VERDICT: Branch {v.get('branch', '?')}: {v.get('reason', '')}")
@@ -1152,8 +1167,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         bench = Characterizer(ptz, clock, ui, options, out, camera_info={"ip": args.ip, "port": args.port})
         report = bench.run()
-        report["driver_stats"] = dict(ptz.stats)
-        bench.save()
     finally:
         ptz.close()
     text = summarize(report)
