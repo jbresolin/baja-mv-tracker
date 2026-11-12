@@ -27,6 +27,9 @@ coco_classes = ["car", "truck", "bus", "motorcycle"]  # "coco": COCO classes tha
                                   # a walk test); all of them become the tracker's single "car" class
 coco_conf = 0.25                  # "coco": its own confidence threshold (rt.detection.conf is for the Baja detector)
 coco_imgsz = [384, 640]           # "coco": input (h, w) of a dynamic-shape export; a fixed-shape export overrides it
+coco_agnostic_iou = 0.5           # "coco": two boxes of different selected classes (e.g. "car" + "truck" on one
+                                  # pickup) overlapping by more than this IoU are one vehicle; the weaker is dropped.
+                                  # Lower than YOLO's own 0.7: such pairs often overlap only 0.5-0.7
 loop_file = true                  # a video file source restarts at the end (teaching on a recording)
 realtime_file = true              # a video file source is paced at real speed (like a live camera)
 roi_mode = "downscale"            # "downscale": crop to the corridor box, the detector shrinks it to its input
@@ -187,12 +190,11 @@ dead_reckoning_trust_s = 0.0      # quantization compensation. For a comparison 
 k_quant = 0.0                     # corrections on), e.g. on Sunday's bench: see zone/README.md
 
 [profiles.bench.spotter]          # home bench on a public street: the COCO detector follows ordinary cars.
-detector = "coco"                 # NEVER at the race (the page shows a warning on every screen).
-coco_model = "deploy/models/yolo11n_coco.onnx"
+detector = "coco"                 # NEVER at the race (the page shows a warning on every screen). coco_model is
+                                  # not repeated here, so a site.toml value survives the profile
 
 [profiles.bench_strict.spotter]   # the same bench detector + the "strict" controller (only one profile can be
 detector = "coco"                 # active at a time), for Sunday's default-vs-strict comparison on the street
-coco_model = "deploy/models/yolo11n_coco.onnx"
 [profiles.bench_strict.controller]
 dead_reckoning_trust_s = 0.0
 k_quant = 0.0

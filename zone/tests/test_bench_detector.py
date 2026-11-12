@@ -46,7 +46,9 @@ class FakeSession:
         out = np.zeros((1, self.rows, self.n_anchors), np.float32)   # every score 0 = "nothing here"
         for i, (name, score, (cx, cy, w, h)) in enumerate(self.anchors):
             out[0, 0:4, i] = (cx, cy, w, h)                           # rows 0-3: the box
-            out[0, 4 + COCO_NAMES.index(name), i] = score             # row 4 + class id: that class's score
+            # `name` is one class name, or a dict {class name: score} when one box gets scores for several classes
+            for class_name, class_score in (name.items() if isinstance(name, dict) else [(name, score)]):
+                out[0, 4 + COCO_NAMES.index(class_name), i] = class_score   # row 4 + class id: that class's score
         return [out]
 
 
@@ -112,6 +114,81 @@ def test_one_vehicle_seen_as_car_and_truck_comes_out_once(tmp_path, monkeypatch)
     det, _ = make_coco_detector(coco_cfg(tmp_path)["spotter"], log=lambda m: None)
     _, scores, _ = det(street_image(), conf=0.25, iou=0.7)
     assert scores.tolist() == pytest.approx([0.9])             # only the stronger box (the "car" one) is left
+
+
+# Two boxes of the same size (80 x 40 pixels) overlap by IoU ("intersection over union") = the area they share
+# divided by the area they cover together. 1.0 = the same box, 0 = not touching.
+def iou_of(a, b):
+    """IoU of two (cx, cy, w, h) boxes, computed here so each test can show the overlap it is about."""
+    ax0, ay0, ax1, ay1 = a[0] - a[2] / 2, a[1] - a[3] / 2, a[0] + a[2] / 2, a[1] + a[3] / 2
+    bx0, by0, bx1, by1 = b[0] - b[2] / 2, b[1] - b[3] / 2, b[0] + b[2] / 2, b[1] + b[3] / 2
+    inter = max(0, min(ax1, bx1) - max(ax0, bx0)) * max(0, min(ay1, by1) - max(ay0, by0))
+    return inter / (a[2] * a[3] + b[2] * b[3] - inter)
+
+
+def test_car_and_truck_boxes_of_one_pickup_that_only_partly_overlap_are_merged(tmp_path, monkeypatch):
+    # The realistic case: the "car" box and the "truck" box of one pickup are not identical, they are shifted by a
+    # quarter of the car's width, which gives IoU 0.6. YOLO's own threshold (0.7) would keep both and the tracker
+    # would follow two cars. spotter.coco_agnostic_iou (default 0.5) is what decides here, so they are merged.
+    shifted_truck = ("truck", 0.6, (120, 200, 80, 40))          # 20 px right of CAR
+    assert iou_of(CAR[2], shifted_truck[2]) == pytest.approx(0.6)
+    install_fake(monkeypatch, FakeSession([CAR, shifted_truck]))
+    det, _ = make_coco_detector(coco_cfg(tmp_path)["spotter"], log=lambda m: None)
+    assert det.agnostic_iou == 0.5                              # the default from zone.example.toml
+    _, scores, _ = det(street_image(), conf=0.25, iou=0.7)
+    assert scores.tolist() == pytest.approx([0.9])             # one vehicle: the stronger ("car") box
+
+    # Proof that the setting is the one used: raised to 0.7 (YOLO's value), the same pair comes out twice.
+    det, _ = make_coco_detector(coco_cfg(tmp_path, "spotter.coco_agnostic_iou=0.7")["spotter"], log=lambda m: None)
+    _, scores, _ = det(street_image(), conf=0.25, iou=0.7)
+    assert len(scores) == 2
+
+
+def test_two_cars_side_by_side_are_both_kept(tmp_path, monkeypatch):
+    # Two real cars in neighbouring lanes (or bumper to bumper) overlap a little on screen: IoU about 0.2. That is
+    # well below 0.5, so both stay: the duplicate filter must not eat a real second car.
+    next_car = ("car", 0.7, (153, 200, 80, 40))                 # 53 px right of CAR
+    assert iou_of(CAR[2], next_car[2]) == pytest.approx(0.2, abs=0.01)
+    install_fake(monkeypatch, FakeSession([CAR, next_car]))
+    det, _ = make_coco_detector(coco_cfg(tmp_path)["spotter"], log=lambda m: None)
+    _, scores, _ = det(street_image(), conf=0.25, iou=0.7)
+    assert sorted(scores.tolist()) == pytest.approx([0.7, 0.9])
+
+
+# ------------------------------------------------------------------------------------------------ best selected class
+# A van that the model finds a bit "train"-like: its scores are train 0.7, car 0.5. YOLO's usual rule takes the best
+# of all 80 classes first ("train") and only then applies the class filter, so a car/truck filter drops the van.
+VAN = ({"train": 0.7, "car": 0.5}, None, (300, 200, 120, 60))
+
+
+def test_rt_default_keeps_its_old_rule_the_van_is_dropped(tmp_path, monkeypatch):
+    # rt.models.YoloOnnx's default behaviour (used by the Baja detector and rt/) is unchanged: best of all classes.
+    install_fake(monkeypatch, FakeSession([VAN]))
+    yolo = rt.models.YoloOnnx(str(model_file(tmp_path)), (INPUT_H, INPUT_W), classes=[2, 7], log=lambda m: None)
+    boxes, _, _ = yolo(street_image(), conf=0.25, iou=0.7)
+    assert len(boxes) == 0
+    # and without a class filter it is reported as what it scored best: a train (COCO class 6)
+    yolo = rt.models.YoloOnnx(str(model_file(tmp_path)), (INPUT_H, INPUT_W), log=lambda m: None)
+    _, scores, classes = yolo(street_image(), conf=0.25, iou=0.7)
+    assert classes.tolist() == [COCO_NAMES.index("train")] and scores.tolist() == pytest.approx([0.7])
+
+
+def test_best_of_selected_keeps_the_van_as_a_car(tmp_path, monkeypatch):
+    # The opt-in rule (best_of_selected=True): only the selected classes compete, so the van is a "car" at 0.5.
+    install_fake(monkeypatch, FakeSession([VAN, DOG]))
+    yolo = rt.models.YoloOnnx(str(model_file(tmp_path)), (INPUT_H, INPUT_W), classes=[2, 7], best_of_selected=True,
+                              log=lambda m: None)
+    boxes, scores, classes = yolo(street_image(), conf=0.25, iou=0.7)
+    assert classes.tolist() == [COCO_NAMES.index("car")] and scores.tolist() == pytest.approx([0.5])
+    assert boxes.tolist()[0] == pytest.approx([240, 170, 360, 230])     # the dog is still not a vehicle
+
+
+def test_the_bench_detector_uses_best_of_selected(tmp_path, monkeypatch):
+    # The bench detector switches the opt-in rule on, so the van is tracked.
+    install_fake(monkeypatch, FakeSession([VAN]))
+    det, _ = make_coco_detector(coco_cfg(tmp_path)["spotter"], log=lambda m: None)
+    _, scores, classes = det(street_image(), conf=0.25, iou=0.7)
+    assert scores.tolist() == pytest.approx([0.5]) and classes.tolist() == [0]
 
 
 def test_unknown_class_name_is_an_error():
@@ -207,6 +284,17 @@ def test_bench_strict_profile_is_bench_plus_strict():
     assert cfg["controller"]["dead_reckoning_trust_s"] == 0.0 and cfg["controller"]["k_quant"] == 0.0
 
 
+def test_a_coco_model_path_from_site_toml_survives_the_bench_profiles(tmp_path):
+    # Order of config layers: defaults < site.toml < profile < --set. If the profiles repeated coco_model, they
+    # would silently replace the path the owner wrote in site.toml. They don't, so the owner's path stays.
+    site = tmp_path / "site.toml"
+    site.write_text('[spotter]\ncoco_model = "D:/models/my_yolo11s.onnx"\n', encoding="utf-8")
+    for profile in ("bench", "bench_strict"):
+        cfg = C.load(site, ["profile=%s" % profile])
+        assert cfg["spotter"]["detector"] == "coco", profile
+        assert cfg["spotter"]["coco_model"] == "D:/models/my_yolo11s.onnx", profile
+
+
 def test_set_wins_over_the_bench_profile():
     # e.g. a walk test: the bench profile, plus people counted as cars
     cfg = C.load(None, ["profile=bench", 'spotter.coco_classes=["person"]'])
@@ -260,3 +348,63 @@ def test_health_line_shows_the_detector_and_warns_for_the_bench_one(tmp_path):
     html = (static / "index.html").read_text(encoding="utf-8")
     assert "DETECTOR DE BANCADA" in js and "det.bench" in js and "#benchWarn" in js
     assert 'id="benchWarn"' in html and "DETECTOR DE BANCADA (COCO)" in html
+
+
+# ------------------------------------------------------------------------------------- ROI: back to image pixels
+class WhiteBlobSession(FakeSession):
+    """A fake model that really "looks" at its input: every white rectangle in the image it is given is reported as
+    a car, with its box in model-input pixels. So the test can check the whole way back: camera frame -> ROI crop
+    (-> tiles) -> letterbox (shrink + grey padding) -> model -> boxes in camera-frame pixels."""
+
+    def run(self, _output_names, feeds):
+        import cv2
+        self.calls += 1
+        image = feeds["images"][0]                               # (3, H, W), values 0..1
+        white = (image.mean(0) > 0.5).astype(np.uint8)           # 1 where the pixel is (almost) white
+        n, _labels, stats, _ = cv2.connectedComponentsWithStats(white)
+        out = np.zeros((1, 84, self.n_anchors), np.float32)
+        for i in range(1, n):                                    # label 0 is the background
+            x, y, w, h = stats[i, :4]
+            out[0, 0:4, i - 1] = (x + w / 2, y + h / 2, w, h)     # centre + size, as YOLO writes it
+            out[0, 4 + COCO_NAMES.index("car"), i - 1] = 0.9
+        return [out]
+
+
+FRAME_W, FRAME_H = 1920, 1080                                    # a full-HD spotter frame
+CORRIDOR_ROI = (200, 300, 1500, 900)                             # the corridor box: 1300 x 600 pixels
+
+
+def frame_with_cars(*boxes):
+    """A black full-HD frame with a white rectangle (x0, y0, x1, y1) for each car."""
+    img = np.zeros((FRAME_H, FRAME_W, 3), np.uint8)
+    for x0, y0, x1, y1 in boxes:
+        img[y0:y1, x0:x1] = 255
+    return img
+
+
+@pytest.mark.parametrize("mode", ["downscale", "tile"])
+def test_coco_boxes_come_back_in_camera_frame_pixels_in_both_roi_modes(tmp_path, monkeypatch, mode):
+    # "downscale": the 1300 x 600 corridor crop is shrunk about 2x to fit the 640 x 384 input, so the model sees a
+    #   smaller car with an offset; the box must be scaled up and shifted back. A few pixels of error are normal
+    #   (the shrink blurs the edges).
+    # "tile": the corridor is cut into 640 x 384 tiles (no shrink); each tile's boxes are shifted by the tile's
+    #   corner, and pieces of one car seen by two overlapping tiles are merged.
+    # Two cars: one well inside the corridor, one near its far corner. A third white box OUTSIDE the corridor must
+    # not be seen at all (the model is never shown that part of the frame).
+    car_a, car_b, outside = (400, 450, 520, 510), (1300, 780, 1460, 860), (1650, 100, 1800, 180)
+    session = WhiteBlobSession()
+    install_fake(monkeypatch, session)
+    cfg = coco_cfg(tmp_path)
+    sp = make_spotter(cfg, rt_config(cfg), roi=CORRIDOR_ROI, mode=mode, log=lambda m: None)
+    boxes, scores = sp.det(frame_with_cars(car_a, car_b, outside))
+
+    if mode == "downscale":
+        assert sp.det.last_n_inferences == 1                    # one crop, one model run
+        tolerance = 3.0
+    else:
+        assert sp.det.last_n_inferences > 1                     # several tiles
+        tolerance = 1.0                                          # no shrink: (almost) exact
+    found = sorted(boxes.tolist())                               # left to right
+    assert len(found) == 2 and scores.tolist() == pytest.approx([0.9, 0.9])
+    assert found[0] == pytest.approx(list(car_a), abs=tolerance)
+    assert found[1] == pytest.approx(list(car_b), abs=tolerance)

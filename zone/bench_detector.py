@@ -65,9 +65,12 @@ class CocoCarDetector:
     """A COCO YOLO11 detector (rt.models.YoloOnnx, built with its `classes` filter) whose selected classes are all
     reported as the tracker's "car" class."""
 
-    def __init__(self, yolo, class_ids, class_names=()):
+    def __init__(self, yolo, class_ids, class_names=(), agnostic_iou=0.5):
         self.yolo = yolo                      # rt.models.YoloOnnx (already filters to class_ids)
         self.class_ids = list(class_ids)
+        # IoU above which two boxes (of any selected classes) are one vehicle. Lower than YOLO's own per-class 0.7:
+        # the "car" and "truck" boxes of one pickup often overlap only 0.5-0.7, and would become two tracks.
+        self.agnostic_iou = float(agnostic_iou)
         self.class_names = list(class_names)
         self.imgsz = yolo.imgsz               # (h, w), like YoloOnnx
         self.desc = "COCO %s (%s)" % ("/".join(self.class_names) or "classes %s" % self.class_ids,
@@ -75,7 +78,7 @@ class CocoCarDetector:
 
     def __call__(self, img, conf=0.25, iou=0.7):
         boxes, scores, _coco_classes = self.yolo(img, conf=conf, iou=iou)
-        keep = agnostic_nms(boxes, scores, iou)
+        keep = agnostic_nms(boxes, scores, self.agnostic_iou)   # not `iou`: that is YOLO's per-class 0.7
         boxes, scores = np.asarray(boxes, np.float32)[keep], np.asarray(scores, np.float32)[keep]
         classes = np.full(len(scores), TRACKER_CAR_CLASS, int)    # car / truck / bus / ... -> "car"
         return boxes.reshape(-1, 4), scores, classes
@@ -105,10 +108,12 @@ def make_coco_detector(spotter_cfg, threads=2, log=print):
     names = list(spotter_cfg.get("coco_classes") or [])
     ids = coco_class_ids(names)
     imgsz = spotter_cfg.get("coco_imgsz", [384, 640])            # a fixed-shape export overrides it
+    # best_of_selected: a box is scored by its best class among the selected ones, so a van whose top COCO class
+    # is e.g. "train" still counts as a car/truck (the Baja detector path keeps rt's default behaviour)
     yolo = YoloOnnx(str(path), imgsz if isinstance(imgsz, int) else tuple(imgsz), int(threads), classes=ids,
-                    log=log)
+                    log=log, best_of_selected=True)
     check_output_shape(yolo)
-    det = CocoCarDetector(yolo, ids, names)
+    det = CocoCarDetector(yolo, ids, names, float(spotter_cfg.get("coco_agnostic_iou", 0.5)))
     h, w = det.imgsz
     log("WARNING: bench detector active (%s): COCO models are unreliable on Baja cars, don't race with it"
         % det.desc)

@@ -116,7 +116,11 @@ def nms(boxes, scores, iou):
 
 class YoloOnnx:
     def __init__(self, path, imgsz, threads=1, rect=False, spinning=False, classes=None, backend="onnxruntime",
-                 device="CPU", log=print):
+                 device="CPU", log=print, best_of_selected=False):
+        """`classes`: keep only these class ids (None = all). `best_of_selected` (opt-in, needs `classes`): each box
+        takes its best score among the selected classes only, instead of its best of all classes then filtered. With
+        the default (False, ultralytics' behaviour) a box whose top class is not selected is dropped even if a
+        selected class scored well too (a van whose top class is "train" is lost from a car+truck filter)."""
         self.imgsz = (imgsz, imgsz) if isinstance(imgsz, int) else tuple(imgsz)
         gpu = backend == "openvino" and not device.startswith("CPU")
         static = (1, 3) + self.imgsz if gpu else None
@@ -128,6 +132,7 @@ class YoloOnnx:
             rect = False  # a fixed-shape model cannot take the minimum rectangle
         self.rect = rect
         self.classes = classes  # None = all classes
+        self.best_of_selected = bool(best_of_selected) and classes is not None
         self.desc = self.runner.desc + (", rect" if rect else ", %dx%d" % self.imgsz)
 
     def __call__(self, img, conf=0.25, iou=0.7, max_det=300):
@@ -137,11 +142,18 @@ class YoloOnnx:
         x = lb[:, :, ::-1].transpose(2, 0, 1)[None].astype(np.float32) / 255.0
         y = self.runner.run(np.ascontiguousarray(x))[0].T  # (N, 4 + nc)
         sc = y[:, 4:]
-        cls = sc.argmax(1)
-        s = sc[np.arange(len(y)), cls]
-        k = s > conf
-        if self.classes is not None:
-            k &= np.isin(cls, self.classes)
+        if self.best_of_selected:
+            # best class among the selected ones only (the other classes' scores are ignored)
+            sel = np.asarray(self.classes, int)
+            cls = sel[sc[:, sel].argmax(1)]
+            s = sc[np.arange(len(y)), cls]
+            k = s > conf
+        else:
+            cls = sc.argmax(1)
+            s = sc[np.arange(len(y)), cls]
+            k = s > conf
+            if self.classes is not None:
+                k &= np.isin(cls, self.classes)
         b, s, cls = y[k, :4], s[k], cls[k]
         if not len(s):
             return np.zeros((0, 4), np.float32), np.zeros(0, np.float32), np.zeros(0, int)
