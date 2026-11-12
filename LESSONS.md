@@ -1657,6 +1657,53 @@ On the teacher's passes (harness, all crops): r2 + pq_spl_full top-1 82.1%, rule
   pq_spl_all` on the cars_*_all passes reproduces the .pt numbers exactly (n: 77.4% / 61% at 100%; s: 78.6% / 60% at
   99.3%). `e2e_26se.py` now accepts an .onnx panel detector.
 
+## Session 3: zone tracker, click-teach and controller (WP-Z2, AUTOPTZ-16/17/18), 2026-11-12
+
+Built `zone/` on top of WP-Z1's driver and simulator. Everything below was measured on the **synthetic world** in
+`zone/testing.py` (a 105 m racing line with a bend, 60 m zone, cars at ~10 m/s braking to 5 m/s, PTZ 22-35 m away,
+WP-Z1's default `PtzModel`: 0.1 s latency, 0.2 s ramp, geometric speed table ~+20% per step). Not yet on real footage:
+the October wide-angle recording and the deployed models were not available on the build machine. Run
+`zone.tools.detect_check` and `zone.tools.replay` on them first.
+
+* **Entry lag is the dominant error.** Holding the entry pose until s = 0 (the brief's rule) means the car crosses the
+  entry at full speed while the camera stands still: it starts 6-9 degrees behind and needs ~1 s to catch up. An
+  **ease-in** (pose follows a parabola from the entry pose at s = -0.08 to the taught curve at s = +0.08, lock at
+  s_lock = -0.08) cut the max error from 8.9 to 2.4 degrees and the mean from 2.1 to 1.1 (both branches). Default on
+  (`zone.ease_in = 0.08`); `ease_in = 0` + `s_lock = 0` gives the literal rule back.
+* **Feedback must compare like with like.** The control law's feedback term `k * (pose(s_ahead) - pan_now)` compares
+  where the car *will be* with where the camera *is*: it always sees a phantom error of v * latency and overdrives
+  (Branch A was worse than B: 3.0 vs 1.8 degrees mean). Comparing with where the camera will be after the same
+  lookahead (pan_now + rate * (lookahead + inquiry age)) fixed it (A 1.2-1.9).
+* **Dead reckoning needs the latency and the ramp.** Integrating commanded speeds as if they acted instantly put the
+  estimate ~50 raw units (3.5 degrees) ahead of the camera after every start; modelling the report's command latency
+  and ramp brought it to within a few units of the simulator.
+* **Speed-step quantization drifts.** With a geometric table and hysteresis (to avoid chatter) the held step can be
+  10-15% off the wanted rate for a whole pass; feed-forward alone then drifts ~3 degrees by the exit. Two fixes, both
+  on by default: Branch B trusts its dead-reckoned pose for 4 s of motion after each preset recall (~one pass), and a
+  "quantization compensation" integrates wanted - commanded rate (pure bookkeeping on our own commands, no pose
+  feedback) and feeds it back gently.
+* **Tile merging: NMS is wrong for cut boxes.** A car cut by a tile edge gives partial boxes; with tied scores NMS
+  kept a partial and dropped the full box (6 tracks for 3 cars). Clustering boxes by intersection / smaller area > 0.6
+  and taking the union fixed it.
+* **Lock window.** "Lock the first track with s >= s_lock" also matches a car already at s = 0.7 when the camera gets
+  back to the entry; chasing it from the entry gives ~70 degrees of error. Only cars within s_lock + 0.15 are locked.
+
+### Session 3, review fixes (PR #3, 2026-11-12)
+
+* **Correction:** `ZoneFrame.t` was the frame's *arrival* time, so the lookahead missed the webcam's capture
+  latency (~0.1 s). It is now the picture time (arrival - `rt.capture.live_latency_s`, default 0.1 s, to be measured
+  on the bench); `controller.latency_s` is the PTZ command latency only.
+* **Correction:** the spotter recording was an `.mp4` (unreadable after a crash) and the replay read our own
+  recordings at their nominal pts. Now `.mkv`, and the replay takes the real grab times from the `.frames.csv` sidecar.
+* A cycle stuck in a hung PTZ call used to block the watchdog's shutdown (and the big STOP) on the runtime lock, so
+  the launcher never restarted. Now: STOP goes to the driver first and waits for the lock at most 0.5 s; the
+  watchdog `os._exit(3)`s when the shutdown takes more than `health.shutdown_grace_s`. Detection runs outside the
+  control lock, so the STOP never waits for it.
+* "PTZ reachable" was True before anything had answered; it's now unknown until a command or inquiry answers, and
+  the health probe stays off the wire while AUTO drives the camera.
+* New: divergence guard (drop the car when the target stays > 15 degrees from the estimated pose for > 5 cycles) and a
+  `strict` config profile (pure feed-forward Branch B) for the Sunday comparison.
+
 ## Session 3: field-ready live capture for rt/ (WP-L1, 2026-11-12)
 
 Code: `rt/camsource.py` (camera interface, OpenCV/DirectShow + fake), `rt/livecam.py` (grab/retrieve decimation,

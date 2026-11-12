@@ -2,9 +2,9 @@ name: zone tests
 
 on:
   push:
-    paths: ["zone/**", ".github/workflows/zone-tests.yml"]
+    paths: ["zone/**", "rt/**", ".github/workflows/zone-tests.yml"]
   pull_request:
-    paths: ["zone/**", ".github/workflows/zone-tests.yml"]
+    paths: ["zone/**", "rt/**", ".github/workflows/zone-tests.yml"]
 
 jobs:
   pytest:
@@ -19,6 +19,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      # zone/ is stdlib-only; pytest is the only thing the tests need.
-      - run: python -m pip install pytest
+      # WP-Z1 (zone/ptz, characterize) is stdlib-only; WP-Z2 (tracker, page) needs numpy / OpenCV / FastAPI.
+      # ffmpeg is optional: the replay and detection-check tests skip without it.
+      - run: python -m pip install pytest numpy opencv-python-headless fastapi httpx
       - run: python -m pytest zone -v

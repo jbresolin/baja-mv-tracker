@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Zona PTZ</title>
+<style>
+  :root { --bg:#14161a; --panel:#1d2026; --line:#30343c; --text:#e8e8e8; --dim:#9aa0a6; --red:#d93025;
+          --green:#1e8e3e; --amber:#f9ab00; --blue:#1a73e8; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px system-ui, sans-serif; }
+  header { display:flex; gap:12px; align-items:center; padding:8px 12px; background:var(--panel);
+           border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  header h1 { font-size:18px; margin:0 12px 0 0; }
+  .state { font-weight:700; padding:4px 10px; border-radius:6px; background:#333; }
+  .state.AUTO { background:var(--green); } .state.PASSIVE { background:var(--blue); } .state.STOPPED { background:#555; }
+  main { display:grid; grid-template-columns: minmax(0,1fr) 400px; gap:12px; padding:12px; }
+  @media (max-width: 1000px) { main { grid-template-columns: 1fr; } }
+  #frameBox { position:relative; background:#000; border:1px solid var(--line); }
+  #frame { width:100%; display:block; cursor:crosshair; }
+  #clickHint { position:absolute; top:8px; right:8px; background:var(--amber); color:#000; padding:4px 8px;
+               border-radius:4px; font-weight:700; display:none; }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:10px; margin-bottom:12px; }
+  section h2 { font-size:15px; margin:0 0 8px; color:var(--dim); text-transform:uppercase; letter-spacing:.05em; }
+  button { background:#2b2f37; color:var(--text); border:1px solid var(--line); border-radius:6px; padding:8px 10px;
+           font-size:14px; cursor:pointer; touch-action:manipulation; }
+  button:hover { border-color:#666; } button.on { background:var(--amber); color:#000; }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  .modes button { min-width:90px; font-weight:700; }
+  #bigStop { background:var(--red); color:#fff; font-size:22px; font-weight:800; padding:14px 24px; border:none; }
+  .row { display:flex; gap:6px; flex-wrap:wrap; align-items:center; margin:6px 0; }
+  .jog { display:grid; grid-template-columns: repeat(3, 56px); gap:4px; }
+  .jog button { height:48px; font-size:20px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  td, th { padding:3px 4px; border-bottom:1px solid var(--line); text-align:left; }
+  tr.sel { background:#3a3320; }
+  td button { padding:2px 6px; font-size:12px; }
+  .kv { display:grid; grid-template-columns: 150px 1fr; gap:2px 8px; font-size:13px; }
+  .kv div:nth-child(odd) { color:var(--dim); }
+  .bad { color:#ff6b5e; font-weight:700; } .good { color:#5bd77b; }
+  #msg { min-height:20px; color:var(--amber); font-weight:600; }
+  #events { font-size:12px; color:var(--dim); max-height:180px; overflow:auto; }
+  input[type=number] { width:80px; background:#111; color:var(--text); border:1px solid var(--line); padding:6px; border-radius:4px; }
+  .big { font-size:20px; font-weight:700; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Zona PTZ</h1>
+  <span id="modeBadge" class="state">…</span>
+  <span id="subState"></span>
+  <span id="locked" class="big"></span>
+  <span style="flex:1"></span>
+  <span class="modes">
+    <button data-mode="STOPPED">PARADO</button>
+    <button data-mode="PASSIVE">PASSIVO</button>
+    <button data-mode="AUTO">AUTO</button>
+  </span>
+  <button id="bigStop" title="Para a câmera imediatamente (tecla Esc)">PARAR</button>
+</header>
+<div id="msg" style="padding:0 12px"></div>
+<main>
+  <div>
+    <div id="frameBox">
+      <img id="frame" alt="spotter">
+      <div id="clickHint"></div>
+    </div>
+    <section style="margin-top:12px">
+      <h2>Eventos</h2>
+      <div id="events"></div>
+    </section>
+  </div>
+  <div>
+    <section>
+      <h2>Ensinar zona</h2>
+      <div class="row">
+        <button id="addPath" data-click="path">Adicionar ponto</button>
+        <button id="addKf" data-click="keyframe">Adicionar keyframe</button>
+        <button id="movePt" data-click="move">Mover ponto</button>
+      </div>
+      <div class="row" id="zoomWarn" style="display:none;color:var(--amber)">
+        Esta PTZ não informa o zoom: digite o zoom de cada keyframe antes de gravá-lo.
+        <label>zoom <input id="kfZoom" type="number" min="0" step="100"></label>
+      </div>
+      <div class="row">
+        <label>Corredor (px, meia largura) <input id="corridor" type="number" min="5" max="1000" step="5"></label>
+        <button id="setCorridor">Aplicar</button>
+      </div>
+      <div class="row">
+        <button id="save" style="background:var(--green);border:none">Salvar zona</button>
+        <span id="dirty"></span>
+      </div>
+      <div style="font-size:12px;color:var(--dim)">Fonte da pose: <b id="poseSrc"></b> · pose atual: <span id="poseNow">–</span>
+        · arquivo <span id="zoneFile"></span></div>
+      <table id="points"><thead><tr><th>#</th><th>tipo</th><th>x,y</th><th></th></tr></thead><tbody></tbody></table>
+    </section>
+    <section>
+      <h2>Mover PTZ</h2>
+      <div class="row">
+        <button id="teachMode" title="A PTZ só se move pela página com o modo ensino ligado. PARAR, PARADO e AUTO o desligam.">Modo ensino: desligado</button>
+      </div>
+      <div class="row">Velocidade:
+        <button data-speed="0">lenta</button><button data-speed="1" class="on">média</button><button data-speed="2">rápida</button>
+      </div>
+      <div class="row" style="gap:18px">
+        <div class="jog">
+          <span></span><button data-jog="0,1">▲</button><span></span>
+          <button data-jog="-1,0">◀</button><button id="jogStop">■</button><button data-jog="1,0">▶</button>
+          <span></span><button data-jog="0,-1">▼</button><span></span>
+        </div>
+        <div class="jog" style="grid-template-columns:72px">
+          <button data-zoom="1">Zoom +</button>
+          <button data-zoom="-1">Zoom −</button>
+        </div>
+      </div>
+      <div class="row" id="poseButtons">
+        <button id="home">Ir para home</button>
+        <button id="zeroHere">Zerar aqui</button>
+      </div>
+      <div style="font-size:12px;color:var(--dim)">Teclado: setas = pan/tilt, PageUp/PageDown = zoom, Esc = PARAR.</div>
+    </section>
+    <section>
+      <h2>Saúde</h2>
+      <div class="kv" id="health"></div>
+    </section>
+  </div>
+</main>
+<script src="/app.js"></script>
+</body>
+</html>

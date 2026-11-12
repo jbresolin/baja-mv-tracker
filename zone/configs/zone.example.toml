@@ -1,0 +1,179 @@
+# zone/configs/zone.example.toml: every setting of the zone tracker (python -m zone.app), with its default.
+# A config of your own only needs the keys it changes:   python -m zone.app --config zone/configs/my_site.toml
+# Any key can also be overridden on the command line:    --set controller.branch=B --set ptz.driver=sim
+# Relative paths are relative to the repo root (the folder that holds zone/ and rt/).
+# "auto" means: take the value from the PTZ characterization report ([ptz] report), or a safe default without one.
+
+profile = ""                      # a named set of changes from [profiles.<name>] at the end of this file, applied on
+                                  # top of your config (and under --set). e.g. --set profile=strict
+
+[zone]
+file = "zones/zone.json"          # the taught zone (click-teach saves here; backups go to zones/zone_backups/)
+out_dir = "out/zone"              # control logs, spotter recordings, PTZ recordings
+interpolation = "pchip"           # pose(s) between keyframes: "pchip" (smooth, no overshoot) | "linear"
+ease_in = 0.08                    # start turning a little before the entry keyframe (in s): the pose follows a parabola
+                                  # from the entry pose at s = -ease_in to the taught curve at s = +ease_in, so the
+                                  # camera is already moving when the car crosses s = 0. Synthetic test: max error
+                                  # 8.9 -> 2.4 degrees. 0 = hold the entry pose until s = 0 (needs director.s_lock <= -ease_in)
+
+[spotter]
+source = "0"                      # camera index | video file (teach / test on a recording) | rtsp url
+detector = "rt"                   # "rt" = the deployed ONNX car detector; "blobs" = white boxes only (synthetic tests)
+loop_file = true                  # a video file source restarts at the end (teaching on a recording)
+realtime_file = true              # a video file source is paced at real speed (like a live camera)
+roi_mode = "downscale"            # "downscale": crop to the corridor box, the detector shrinks it to its input
+                                  # "tile": split the corridor box into detector-sized tiles (more detail, more CPU)
+                                  # "full": whole frame (no crop; for comparison only)
+                                  # zone.tools.detect_check measures which works better on a recording
+roi_margin_px = 40                # margin added around the corridor box (pixels)
+tile_overlap = 0.2                # "tile": overlap between neighbouring tiles (fraction of a tile)
+tile_scale = 1.0                  # "tile": tile size = detector input * this (1.0 = no resize inside a tile)
+max_track_age_s = 3.0             # informative: the tracker keeps a lost track this long (rt.tracker.track_buffer)
+
+# rt/ settings used by the spotter (same names as rt/config.toml; only the keys that differ for the zone node)
+[rt.capture]
+fps = 10.0                        # detections per second = control loop rate
+camera_backend = "auto"           # Windows: "dshow" or "msmf" if "auto" picks the wrong one
+camera_width = 1920
+camera_height = 1080
+camera_fps = 30
+live_latency_s = 0.1              # spotter capture latency (s): from the moment the picture is taken to the moment the
+                                  # frame reaches us. Subtracted from live frame times (wall and monotonic), so the
+                                  # controller's lookahead covers it. 0.1 is a typical USB webcam; MEASURE it (README)
+
+[rt.models]
+manifest = "deploy/models/manifest.json"
+manifest_car = "car_n"            # YOLO11n car detector (car_s is ~3x the CPU)
+
+[rt.runtime]
+threads_detector = 2
+
+[rt.detection]
+conf = 0.15
+nms_iou = 0.7
+
+[rt.clock]
+ntp_server = ""                   # e.g. the event MikroTik's IP: the page shows this PC's offset to it
+
+[ptz]
+driver = "visca"                  # "visca" (real camera) | "sim" (SimulatedPtz, for teaching on a recording)
+host = "192.168.0.100"
+port = 52381
+timeout_s = 0.2
+report = ""                       # characterization report JSON (python -m zone.tools.characterize); picks the branch
+command_log = ""                  # optional JSONL of every VISCA packet (debugging)
+
+[teach]
+preset_base = 10                  # keyframe presets are numbered from here (10, 11, 12, ...)
+pose_source = "auto"              # how a keyframe's pose is known: "auto" (from the report) | "inquiry" |
+                                  # "commanded" (absolute-position nudges only) | "dead_reckoning" (approximate)
+jog_speeds = [2, 6, 12]           # pan/tilt speed steps for the slow / medium / fast jog buttons
+jog_zoom_speed = 3                # zoom speed step for the zoom buttons
+nudge_units = [8, 32, 128]        # "commanded" pose source: pan/tilt nudge per click (raw units), slow/medium/fast
+zoom_nudge_units = [100, 400, 1600]
+default_corridor_px = 60          # corridor half-width of a new zone
+
+[progress]
+meas_sigma_px = 6.0               # noise of one ground point along the path (pixels)
+accel_sigma = 0.4                 # how fast the speed may change (s/s^2): bigger follows braking sooner, but noisier
+v_sigma0 = 0.5                    # initial speed uncertainty
+window_back_px = 40.0             # projection search window behind the previous position (arc pixels)
+window_ahead_px = 400.0           # ... and ahead of it
+window_sigmas = 3.0               # after a dropout, the window is at least +- this many standard deviations of the
+                                  # predicted s (so a car that braked while unseen is still found)
+corridor_factor = 1.0             # detections farther than factor * corridor half-width don't update the track
+finish_after_s = 3.0              # a track unseen for this long is finished (and teaches the speed profile)
+profile_min_span = 0.3            # ... if it covered at least this much s
+max_prediction_s = 3.0            # cap on predicting a lost car ahead
+
+[speed_profile]
+bin_width = 0.05                  # in s
+max_passes = 50                   # each bin keeps the last N passes; the profile is their median
+default_v = 0.25                  # s/s before anything is learned (a 4 s zone)
+
+[speedmap]
+hysteresis = 0.3                  # keep the current step unless the ideal one is > 0.5 + this away
+max_step_change = 4               # ramp: at most this many steps of change per cycle
+start_margin = 0.15               # band around "half the minimum rate" so it never alternates stop/start
+pan_min_smooth_step = "auto"      # slowest smooth step (report: pan_min_smooth_step; default 1)
+tilt_min_smooth_step = "auto"
+
+[controller]
+branch = "auto"                   # "auto" = the report's verdict (no report: "B") | "A" | "B"
+latency_s = "auto"                # command latency only (command sent -> camera moving); "auto" = report
+                                  # command_latency_s + ramp_s / 2 (default 0.25). The spotter's capture latency is
+                                  # rt.capture.live_latency_s, and the processing time is measured per frame
+include_processing_delay = true   # also look ahead by the time since the frame was grabbed
+k_pan = 1.5                       # feedback gain (1/s); Branch B uses it only right after a preset recall
+k_tilt = 1.5
+max_feedback_pan = 150.0          # cap on the feedback term (raw units/s)
+max_feedback_tilt = 100.0
+inquiry_hz = "auto"               # Branch A poll rate; "auto" = report inquiry_poll_hz (capped at 20)
+inquiry_stale_s = 0.35
+dead_reckoning_trust_s = 4.0      # Branch B: seconds of motion after a recall (known pose) during which feedback on the
+                                  # dead-reckoned pose is allowed (~ one pass; 0 = strict feed-forward only)
+k_quant = 1.5                     # quantization compensation (1/s): integrates "wanted - commanded rate" (whole speed
+                                  # steps are up to ~15% off) and adds it back; 0 = off. Not pose feedback: B uses it too
+ttl_s = 0.3                       # every velocity command expires after this: a dead loop stops the camera
+divergence_deg = 15.0             # divergence guard: drop the car (-> back to the entry) when the target is more than
+divergence_cycles = 5             # this many degrees from the camera's estimated pose for more than this many cycles
+                                  # in a row (logged as a "divergence" event, drop reason "diverged"). 0 deg = off
+zoom_enabled = true
+zoom_min_interval_s = 0.5         # at most 2 zoom commands per second
+zoom_threshold = 150              # only re-send zoom when it changes by more than this (raw units)
+zoom_loosen = 0.85                # < 1 frames looser than taught: zoom = wide + loosen * (taught - wide)
+zoom_wide = "auto"                # raw zoom of the widest angle ("auto" = report zoom_limits[0], default 0)
+
+[director]
+s_lock = -0.08                    # lock the first car that reaches this s (= -zone.ease_in: the camera starts there) ...
+lock_window = 0.15                # ... but not one already beyond s_lock + lock_window (too late to catch) ...
+v_min = 0.05                      # ... moving forward at least this fast (s/s) ...
+min_updates = 3                   # ... with at least this many detections
+lost_timeout_s = 1.5              # drop the car after this long without a detection
+stopped_v = 0.02
+stopped_timeout_s = 3.0           # drop a car slower than stopped_v for this long
+off_corridor_frames = 3           # drop a car outside the corridor for more frames than this
+s_exit = 1.0                      # release the car here and go back to the entry
+settle_s = "auto"                 # wait after recalling the entry preset ("auto" = report preset_settle_s, default 1.5)
+
+[web]
+host = "0.0.0.0"                  # 0.0.0.0 = reachable from a phone on the LAN; "127.0.0.1" = this PC only
+port = 8090
+jpeg_quality = 70
+frame_max_width = 1280            # the page's live frame is downscaled to this width
+
+[log]
+cycle_log = true                  # JSONL per control cycle in out_dir (zone_<start>.jsonl)
+flush_every = 10                  # lines between flushes
+
+[recording]
+spotter = true                    # record the frames the tracker already grabs (no second webcam open)
+spotter_fps = "capture"           # "capture" = the processing rate (rt.capture.fps)
+spotter_codec = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-pix_fmt", "yuv420p"]
+                                  # e.g. ["-c:v", "h264_nvenc", "-preset", "p1", "-cq", "23"] on the XPS's GTX 1050 Ti
+spotter_queue = 30                # frames buffered for the encoder; a full queue drops frames (counted)
+ffmpeg = "ffmpeg"
+ptz_usb = false                   # record the PTZ's USB H.264 with ffmpeg -c copy (python -m zone.tools.record_ptz)
+ptz_input = ["-f", "dshow", "-rtbufsize", "256M", "-vcodec", "h264", "-video_size", "1920x1080", "-framerate", "30"]
+ptz_device = "video=USB Camera"   # dshow device name (ffmpeg -list_devices true -f dshow -i dummy)
+ptz_segment_s = 0                 # > 0: split the PTZ recording into files of this many seconds
+
+[health]
+min_free_gb = 5.0                 # warn on the page below this free disk space in out_dir
+no_frame_exit_s = 20.0            # no spotter frame for this long: exit with an error so the launcher restarts us
+shutdown_grace_s = 5.0            # ... and if the clean shutdown hangs (stuck detector / PTZ call), kill the process
+                                  # (os._exit 3) after this long, so the launcher can always restart it
+stop_lock_timeout_s = 0.5         # big STOP: wait at most this long for the control loop; past it, the stop goes
+                                  # straight to the PTZ driver and the loop switches to STOPPED when it wakes up
+
+[supervisor]
+backoff_initial_s = 2.0           # run_zone.bat: wait before restarting a crashed process, doubling each time ...
+backoff_max_s = 60.0              # ... up to this
+healthy_after_s = 60.0            # a process that ran this long resets the backoff
+
+# ------------------------------------------------------------------------------------------------- profiles
+# Named sets of changes, picked with `profile = "<name>"` (top of this file) or --set profile=<name>.
+
+[profiles.strict.controller]      # Branch B with pure feed-forward: no feedback on the dead-reckoned pose and no
+dead_reckoning_trust_s = 0.0      # quantization compensation. For a comparison run against the default (both
+k_quant = 0.0                     # corrections on), e.g. on Sunday's bench: see zone/README.md
