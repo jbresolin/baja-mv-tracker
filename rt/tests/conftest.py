@@ -28,6 +28,22 @@ def cfg():
     return C.load()
 
 
+def plenty_of_free_disk(folder):
+    """A fake "free disk space" reading for the Recorder: always 1000 GB, whatever the folder.
+
+    Why tests need it: the Recorder has a disk guard. Before it writes, it asks how much space is free on the disk,
+    and if that is under `recording.stop_free_gb` (5 GB in rt/config.toml) it records NOTHING (on purpose: on the
+    race laptop a full disk must never stop detection). Without this fake, a test asks the real disk of the machine
+    running the tests. A GitHub Actions runner is a throwaway computer whose free space changes from one machine to
+    the next: on one with under 5 GB free, every frame was silently skipped, no file was opened, and the test failed
+    with an empty `rec.segments` list. So the same commit passed on one runner and failed on another, which looked
+    like a random "flaky" test but was really this hidden dependency on the machine's disk.
+
+    Pass it as `Recorder(..., disk_free_gb=plenty_of_free_disk)` in every test that is not about the disk guard
+    (that one, test_disk_guard_warns_then_stops_recording_then_resumes, uses its own adjustable fake disk)."""
+    return 1000.0
+
+
 def textured_frame(w=320, h=180, seed=0):
     """A random-noise image. The pass logic keeps crops of cars and scores them by sharpness; a flat grey image would
     have zero sharpness, so tests use noise to look like a real (sharp) picture."""

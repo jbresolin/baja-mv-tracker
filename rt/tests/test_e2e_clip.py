@@ -26,6 +26,8 @@ from rt.camsource import FakeCamera
 from rt.livecam import CameraCapture
 from rt.recorder import Recorder
 
+from .conftest import plenty_of_free_disk
+
 ROOT = Path(__file__).resolve().parents[2]
 CLIP = Path(__file__).parent / "fixtures" / "2026-10-17 26SE car14 clip.mp4"
 UTC_3 = dt.timezone(dt.timedelta(hours=-3))      # the 26SE overlay clock and the human counts are in UTC-3
@@ -50,7 +52,8 @@ def test_recording_lines_up_with_the_frames_detection_saw(cfg, tmp_path):
     cfg["capture"]["queue_size"] = 1000
     cfg["camera"]["fps"] = 10
     cfg["recording"]["queue_frames"] = 1000         # the fake camera runs faster than real time: keep every frame
-    rec = Recorder(cfg, tmp_path, fps=10, version="test", log=lambda m: None, encoder="libx264")
+    rec = Recorder(cfg, tmp_path, fps=10, version="test", log=lambda m: None, encoder="libx264",
+                   disk_free_gb=plenty_of_free_disk)    # not the real disk: see plenty_of_free_disk in conftest.py
     rec.start()
     stop_at_first_loss = lambda s: cap.stop_ev.set() if s >= 1 else None  # noqa: E731
     cap = CameraCapture(cfg, camera_factory=lambda: cam, clock=clock, recorder=rec, sleep=stop_at_first_loss,

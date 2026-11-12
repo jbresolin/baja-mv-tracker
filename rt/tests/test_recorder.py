@@ -17,6 +17,8 @@ import pytest
 from rt.backoff import FakeClock
 from rt.recorder import Recorder
 
+from .conftest import plenty_of_free_disk
+
 
 class FakeFfmpeg:
     """Stands in for subprocess.Popen(ffmpeg ...): remembers the command, collects what is written to stdin, and
@@ -420,7 +422,8 @@ def test_real_ffmpeg_writes_a_playable_file(cfg, tmp_path, kind):
     # camera JPEG bytes, what a passthrough backend (V4L2) gives.
     cfg["recording"]["queue_frames"] = 100         # the test offers 30 frames at once, faster than real time:
                                                     # a big queue so none is dropped before ffmpeg has started
-    rec = Recorder(cfg, tmp_path, fps=10, version="test", log=lambda m: None, encoder="libx264")
+    rec = Recorder(cfg, tmp_path, fps=10, version="test", log=lambda m: None, encoder="libx264",
+                   disk_free_gb=plenty_of_free_disk)   # not the real disk: see plenty_of_free_disk in conftest.py
     rec.start()
     for frame_no in range(30):
         img = np.full((48, 64, 3), (frame_no * 8) % 255, np.uint8)
@@ -466,7 +469,8 @@ def test_replay_of_a_recording_uses_the_frames_csv_times(cfg, tmp_path):
     from rt.capture import FileCapture
 
     cfg["recording"]["queue_frames"] = 100
-    rec = Recorder(cfg, tmp_path, fps=10, version="test", log=lambda m: None, encoder="libx264")
+    rec = Recorder(cfg, tmp_path, fps=10, version="test", log=lambda m: None, encoder="libx264",
+                   disk_free_gb=plenty_of_free_disk)   # not the real disk: see plenty_of_free_disk in conftest.py
     rec.start()
     t_wall, recorded = 1_800_000_000.0, []
     for frame_no in range(20):
