@@ -8,9 +8,13 @@ Rules:
   * rt exits (crash, or any exit code): start it again after a wait that doubles each time: 5 s, 10 s, 20 s, 40 s,
     60 s, 60 s, ... If the run that just ended had been up for `healthy_reset_min` minutes, the wait starts again at
     5 s (one crash after hours of running is not a crash loop).
-  * rt is alive but its status page (http://127.0.0.1:<status.port>/status.json) reports processing fps = 0, or
-    does not answer, for `stall_s` seconds in a row: kill it and restart it the same way. Nothing is checked during
-    the first `startup_grace_s` seconds of a run (models load, the camera opens).
+  * rt is alive but its status page (http://127.0.0.1:<status.port>/status.json) does not answer, or reports
+    processing fps = 0 while the camera claims to be streaming, for `stall_s` seconds in a row: kill it and restart
+    it the same way. Nothing is checked during the first `startup_grace_s` seconds of a run (models load, the camera
+    opens).
+  * fps = 0 while the status page says the camera is lost / retrying / opening is NOT a stall: rt is alive (it
+    answers) and is already reopening the camera in-process with its own backoff. Killing rt there would not bring
+    the camera back sooner, and every restart costs a model load and a new output file.
   * Every start, exit, stall and kill is written to the launcher log (`<out_dir>/launcher.log`) and the console.
 
 The kill takes the whole process tree: on Windows `.venv\\Scripts\\python.exe` is a launcher that starts the real
@@ -66,11 +70,24 @@ def kill_tree(proc, timeout=10.0):
         pass
 
 
+# Camera states (rt/livecam.py) in which rt is handling a missing camera by itself: it answers its status page, has
+# 0 fps because there are no frames, and keeps trying to reopen the camera with backoff.
+CAMERA_RECOVERING_STATES = ("lost", "retrying", "opening")
+
+
 def probe_fps(url, timeout=2.0):
     """processing fps from rt's status page, or None if it does not answer."""
+    status = probe_status(url, timeout)
+    return None if status is None else status["fps"]
+
+
+def probe_status(url, timeout=2.0):
+    """What the launcher needs from rt's status page: {"fps": processing fps, "camera_state": the camera's state
+    ("streaming", "lost", ...; None if the page has no camera)}, or None if the page does not answer."""
     try:
         with urllib.request.urlopen(url, timeout=timeout) as r:
-            return float(json.loads(r.read().decode("utf-8"))["processing"]["fps"])
+            payload = json.loads(r.read().decode("utf-8"))
+        return dict(fps=float(payload["processing"]["fps"]), camera_state=(payload.get("camera") or {}).get("state"))
     except Exception:  # noqa: BLE001
         return None
 
@@ -79,8 +96,9 @@ class Supervisor:
     """The restart rules as a small state machine. tick() is called every `poll_s` seconds by run(); tests call it
     directly with a fake clock, a fake process and a fake fps probe, so no test ever sleeps.
 
-    make_cmd() -> the command list for one run; spawn(cmd) -> a process object (poll(), pid); probe() -> fps or
-    None; kill(proc) stops it; clock() -> seconds (monotonic); log(msg) writes a line."""
+    make_cmd() -> the command list for one run; spawn(cmd) -> a process object (poll(), pid); probe() -> the
+    status page's {"fps", "camera_state"} (probe_status), a bare fps number (camera state unknown), or None when
+    the page does not answer; kill(proc) stops it; clock() -> seconds (monotonic); log(msg) writes a line."""
 
     def __init__(self, make_cmd, spawn, probe, kill, clock, log, first_wait_s=5.0, max_wait_s=60.0, stall_s=30.0,
                  grace_s=60.0, healthy_reset_s=600.0, check_stall=True):
@@ -92,6 +110,7 @@ class Supervisor:
         self.started_at = None
         self.next_start_at = None     # None = start now
         self.zero_since = None
+        self.camera_wait_logged = False   # the "camera lost, rt handles it" message is logged once per episode
         self.starts = 0
         self.restarts = []            # (time, reason, wait) of every scheduled restart
 
@@ -126,14 +145,28 @@ class Supervisor:
             return
         if not self.check_stall or now - self.started_at < self.grace_s:
             return
-        fps = self.probe()
+        answer = self.probe()
+        if isinstance(answer, dict):
+            fps, camera_state = answer.get("fps"), answer.get("camera_state")
+        else:                                  # a bare number (or None): camera state unknown
+            fps, camera_state = answer, None
         if fps is not None and fps > 0:
             self.zero_since = None
+            self.camera_wait_logged = False
+            return
+        if fps is not None and camera_state in CAMERA_RECOVERING_STATES:
+            # rt answers and says the camera is gone: it is reopening it by itself. Not a stall.
+            self.zero_since = None
+            if not self.camera_wait_logged:
+                self.camera_wait_logged = True
+                self.log("status: fps = 0, camera %s: rt is reopening the camera itself; not restarting" %
+                         camera_state)
             return
         if self.zero_since is None:
             self.zero_since = now
-            self.log("status: %s; restart if it lasts %.0f s" % ("no answer" if fps is None else "fps = 0",
-                                                                 self.stall_s))
+            self.log("status: %s; restart if it lasts %.0f s" % (
+                "no answer" if fps is None else "fps = 0 (camera %s)" % (camera_state or "state unknown"),
+                self.stall_s))
         if now - self.zero_since >= self.stall_s:
             self.log("rt stalled (%s for %.0f s): killing pid %s" % (
                 "no status answer" if fps is None else "fps = 0", now - self.zero_since, self.proc.pid))
@@ -189,7 +222,7 @@ def main():
         log("WARNING status page disabled: stalls cannot be detected, only exits")
     sup = Supervisor(make_cmd=lambda: build_command(cfg, a.config),
                      spawn=lambda cmd: subprocess.Popen(cmd, cwd=str(ROOT)),
-                     probe=lambda: probe_fps(url), kill=kill_tree, clock=time.monotonic, log=log,
+                     probe=lambda: probe_status(url), kill=kill_tree, clock=time.monotonic, log=log,
                      first_wait_s=float(la["restart_first_s"]), max_wait_s=float(la["restart_max_s"]),
                      stall_s=float(la["stall_s"]), grace_s=float(la["startup_grace_s"]),
                      healthy_reset_s=float(la["healthy_reset_min"]) * 60, check_stall=check)

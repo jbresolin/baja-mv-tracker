@@ -13,7 +13,8 @@ extra_args = ["--stats"]        # more rt/run.py arguments: --stats samples CPU/
 restart_first_s = 5             # after rt exits or stalls: wait 5 s, then 10, 20, 40, 60, 60, ...
 restart_max_s = 60
 healthy_reset_min = 10          # a run that lasted 10 min resets the wait to 5 s
-stall_s = 30                    # status page fps = 0 (or no answer) for 30 s -> kill rt and restart it
+stall_s = 30                    # status page silent, or fps = 0 while the camera says streaming, for 30 s ->
+                                # kill rt and restart it (camera lost/retrying: rt reopens it itself, no kill)
 startup_grace_s = 60            # no stall check in the first 60 s of a run (models load, camera opens)
 poll_s = 2                      # how often the launcher looks at rt
 

@@ -83,8 +83,9 @@ private networks when Windows asks).
   Windows time service's phase offset), recording state and free disk, last 20 passes with thumbnail, number,
   confidence and t_cross. `/status.json` has the same data. Read-only.
 * **Launcher** (`rt/supervise.py`, `rt\run_lapline.bat`, `[launch]`): restarts rt when it exits (5 s, doubling, max
-  60 s; reset after a 10-min healthy run) or when the status page reports 0 fps (or does not answer) for 30 s
-  (after a 60 s start-up grace). It kills the whole process tree. Each run writes
+  60 s; reset after a 10-min healthy run) or when the status page does not answer, or reports 0 fps while the camera
+  says "streaming", for 30 s (after a 60 s start-up grace). 0 fps with the camera "lost" / "retrying" / "opening" is
+  left to rt, which is already reopening the camera itself. It kills the whole process tree. Each run writes
   `out/lapline/<date>/lapline_<time>.jsonl` (+ csv, stats, rec/); restarts are logged in `out/lapline/launcher.log`.
 
 Replay a recording through rt like any file (`--source out/lapline/<date>/rec/rec_....mkv`): its `creation_time` tag
