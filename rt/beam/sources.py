@@ -2,10 +2,14 @@
 
 An *edge* is a change of the beam signal: the beam got blocked (level 1, "active") or cleared (level 0). Each edge
 is stamped, right after the driver sees it, on the SAME two clocks rt uses for camera frames (rt.backoff.SystemClock,
-the clock object rt/livecam.py stamps grab() with):
+the clock object rt/livecam.py stamps frames with):
   t_wall = time.time()        epoch seconds; what every rt event uses; can jump when NTP corrects it
   t_mono = time.monotonic()   never jumps; good for durations and for comparing with frame `t_cap`
-So a beam edge and a frame can be compared directly (beam vs camera latency, beam vs vision crossing time).
+So a beam edge and a frame can be compared directly (beam vs camera latency, beam vs vision crossing time). One
+difference: on DirectShow (the T14) rt/livecam.py stamps a frame right AFTER retrieve(), which waits for the frame
+AND decodes it, so frame times run late by the decode time (~10-20 ms of MJPEG decode) on top of the camera's own
+latency. Beam edges have no such delay. `assoc_offset_s` (estimated by rt/tools/fuse_beam.py) and the LED latency
+measurement both absorb it: they measure frame time - beam time as a whole.
 
 Drivers (chosen by `beam.driver` in the config):
   * ModemLineSource ("modem-line"): the sensor drives one RS232 modem-status input of the USB adapter (CTS, DSR,

@@ -62,22 +62,48 @@ private networks when Windows asks).
 
 * **Camera** (`rt/livecam.py`, `rt/camsource.py`, `[camera]`): DirectShow on Windows, MJPG FOURCC set explicitly,
   1920x1080 @ 30 fps; what the driver gives is read back and logged, and a camera that will not do MJPG fails loudly
-  (and is retried). `grab()` takes every frame, `retrieve()` only the ~10 fps that are processed: the other 2/3 are
-  never decoded. With `raw_mjpeg` the camera's JPEG bytes are retrieved and only processed frames are decoded.
-  Select the camera by device path (`camera.device`), never by name: identical webcams share a name. Image settings
-  (`[camera.settings]`: manual exposure, gain, white balance, focus) are applied at every open and read back; a
-  setting the camera does not support is a warning. If the camera disappears, rt keeps running and reopens it
-  (1 s, doubling, max 30 s).
-* **Timestamps**: each frame is stamped at `grab()` with the wall clock (`t`, what every event uses) and the monotonic
-  clock (`t_cap`). A `clock_map` event once a minute relates the two (for the beam input, WP-L2).
-* **Recording** (`rt/recorder.py`, `[recording]`): the processed frames (exactly what rt saw) go to
-  `<folder of --out>/rec/rec_<date>_<time>.mkv`, one file per 30 min, with a `.json` sidecar (start time on both
-  clocks, camera settings read back, software version, encoder) and a `.frames.csv` (true time of every frame).
-  Default H.264 (QuickSync, AMF, else x264 veryfast): ~4 GB/h at 10 fps. `mode = "mjpeg"` copies the camera JPEGs
-  without re-encoding but needs ~20-30 GB/h at 10 fps (66-89 GB/h at 30 fps), measured on 26SE frames. It never
-  slows detection (a full queue drops frames from the recording, counted). Under 20 GB free the status page warns;
-  under 5 GB recording stops (detection goes on) until space is back above 20 GB. The ffmpeg process is the only
-  extra consumer; it reads frames from rt through a pipe, so the webcam has one handle.
+  (and is retried). Select the camera by device path (`camera.device`), never by name: identical webcams share a
+  name. Image settings (`[camera.settings]`: manual exposure, gain, white balance, focus) are applied at every open
+  and read back; a setting the camera does not support is a warning.
+* **Read loop per backend** (`camera.read_mode = "auto"`). OpenCV's DirectShow backend (cap_dshow.cpp) does not do
+  what its API suggests: `grab()` returns True at once, and `retrieve()` is what waits (up to ~1 s) for the next
+  frame and decodes it; it also ignores `CONVERT_RGB = 0` for MJPG, so every frame is decoded anyway. A "grab every
+  frame, retrieve only 1 in 3" loop therefore spins grab() at full speed on DirectShow (a whole core and the GIL)
+  and saves nothing. So:
+  * `retrieve_every_frame` (DirectShow, and every backend not verified otherwise): one grab() + one (waiting)
+    retrieve() per camera frame, stamped as soon as retrieve() returns, then 2 of 3 frames are dropped in
+    software. The decode of all 30 fps is paid (~0.6 core on the 3900X, ~1.2 on a U-series laptop: LESSONS WP11);
+    measure it on the T14.
+  * `grab_then_retrieve` (V4L2 on Linux, where grab() really waits for the next buffer): every frame is grabbed and
+    stamped at grab(), only the processed ones are retrieved (decoded).
+  * Future options to avoid decoding 20 of 30 fps on Windows (not implemented): the MSMF backend, if its grab()
+    is confirmed to block per frame; or an ffmpeg `-f dshow -vcodec mjpeg` source that copies the camera's JPEGs
+    through a pipe (decode only the processed ones, and record without re-encoding).
+* **Camera lost**: DirectShow reports an unplug once (one grab() returns False) and then retrieve() just times out,
+  so loss is detected by time: no good frame for `camera.lost_after_s` (3 s, monotonic clock) or
+  `camera.lost_after_failures` (10) failed reads in a row. The status page then shows "camera lost", the recording
+  file is closed, and the camera is reopened with backoff (1 s, doubling, max 30 s) until it is back, in the same
+  process (the launcher is only the last resort).
+* **Timestamps**: each frame is stamped with the wall clock (`t`, what every event uses) and the monotonic clock
+  (`t_cap`) as soon as it is in hand: after retrieve() on DirectShow (this includes the MJPEG decode, ~10-20 ms;
+  fold it into `capture.live_latency_s` once measured), at grab() on V4L2. A `clock_map` event once a minute
+  relates the two clocks (for the beam input, WP-L2).
+* **Recording** (`rt/recorder.py`, `[recording]`): the processed frames (exactly what rt saw, 10 fps) go to
+  `<folder of --out>/rec/rec_<date>_<time>.mkv` as H.264. The encoder is probed once at start and logged: QuickSync
+  (`h264_qsv`), AMF (`h264_amf`), else x264 `veryfast`. ~4 GB/h at 10 fps (x264 CRF 23 on 26SE frames; QSV / AMF
+  sizes differ: check the real files on the T14). DirectShow hands rt decoded images, so there are no camera JPEGs
+  to copy: `mode = "mjpeg"` and `all_frames` are refused at start with an explanation (`h264` or `off`).
+  * **Files**: a new file every 30 min, and also after a camera loss or a gap of more than 2 frame periods: the
+    file's frame rate is nominal, so a file never spans a gap. Next to each file: a `.json` sidecar (start time on
+    both clocks, camera settings read back at the last open, software version, encoder; written provisionally at
+    open, finalised at close), a `.frames.csv` (the authoritative time of every frame; flushed every 30 rows) and a
+    `.ffmpeg.log` (ffmpeg's messages: a file, because an unread pipe fills up and freezes ffmpeg).
+  * **Never slows detection**: offer() never blocks; the queue holds ~1 s (10 frames, ~60 MB at 1080p) and drops
+    the oldest frame when full (counted). A watchdog kills ffmpeg if it does not accept a frame for 10 s or exits,
+    marks recording failed on the status page and starts a new file 10 s later; after 5 failures in a row
+    recording is off for the run (detection goes on).
+  * **Disk guard**: under 20 GB free the status page warns; under 5 GB recording stops (detection goes on) until
+    space is back above 20 GB. ffmpeg reads frames from rt through a pipe, so the webcam has one handle.
 * **Status page** (`rt/status.py`, `[status]`): processing fps and dropped frames, camera state and settings read
   back, clock offset (red above 0.5 s; `clock.ntp_server` = the event router for a measured SNTP offset, else the
   Windows time service's phase offset), recording state and free disk, last 20 passes with thumbnail, number,
@@ -85,11 +111,16 @@ private networks when Windows asks).
 * **Launcher** (`rt/supervise.py`, `rt\run_lapline.bat`, `[launch]`): restarts rt when it exits (5 s, doubling, max
   60 s; reset after a 10-min healthy run) or when the status page does not answer, or reports 0 fps while the camera
   says "streaming", for 30 s (after a 60 s start-up grace). 0 fps with the camera "lost" / "retrying" / "opening" is
-  left to rt, which is already reopening the camera itself. It kills the whole process tree. Each run writes
+  left to rt, which is already reopening the camera itself. It kills the whole process tree. It starts rt with
+  `--require-status`: if the status port is busy (another rt, or another program), rt exits with code 3 and says
+  why, and launcher.log names the reason, instead of rt running blind and being killed as "stalled" every ~90 s. On
+  Windows the page binds its port exclusively (Python's default SO_REUSEADDR would let two programs share it
+  silently). Each run writes
   `out/lapline/<date>/lapline_<time>.jsonl` (+ csv, stats, rec/); restarts are logged in `out/lapline/launcher.log`.
 
-Replay a recording through rt like any file (`--source out/lapline/<date>/rec/rec_....mkv`): its `creation_time` tag
-is the segment's wall-clock start.
+Replay a recording through rt like any file (`--source out/lapline/<date>/rec/rec_....mkv`): when the file's
+`.frames.csv` is next to it, each frame gets its recorded time from it (the authoritative clock); otherwise the
+file's `creation_time` tag (the segment's start) + the nominal frame rate.
 
 ## Beam input: timing light-beam sensor at the line (WP-L2)
 
@@ -116,9 +147,11 @@ of `rt/configs/lapline.toml` (example and every key: `rt/configs/lapline.example
     stamped on receipt; the raw bytes are kept. With `byte_release_pattern` the "clear" message is an edge too.
   * `fake`: one synthetic tube-frame car every `fake_every_s` (check the chain and the status page without hardware).
 * **Same clocks as the frames.** Each edge is stamped right after it is seen with `time.time()` and
-  `time.monotonic()` (the clock object rt/livecam.py stamps `grab()` with). `t_edge` / `t_beam` = wall time +
+  `time.monotonic()` (the clock object rt/livecam.py stamps frames with). `t_edge` / `t_beam` = wall time +
   `clock.offset_s`, like frame times. The camera's `capture.live_latency_s` is subtracted from frames only, so
-  `t_cross - t_beam` contains the camera latency and where the camera's centre line is relative to the beam.
+  `t_cross - t_beam` contains the camera latency and where the camera's centre line is relative to the beam. On
+  DirectShow frames are stamped after `retrieve()` (decode included), so frame times run late by the decode time
+  too; `assoc_offset_s` and the LED latency absorb it.
   At 1 kHz an edge is stamped within ~1 ms (the `poll_gap_ms` field says how long the gap before it was). Windows:
   Python 3.11+ sleeps with a high-resolution timer, so 1 kHz is reachable; the `beam_poll` event (every 60 s) and
   the status page show the achieved rate and the largest gap.
@@ -205,10 +238,12 @@ python rt/run.py --source <file | camera | camera index | rtsp/http url> --event
 * Validation tools (they need pandas, and are not needed at the race): `rt/eval_26se.py` (replay metrics vs the
   human laps, and an online-vs-offline pass-logic check), `rt/loadtest.py` (real-time CPU/RAM matrix).
 
-Live sources use the system clock. At start, `rt/timesync.py` checks Windows time sync (`w32tm /query /status`).
-**It warns loudly when the PC is not synced.** The session-1 PC was 80 s ahead of the lap server. Fix it with
-Settings > Time > Sync now, or set `clock.offset_s`. `clock.ntp_server` adds an SNTP check. It is off by default,
-so the program makes no network calls unless you set it.
+Live sources use the system clock. At start and every minute, `rt/timesync.py` checks it. **It warns loudly when
+the PC is not synced.** The session-1 PC was 80 s ahead of the lap server. Fix it with Settings > Time > Sync now, or
+set `clock.offset_s`. The primary check is SNTP against `clock.ntp_server` (the lap-line example config sets it to
+a placeholder for the event router: set the real IP); it is empty in `rt/config.toml`, so a plain run makes no
+network calls. Windows' own status (`w32tm /query /status [/verbose]`) is read by its layout (field order and
+value shapes), so a pt-BR Windows with Portuguese labels and a cp850 console works too.
 
 ## Config reference (`rt/config.toml`; a user config only needs the keys it changes)
 
@@ -232,12 +267,15 @@ so the program makes no network calls unless you set it.
 | capture | hwaccel | none | ffmpeg `-hwaccel` (`d3d11va` / `qsv` on an Intel laptop): software decode of a 1080p30 camera costs ~0.6 core here, ~1 core on the laptop |
 | capture | live_latency_s | 0 | known capture latency subtracted from live frame times |
 | camera | backend / device / width / height / fps / fourcc | auto / 0 / 1920 / 1080 / 30 / MJPG | USB camera (rt/livecam.py); `device` = index or device path (`--list-cameras`) |
-| camera | require_fourcc / raw_mjpeg | true / true | fail if not MJPG; retrieve JPEG bytes, decode only processed frames |
-| camera | lost_after_failed_grabs / reopen_first_s / reopen_max_s / clock_map_every_s | 30 / 1 / 30 / 60 | camera lost after ~1.5 s without frames; reopen backoff; clock_map event period |
+| camera | require_fourcc / raw_mjpeg | true / false | fail if not MJPG; ask for JPEG bytes (V4L2 only; DirectShow always decodes) |
+| camera | read_mode | auto | `retrieve_every_frame` (DirectShow) or `grab_then_retrieve` (V4L2); see "Read loop per backend" |
+| camera | lost_after_s / lost_after_failures / reopen_first_s / reopen_max_s / clock_map_every_s | 3 / 10 / 1 / 30 / 60 | camera lost after 3 s without a good frame or 10 failed reads; reopen backoff; clock_map event period |
 | camera.settings | exposure, gain, auto_exposure, auto_wb, wb_temperature, autofocus, focus, ... | (none) | OpenCV CAP_PROP_* names, backend units; applied at each open and read back |
-| recording | mode / all_frames / segment_min | h264 / false / 30 | h264, mjpeg (copy) or off; record every camera frame (mjpeg only); file length |
-| recording | warn_free_gb / stop_free_gb / h264_encoders | 20 / 5 / qsv, amf, x264 | disk guard; H.264 encoders tried in order |
-| status | enabled / bind / port / passes / time_check_s | true / 0.0.0.0 / 8765 / 20 / 60 | status page |
+| recording | mode / segment_min / split_gap_periods | h264 / 30 / 2 | h264 or off (mjpeg copy is refused); file length; a gap of more than this many frame periods starts a new file |
+| recording | warn_free_gb / stop_free_gb / h264_encoders | 20 / 5 / qsv, amf, x264 | disk guard; H.264 encoders probed in order at start |
+| recording | queue_frames / csv_flush_rows | 10 / 30 | frames waiting for ffmpeg (oldest dropped when full); frames.csv flush period |
+| recording | write_timeout_s / retry_wait_s / max_failures | 10 / 10 / 5 | watchdog: ffmpeg stuck or dead -> kill, new file after the wait; give up after this many failures in a row |
+| status | enabled / bind / port / passes / time_check_s / required | true / 0.0.0.0 / 8765 / 20 / 60 / false | status page; `required` (or `--require-status`, which the launcher passes): exit with code 3 if the port is busy |
 | launch | event / source / out_dir / extra_args | "" / camera / out/lapline / [] | read by rt/supervise.py |
 | launch | restart_first_s / restart_max_s / healthy_reset_min / stall_s / startup_grace_s | 5 / 60 / 10 / 30 / 60 | restart rules |
 | clock | mode | auto | files: overlay (OBS clock) > creation_time > mtime-duration; `pts`, `system` also accepted |
@@ -277,7 +315,7 @@ the frame being processed). Times are epoch seconds of the video PC's clock, eac
 |---|---|---|
 | `info`, `warning` | start / end / clock problems | `msg` |
 | `camera` | live camera state change (opening, streaming, lost, retrying, stopped) | `state`, `detail` |
-| `clock_map` | live camera, once a minute | `grab_wall` (epoch), `grab_mono` (time.monotonic), `wall_minus_mono`, `grab_no` |
+| `clock_map` | live camera, once a minute | `frame_wall` (epoch), `frame_mono` (time.monotonic) of one frame, `wall_minus_mono`, `camera_frame_no` (frames received from the camera since start), `stamped_at` (`after retrieve` or `grab`) |
 | `pass_start` | a track becomes foreground (box > 0.2 H, bottom > 0.4 H, 6 frames: ~0.6 s after the car appears) and joins no open pass | `pass_id`, `t_enter`, `box` (first box, normalised x1 y1 x2 y2), `hmax` |
 | `pass_provisional` | first confident read while the pass is open (same rule as auto-confirm) | `pass_id`, `number`, `confidence`, `support`, `n_read`, `top3` |
 | `pass_end` | the pass closed: all its tracks gone and 10 s without a box (the re-attach windows expired) | `pass_id`, `t_enter`, `t_cross`, `t_exit`, `dwell_s`, `n_frames`, `n_tracks`, `tracks`, `exited`, `hmax`, `n_crops` |
@@ -312,9 +350,9 @@ the frame being processed). Times are epoch seconds of the video PC's clock, eac
   the reviewer flow (`contagem_decisao`); and server-clock anchoring (`ancora_*` columns).
 * **PTZ interface**: only the events above (`pass_start` with the entry box, `pass_provisional` with the number).
   The transport (UDP / websocket / HTTP) is still to be decided. Add a `Sink` subclass for it.
-* **USB camera capture** (WP-L1) is tested with a fake camera (rt/tests) and a paced fake camera through run.py; it
-  has not met a real webcam yet. DirectShow raw MJPEG passthrough (`raw_mjpeg`) depends on the OpenCV build: if it
-  does not work, rt notices on the first frame, decodes in OpenCV and says so in the log. **RTSP** is written but
+* **USB camera capture** (WP-L1) is tested with fake cameras (rt/tests; `FakeDshowCamera` copies DirectShow's
+  grab/retrieve behaviour as read in OpenCV 4.x cap_dshow.cpp) and a paced fake camera through run.py; it has not
+  met a real webcam yet. **RTSP** is written but
   untested here; it was exercised with `--as-live` on a file.
 * **Beam input** (WP-L2) is tested with a fake serial port and a fake clock, and the byte-stream driver once with
   real pyserial on a Linux pseudo-terminal. It has not met the real CP2102 adapter or the sensors: run the probe

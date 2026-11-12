@@ -28,18 +28,18 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
 
 def early_threads(argv):
     """thread env vars must be set before numpy / onnxruntime / cv2 load their thread pools."""
-    n = None
-    for i, a in enumerate(argv):
-        if a == "--threads" and i + 1 < len(argv):
-            n = argv[i + 1]
-        elif a.startswith("--threads="):
-            n = a.split("=", 1)[1]
-    if n:
-        for k in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
-            os.environ[k] = str(n)
+    n_threads = None
+    for i, arg in enumerate(argv):
+        if arg == "--threads" and i + 1 < len(argv):
+            n_threads = argv[i + 1]
+        elif arg.startswith("--threads="):
+            n_threads = arg.split("=", 1)[1]
+    if n_threads:
+        for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+            os.environ[name] = str(n_threads)
     else:
-        for k in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
-            os.environ.setdefault(k, "1")
+        for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+            os.environ.setdefault(name, "1")
 
 
 early_threads(sys.argv)
@@ -49,7 +49,7 @@ import cv2  # noqa: E402
 
 from rt import config as C  # noqa: E402
 from rt.capture import open_source, set_affinity  # noqa: E402
-from rt.recorder import Recorder, software_version  # noqa: E402
+from rt.recorder import Recorder, check_recording_config, software_version  # noqa: E402
 from rt.models import YoloOnnx  # noqa: E402
 from rt.passlogic import PassLogic  # noqa: E402
 from rt.sinks import ConsoleSink, CsvSink, Emitter, JsonlSink, LapAppSink  # noqa: E402
@@ -76,6 +76,8 @@ def main():
     ap.add_argument("--stats", action="store_true", help="sample CPU / RAM every second (needs psutil)")
     ap.add_argument("--no-identity", action="store_true")
     ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--require-status", action="store_true",
+                    help="exit (code 3) if the status page cannot open its port (the launcher passes this)")
     a = ap.parse_args()
     if a.list_cameras:
         return list_cameras(C.load(a.config, a.set))
@@ -88,11 +90,11 @@ def main():
     if a.affinity:
         sets += ["runtime.affinity=[%s]" % a.affinity]
     cfg = C.load(a.config, sets)
-    r = cfg["runtime"]
-    cv2.setNumThreads(int(r["cv2_threads"]))
-    if r.get("affinity"):
-        set_affinity(os.getpid(), r["affinity"])
-    if r.get("priority") == "high":
+    runtime_cfg = cfg["runtime"]
+    cv2.setNumThreads(int(runtime_cfg["cv2_threads"]))
+    if runtime_cfg.get("affinity"):
+        set_affinity(os.getpid(), runtime_cfg["affinity"])
+    if runtime_cfg.get("priority") == "high":
         try:
             import psutil
             psutil.Process().nice(psutil.ABOVE_NORMAL_PRIORITY_CLASS if hasattr(psutil, "ABOVE_NORMAL_PRIORITY_CLASS")
@@ -121,21 +123,20 @@ def main():
     server = timechecker = recorder = None
     if board is not None:
         board.info = dict(event=a.event, version=version, source=" ".join(a.source), out=str(out))
-        from rt.status import StatusServer, TimeChecker
-        st = cfg["status"]
-        try:
-            server = StatusServer(board, st["bind"], int(st["port"])).start()
-            log("status page: http://%s:%d/" % ("localhost" if st["bind"] in ("0.0.0.0", "") else st["bind"],
-                                                server.port))
-        except OSError as e:
-            warn("status page not started on port %s: %s" % (st["port"], e))
+        from rt.status import TimeChecker, start_status_server
+        status_cfg = cfg["status"]
+        required = a.require_status or bool(status_cfg.get("required", False))
+        server = start_status_server(board, status_cfg["bind"], status_cfg["port"], required, log=log, warn=warn)
         if live_camera:
-            timechecker = TimeChecker(cfg, board, float(st["time_check_s"]))
+            timechecker = TimeChecker(cfg, board, float(status_cfg["time_check_s"]))
             timechecker.start()
+    if live_camera:
+        check_recording_config(cfg["recording"])       # a clear error for settings that cannot work
     if live_camera and cfg["recording"]["mode"] != "off":
-        rc = cfg["recording"]
-        rec_fps = float(cfg["camera"]["fps"]) if rc["all_frames"] else float(cfg["capture"]["fps"])
-        recorder = Recorder(cfg, out.parent / rc["subdir"], rec_fps, version, log=log)
+        recording_cfg = cfg["recording"]
+        recorder = Recorder(cfg, out.parent / recording_cfg["subdir"], float(cfg["capture"]["fps"]), version,
+                            log=log)
+        recorder.choose_encoder()                     # probe QSV / AMF / x264 once, now, and log the one used
         recorder.start()
         if board is not None:
             board.recorder = recorder
@@ -144,10 +145,12 @@ def main():
 
     roster, teams = C.read_roster(a.event)
     m = cfg["models"]
-    det = YoloOnnx(m["car_detector"], m["car_imgsz"], int(r["threads_detector"]), spinning=bool(r["ort_spinning"]),
-                   backend=r["car_backend"], device=r["car_device"], log=warn)
-    trk = ByteTracker(**{k: cfg["tracker"][k] for k in ("track_high_thresh", "track_low_thresh", "new_track_thresh",
-                                                         "track_buffer", "match_thresh", "fuse_score")})
+    det = YoloOnnx(m["car_detector"], m["car_imgsz"], int(runtime_cfg["threads_detector"]),
+                   spinning=bool(runtime_cfg["ort_spinning"]), backend=runtime_cfg["car_backend"],
+                   device=runtime_cfg["car_device"], log=warn)
+    trk = ByteTracker(**{key: cfg["tracker"][key] for key in ("track_high_thresh", "track_low_thresh",
+                                                               "new_track_thresh", "track_buffer", "match_thresh",
+                                                               "fuse_score")})
     idw = None
     if not a.no_identity:
         from rt.identity import IdentityWorker
@@ -221,28 +224,28 @@ def main():
     if idw:
         idw.finish()
     wall = time.time() - t_wall0
-    st = summary(a, cfg, det, idw, mon, n_frames, dropped, tdet, tpost, lags, wall, t_flush - t_wall0, vid_t0, vid_t1,
-                 em.counts)
-    st["version"] = version
+    stats = summary(a, cfg, det, idw, mon, n_frames, dropped, tdet, tpost, lags, wall, t_flush - t_wall0, vid_t0,
+                    vid_t1, em.counts)
+    stats["version"] = version
     if recorder is not None:
         recorder.stop()
-        st["recording"] = recorder.status()
-        st["recording"]["segments"] = [str(p) for p in recorder.segments]
+        stats["recording"] = recorder.status()
+        stats["recording"]["segments"] = [str(path) for path in recorder.segments]
     for c in caps:
         if hasattr(c, "status"):
-            st["camera"] = c.status()
+            stats["camera"] = c.status()
     if beam is not None:
         beam.stop()
-        st["beam"] = beam.status()
+        stats["beam"] = beam.status()
     if timechecker is not None:
         timechecker.halt.set()
     if server is not None:
         server.stop()
     if mon:
         mon.stop()
-    log("rt end: " + json.dumps({k: st[k] for k in ("frames", "dropped", "video_s", "wall_s", "speed_x",
-                                                    "det_ms_p50", "passes", "cpu")}, default=str))
-    Path(str(out.with_suffix("")) + ".stats.json").write_text(json.dumps(st, indent=1, default=str))
+    log("rt end: " + json.dumps({key: stats[key] for key in ("frames", "dropped", "video_s", "wall_s", "speed_x",
+                                                              "det_ms_p50", "passes", "cpu")}, default=str))
+    Path(str(out.with_suffix("")) + ".stats.json").write_text(json.dumps(stats, indent=1, default=str))
     em.close()
 
 
@@ -288,8 +291,8 @@ def list_cameras(cfg):
               "camera.device. Names are not used: identical webcams share a name.")
     else:
         by_id = Path("/dev/v4l/by-id")
-        for p in sorted(by_id.glob("*")) if by_id.exists() else []:
-            print("%s -> %s" % (p, p.resolve()))
+        for link in sorted(by_id.glob("*")) if by_id.exists() else []:
+            print("%s -> %s" % (link, link.resolve()))
         print("Linux: put a /dev/v4l/by-id/... path in camera.device (stable across replugs).")
 
 

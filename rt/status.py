@@ -18,6 +18,8 @@ import collections
 import datetime as dt
 import html
 import json
+import socket
+import sys
 import threading
 from bisect import bisect_left
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -44,7 +46,7 @@ class StatusBoard:
         self.thumb_w = int(s.get("thumb_width", 320))
         self.thumb_every_s = 1.0 / float(s.get("thumb_fps", 5))
         self.ring_s = float(s.get("thumb_ring_s", 20))
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()                 # re-entrant: on_event holds it while it calls helpers
         self.frame_monos = collections.deque()        # monotonic times of processed frames, last window_s
         self.frames = 0
         self.last_frame_t = None
@@ -98,37 +100,37 @@ class StatusBoard:
 
     def on_event(self, ev):
         """Called by StatusSink for every rt event."""
-        t = ev["type"]
-        if t not in ("pass_start", "pass_provisional", "pass_end", "pass_identity"):
+        kind = ev["type"]
+        if kind not in ("pass_start", "pass_provisional", "pass_end", "pass_identity"):
             return
-        pid = ev["pass_id"]
-        with self.lock:
-            p = self.passes.get(pid)
-            if p is None:
-                p = self.passes[pid] = dict(pass_id=pid, state="open", number=None, confidence=None,
-                                            auto_confirm=None, provisional=None, t_enter=None, t_cross=None,
-                                            team=None, thumb_t=None)
+        pass_id = ev["pass_id"]
+        with self.lock:                     # the web server thread reads these dicts: change them under the lock
+            entry = self.passes.get(pass_id)
+            if entry is None:
+                entry = self.passes[pass_id] = dict(pass_id=pass_id, state="open", number=None, confidence=None,
+                                                    auto_confirm=None, provisional=None, t_enter=None, t_cross=None,
+                                                    team=None, thumb_t=None)
                 while len(self.passes) > self.n_passes:
                     old, _ = self.passes.popitem(last=False)
                     self.thumbs.pop(old, None)
-        if t == "pass_start":
-            p["t_enter"] = ev.get("t_enter")
-            th = self.nearest_thumb(ev.get("t_video"))        # the frame being processed when the pass started
-            if th:
-                self._set_thumb(pid, th)
-        elif t == "pass_provisional":
-            p["provisional"] = ev.get("number")
-        elif t in ("pass_end", "pass_identity"):
-            p["t_enter"] = ev.get("t_enter", p["t_enter"])
-            p["t_cross"] = ev.get("t_cross", p["t_cross"])
-            if t == "pass_end":
-                p["state"] = "closed"
-                th = self.nearest_thumb(p["t_cross"])          # better: the frame where the car crosses the centre
-                if th:
-                    self._set_thumb(pid, th)
-            else:
-                p.update(state="read", number=ev.get("number"), confidence=ev.get("confidence"),
-                         auto_confirm=ev.get("auto_confirm"), team=ev.get("team"))
+            if kind == "pass_start":
+                entry["t_enter"] = ev.get("t_enter")
+                thumb = self.nearest_thumb(ev.get("t_video"))     # the frame being processed when the pass started
+                if thumb:
+                    self._set_thumb(pass_id, thumb)
+            elif kind == "pass_provisional":
+                entry["provisional"] = ev.get("number")
+            elif kind in ("pass_end", "pass_identity"):
+                entry["t_enter"] = ev.get("t_enter", entry["t_enter"])
+                entry["t_cross"] = ev.get("t_cross", entry["t_cross"])
+                if kind == "pass_end":
+                    entry["state"] = "closed"
+                    thumb = self.nearest_thumb(entry["t_cross"])  # better: the frame where the car crosses the centre
+                    if thumb:
+                        self._set_thumb(pass_id, thumb)
+                else:
+                    entry.update(state="read", number=ev.get("number"), confidence=ev.get("confidence"),
+                                 auto_confirm=ev.get("auto_confirm"), team=ev.get("team"))
 
     def _set_thumb(self, pid, th):
         with self.lock:
@@ -145,9 +147,9 @@ class StatusBoard:
     def fps(self):
         now = self.clock.mono()
         with self.lock:
-            n = sum(1 for m in self.frame_monos if now - m <= self.window_s)
+            n_recent = sum(1 for m in self.frame_monos if now - m <= self.window_s)
         span = min(self.window_s, max(1e-9, now - self.started_mono))
-        return round(n / span, 2) if n else 0.0
+        return round(n_recent / span, 2) if n_recent else 0.0
 
     def payload(self):
         cap = self.capture
@@ -168,12 +170,14 @@ class StatusBoard:
             warnings.append("disk low: %.1f GB free" % rec["free_gb"])
         if rec.get("disk_state") == "stopped":
             warnings.append("recording STOPPED: %.1f GB free" % rec["free_gb"])
+        if str(rec.get("state", "")).startswith(("error", "failed")):
+            warnings.append("recording " + rec["state"])
         beam = self.beam.status() if self.beam is not None else dict(enabled=False)
         warnings += beam_warnings(beam)
         with self.lock:
             passes = [dict(p, t_enter_iso=iso(p["t_enter"]), t_cross_iso=iso(p["t_cross"]), thumb_iso=iso(p["thumb_t"]),
                            thumb_url=("/thumb/%d.jpg?v=%.3f" % (p["pass_id"], p["thumb_t"])) if p["thumb_t"] else None)
-                      for p in reversed(self.passes.values())]
+                      for p in reversed(self.passes.values())]   # p = one pass entry
         return dict(now=iso(self.clock.wall()), uptime_s=round(self.clock.mono() - self.started_mono, 1),
                     info=self.info,
                     processing=dict(fps=fps, target_fps=self.target_fps, frames=self.frames,
@@ -269,6 +273,8 @@ def render_html(p):
         _e(k), _e(v.get("requested")), _e(v.get("read_back")) + ("" if v.get("accepted") else " (not accepted)"))
         for k, v in (info.get("settings") or {}).items())
     rec_cls = {"ok": "ok", "low": "warn", "stopped": "bad"}.get(rec.get("disk_state"), "ok")
+    if str(rec.get("state", "")).startswith(("error", "failed")):
+        rec_cls = "bad"
     rows = []
     for x in p["passes"]:
         img = '<img src="%s" alt="">' % _e(x["thumb_url"]) if x.get("thumb_url") else ""
@@ -283,8 +289,8 @@ def render_html(p):
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>rt status</title><style>%s</style></head>
 <body><h1>rt lap line &middot; %s</h1><small>%s &middot; up %.0f s &middot; %s</small>%s
 <h2>Processing</h2><span class="%s">%.1f fps</span> (target %.0f) &middot; %d frames &middot; %d dropped
-<h2>Camera</h2><span class="%s">%s</span> %s<br><small>%s %sx%s @ %s fps, raw MJPEG %s, %s grabbed, %s corrupt,
-%s reopens</small><table>%s</table>
+<h2>Camera</h2><span class="%s">%s</span> %s<br><small>%s %sx%s @ %s fps, read mode %s, %s camera frames, %s failed
+reads, %s corrupt, %s reopens, last frame %s s ago</small><table>%s</table>
 <h2>Clock offset</h2>%s
 <h2>Recording</h2><span class="%s">%s</span> %s<br><small>%s GB free (warn &lt; %s, stop &lt; %s) &middot; %s frames
 &middot; %s dropped &middot; %s</small>
@@ -294,8 +300,9 @@ def render_html(p):
         CSS, _e(p["info"].get("event", "")), _e(p["now"]), p["uptime_s"], _e(p["info"].get("version", "")), warn,
         fps_cls, pr["fps"], pr["target_fps"], pr["frames"], pr["dropped"],
         cam_cls, _e(cam.get("state")), _e(cam.get("detail", "")), _e(info.get("fourcc", "")), _e(info.get("width")),
-        _e(info.get("height")), _e(info.get("fps")), _e(cam.get("raw_mjpeg")), _e(cam.get("grabbed")),
-        _e(cam.get("corrupt")), _e(cam.get("reopens")), settings,
+        _e(info.get("height")), _e(info.get("fps")), _e(cam.get("read_mode")), _e(cam.get("camera_frames")),
+        _e(cam.get("failed_reads")), _e(cam.get("corrupt")), _e(cam.get("reopens")), _e(cam.get("last_frame_age_s")),
+        settings,
         off_html,
         rec_cls, _e(rec.get("state")), _e(rec.get("file") or ""), _e(rec.get("free_gb")), _e(rec.get("warn_free_gb")),
         _e(rec.get("stop_free_gb")), _e(rec.get("frames")), _e(rec.get("dropped")), _e(rec.get("encoder") or ""),
@@ -330,14 +337,51 @@ none %s / ambiguous %s &middot; %s</small>
         _e(a.get("ambiguous")), _e(led_txt), rows)
 
 
+class StatusHTTPServer(ThreadingHTTPServer):
+    """The stdlib HTTP server, but on Windows it refuses a port another program already uses. Python's HTTPServer
+    sets SO_REUSEADDR, and on Windows that lets a second program bind a port that is already listening (both
+    "own" it and requests go to either), so a busy port would go unnoticed. SO_EXCLUSIVEADDRUSE makes the bind
+    fail instead, as it does on Linux."""
+
+    daemon_threads = True
+    if sys.platform == "win32":
+        allow_reuse_address = False
+
+        def server_bind(self):
+            if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            super().server_bind()
+
+
+def start_status_server(board, bind, port, required, log=print, warn=print):
+    """Start the status page. If the port cannot be opened (another rt, or another program, uses it):
+      * required (rt started by the launcher, which watches rt through this page): say why and exit with
+        EXIT_STATUS_PORT_BUSY. Running on would be pointless: the launcher would see no page, call rt stalled and
+        kill it every ~90 s, forever, without saying why.
+      * not required (a manual run): warn and run without the page. Returns the server, or None."""
+    from .config import EXIT_STATUS_PORT_BUSY
+    try:
+        server = StatusServer(board, bind, int(port)).start()
+    except OSError as e:
+        msg = ("status page cannot listen on port %s (%s): another program, or another rt, is using it. Close it, "
+               "or set status.port to a free port in the config (the launcher reads the same setting)" % (port, e))
+        if required:
+            warn(msg + ". Exiting: the launcher needs the status page to watch rt.")
+            print("rt: " + msg, file=sys.stderr, flush=True)
+            raise SystemExit(EXIT_STATUS_PORT_BUSY)
+        warn(msg + ". Running without the status page.")
+        return None
+    log("status page: http://%s:%d/" % ("localhost" if bind in ("0.0.0.0", "") else bind, server.port))
+    return server
+
+
 class StatusServer:
     """Serves the board on (bind, port) from a background thread. stop() closes it."""
 
     def __init__(self, board, bind="0.0.0.0", port=8765, log=print):
         self.board = board
         handler = self._handler()
-        self.httpd = ThreadingHTTPServer((bind, int(port)), handler)
-        self.httpd.daemon_threads = True
+        self.httpd = StatusHTTPServer((bind, int(port)), handler)
         self.port = self.httpd.server_address[1]
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self.log = log

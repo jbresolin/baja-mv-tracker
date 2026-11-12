@@ -48,15 +48,15 @@ def kill_tree(proc, timeout=10.0):
             procs = parent.children(recursive=True) + [parent]
         except psutil.NoSuchProcess:
             procs = []
-        for p in procs:
+        for process in procs:
             try:
-                p.terminate()
+                process.terminate()
             except psutil.NoSuchProcess:
                 pass
         _, alive = psutil.wait_procs(procs, timeout=timeout)
-        for p in alive:
+        for process in alive:
             try:
-                p.kill()
+                process.kill()
             except psutil.NoSuchProcess:
                 pass
     except ImportError:
@@ -85,11 +85,16 @@ def probe_status(url, timeout=2.0):
     """What the launcher needs from rt's status page: {"fps": processing fps, "camera_state": the camera's state
     ("streaming", "lost", ...; None if the page has no camera)}, or None if the page does not answer."""
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as r:
-            payload = json.loads(r.read().decode("utf-8"))
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
         return dict(fps=float(payload["processing"]["fps"]), camera_state=(payload.get("camera") or {}).get("state"))
     except Exception:  # noqa: BLE001
         return None
+
+
+# Exit codes of rt/run.py that mean something specific, named in the launcher log.
+EXIT_REASONS = {C.EXIT_STATUS_PORT_BUSY: "the status page's port is busy: another program or another rt uses it; "
+                                         "see rt's console. Close it or change status.port"}
 
 
 class Supervisor:
@@ -139,9 +144,10 @@ class Supervisor:
             if self.next_start_at is None or now >= self.next_start_at:
                 self._start(now)
             return
-        rc = self.proc.poll()
-        if rc is not None:
-            self._schedule_restart(now, "rt exited with code %s" % rc)
+        return_code = self.proc.poll()
+        if return_code is not None:
+            why = EXIT_REASONS.get(return_code)
+            self._schedule_restart(now, "rt exited with code %s%s" % (return_code, " (%s)" % why if why else ""))
             return
         if not self.check_stall or now - self.started_at < self.grace_s:
             return
@@ -193,14 +199,18 @@ class FileLog:
 
 
 def build_command(cfg, config_path, python=None, now=None):
-    """The rt/run.py command for one run, with a fresh output file named after the start time."""
-    la = cfg["launch"]
+    """The rt/run.py command for one run, with a fresh output file named after the start time. With the status page
+    on, rt is told it is required (--require-status): the launcher watches rt through it, so rt must exit with a
+    clear message, not run on blind, if its port is busy."""
+    launch_cfg = cfg["launch"]
     now = now or dt.datetime.now()
-    out_dir = C.resolve(la["out_dir"]) / now.strftime("%Y-%m-%d")
-    out = out_dir / ("%s_%s.jsonl" % (la.get("name", "lapline"), now.strftime("%H-%M-%S")))
-    cmd = [python or sys.executable, str(ROOT / "rt" / "run.py"), "--source", str(la["source"]), "--event",
-           str(la["event"]), "--config", str(config_path), "--out", str(out)]
-    return cmd + [str(x) for x in la.get("extra_args", [])]
+    out_dir = C.resolve(launch_cfg["out_dir"]) / now.strftime("%Y-%m-%d")
+    out = out_dir / ("%s_%s.jsonl" % (launch_cfg.get("name", "lapline"), now.strftime("%H-%M-%S")))
+    cmd = [python or sys.executable, str(ROOT / "rt" / "run.py"), "--source", str(launch_cfg["source"]), "--event",
+           str(launch_cfg["event"]), "--config", str(config_path), "--out", str(out)]
+    if cfg["status"].get("enabled", True):
+        cmd.append("--require-status")
+    return cmd + [str(arg) for arg in launch_cfg.get("extra_args", [])]
 
 
 def main():
@@ -209,28 +219,28 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="print the rt command and exit")
     a = ap.parse_args()
     cfg = C.load(a.config)
-    la, st = cfg["launch"], cfg["status"]
-    if not la.get("event"):
+    launch_cfg, status_cfg = cfg["launch"], cfg["status"]
+    if not launch_cfg.get("event"):
         raise SystemExit("launch.event is empty in %s" % a.config)
     if a.dry_run:
         print(build_command(cfg, a.config))
         return
-    log = FileLog(C.resolve(la["out_dir"]) / "launcher.log")
-    url = "http://127.0.0.1:%d/status.json" % int(st["port"])
-    check = bool(st.get("enabled", True))
+    log = FileLog(C.resolve(launch_cfg["out_dir"]) / "launcher.log")
+    url = "http://127.0.0.1:%d/status.json" % int(status_cfg["port"])
+    check = bool(status_cfg.get("enabled", True))
     if not check:
         log("WARNING status page disabled: stalls cannot be detected, only exits")
     sup = Supervisor(make_cmd=lambda: build_command(cfg, a.config),
                      spawn=lambda cmd: subprocess.Popen(cmd, cwd=str(ROOT)),
                      probe=lambda: probe_status(url), kill=kill_tree, clock=time.monotonic, log=log,
-                     first_wait_s=float(la["restart_first_s"]), max_wait_s=float(la["restart_max_s"]),
-                     stall_s=float(la["stall_s"]), grace_s=float(la["startup_grace_s"]),
-                     healthy_reset_s=float(la["healthy_reset_min"]) * 60, check_stall=check)
+                     first_wait_s=float(launch_cfg["restart_first_s"]), max_wait_s=float(launch_cfg["restart_max_s"]),
+                     stall_s=float(launch_cfg["stall_s"]), grace_s=float(launch_cfg["startup_grace_s"]),
+                     healthy_reset_s=float(launch_cfg["healthy_reset_min"]) * 60, check_stall=check)
     log("launcher start: config %s, status %s" % (a.config, url))
     try:
         while True:
             sup.tick()
-            time.sleep(float(la.get("poll_s", 2)))
+            time.sleep(float(launch_cfg.get("poll_s", 2)))
     except KeyboardInterrupt:
         log("launcher interrupted (Ctrl+C)")
     finally:

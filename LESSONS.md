@@ -1682,6 +1682,40 @@ tracker, models and the file capture are unchanged, so the 26SE replay numbers a
   "manual" (driver-dependent; the read-back on the status page tells), w32tm "Phase Offset" parsing on a non-English
   Windows (shows "unknown" then; set `clock.ntp_server` for a real SNTP measurement), QSV/AMF on the T14.
 
+### Review fixes on PR #1 (2026-11-12): what OpenCV's DirectShow backend really does
+
+The reviewer read OpenCV 4.x `modules/videoio/src/cap_dshow.cpp`. **Corrections of the bullets above:**
+
+* **Correction: "grab() every frame, retrieve() only the processed ones" saves nothing on DirectShow and busy-loops.**
+  DirectShow's `grabFrame()` returns True at once (it only checks that the device is not disconnected); the wait for
+  a new frame (up to ~1 s) is inside `retrieve()`, which also decodes, and DirectShow ignores `CONVERT_RGB = 0` for
+  MJPG (so `raw_mjpeg` never gave JPEG bytes there). Now `camera.read_mode = auto` picks per backend:
+  `retrieve_every_frame` on DirectShow (one grab + one waiting retrieve per camera frame, stamped right after the
+  retrieve, 2 of 3 dropped in software: the decode of all 30 fps is paid, ~1.2 cores on a throttled U-series per
+  the WP11 table; to be measured on the T14), `grab_then_retrieve` only on V4L2 where grab really blocks.
+  `FakeDshowCamera` in rt/camsource.py copies the DirectShow behaviour for the tests. Possible future sources (not
+  implemented): MSMF if its grab blocks per frame, or ffmpeg `-f dshow -vcodec mjpeg` copying the camera JPEGs.
+* **Correction: timestamps are taken after retrieve() on DirectShow, not at grab().** They include the MJPEG decode
+  (~10-20 ms); fold it into `capture.live_latency_s` when the latency is measured (LED / beam, WP-L2).
+* **An unplug on DirectShow is edge-triggered**: one grab() returns False, then grab() is True again and retrieve()
+  times out every second. The old "30 failed grabs" rule never fired, so the camera was never reopened in-process.
+  Loss is now "no good frame for `camera.lost_after_s` = 3 s (monotonic) or 10 failed reads in a row".
+* **Correction: `recording.mode = "mjpeg"` (copy) is not possible with this capture** (frames arrive decoded) and is
+  refused at start, as is `all_frames`; H.264 only (QSV / AMF probed at start and logged, else x264). The MJPEG
+  disk numbers above (66-89 / 22-30 GB/h) stay as measurements but no longer apply to rt. The ~4.2 GB/h figure is
+  x264 CRF 23; QSV / AMF sizes are not measured yet.
+* Recording files now split at a camera loss or a gap of > 2 frame periods (the file rate is nominal, so a file
+  spanning a gap replays shifted), the `.frames.csv` is authoritative and the replay (`FileCapture`) uses it.
+  ffmpeg's stderr goes to `<segment>.ffmpeg.log` (an unread pipe can fill and freeze ffmpeg); a watchdog kills an
+  ffmpeg that does not accept data for 10 s or exits, retries 10 s later, gives up after 5 failures in a row.
+* Python's `HTTPServer` sets SO_REUSEADDR; **on Windows that lets a second program bind a port that is already
+  listening**, so a busy status port would go unnoticed. The status server binds with SO_EXCLUSIVEADDRUSE on
+  Windows, and with `--require-status` (the launcher passes it) rt exits with code 3 if the port is busy.
+* **Correction: the w32tm parsing was English-only**, and `subprocess.run(text=True)` could fail to decode cp850
+  bytes of a pt-BR console (reported as "w32tm not available"). It is now read by layout (field order and value
+  shapes) from bytes decoded with the console code page. No real pt-BR `w32tm /query /status /verbose` capture was
+  available: paste one from the T14 into rt/tests/test_timesync.py to replace the constructed sample.
+
 ## Session 3: beam input for rt/ (WP-L2, AUTOPTZ-23, 2026-11-12)
 
 Code: `rt/beam/` (`sources.py` drivers modem-line / byte-stream / fake, `grouping.py` edges -> breaks + stuck beam,
@@ -1692,8 +1726,9 @@ unchanged (beam results are separate `pass_beam` events), so the 26SE replay num
 the adapter arrived: how the pulse reaches the PC (a modem line or bytes) is still unknown, hence two drivers and the
 probe.
 
-* **Clocks**: beam edges are stamped with the same `time.time()` / `time.monotonic()` pair as frames at `grab()`.
-  `t_beam` gets `clock.offset_s` like frames but NOT `capture.live_latency_s` (a camera property), so `t_cross -
+* **Clocks**: beam edges are stamped with the same `time.time()` / `time.monotonic()` pair as frames. On DirectShow
+  frames are stamped after `retrieve()` (decode included, see the PR #1 review fixes above), so frame times run late
+  by the decode time; `assoc_offset_s` and the LED latency absorb it. `t_beam` gets `clock.offset_s` like frames but NOT `capture.live_latency_s` (a camera property), so `t_cross -
   t_beam` = camera latency + where the camera's centre line sits relative to the beam + the pass logic's definition
   of t_cross. fuse_beam.py estimates that offset from clean single matches; `assoc_offset_s` takes it for live use.
 * **Isolation**: the reader thread does nothing but read and stamp (it never takes rt's emitter lock or writes a

@@ -22,7 +22,8 @@ class FakeCapture:
     def status(self):
         return dict(state="streaming", detail="", device="0", info=dict(fourcc="MJPG", width=1920, height=1080, fps=30,
                     settings={"exposure": dict(requested=-10, accepted=True, read_back=-10.0)}),
-                    raw_mjpeg=True, grabbed=900, corrupt=0, reopens=0)
+                    read_mode="retrieve_every_frame", raw_mjpeg=False, camera_frames=900, failed_reads=0, corrupt=0,
+                    reopens=0, last_frame_age_s=0.03)
 
 
 class FakeRecorder:
@@ -32,7 +33,7 @@ class FakeRecorder:
     def status(self):
         return dict(state="recording", file="rec_2026-11-21_09-00-00.mkv", frames=100, dropped=0,
                     free_gb=self.free_gb, disk_state=self.disk_state, warn_free_gb=20, stop_free_gb=5,
-                    encoder="copy (MJPEG)")
+                    encoder="libx264")
 
 
 def board_running(cfg, seconds=12.0, fps=10):
@@ -41,9 +42,9 @@ def board_running(cfg, seconds=12.0, fps=10):
     b = StatusBoard(cfg, clock)
     b.capture, b.recorder = FakeCapture(), FakeRecorder()
     img = np.zeros((90, 160, 3), np.uint8)
-    for k in range(int(seconds * fps)):
+    for frame_no in range(int(seconds * fps)):
         clock.advance(1.0 / fps)
-        b.on_frame(make_frame(clock.wall(), k, img))
+        b.on_frame(make_frame(clock.wall(), frame_no, img))
     return b, clock
 
 
@@ -138,3 +139,47 @@ def test_http_server_serves_page_json_and_thumbnails(cfg):
             urllib.request.urlopen(base + "/thumb/999.jpg", timeout=5)
     finally:
         srv.stop()
+
+
+# ------------------------------------------------------------------------------------------------ busy port
+@pytest.fixture
+def busy_port():
+    """A port on this machine that some other program is already listening on (here: a plain socket)."""
+    import socket
+    other_program = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    other_program.bind(("127.0.0.1", 0))           # port 0 = the system picks a free port
+    other_program.listen(1)
+    yield other_program.getsockname()[1]
+    other_program.close()
+
+
+def test_busy_port_when_required_exits_with_code_3_and_says_why(cfg, busy_port):
+    # Started by the launcher (required = True): rt must stop with a clear message and exit code 3. Running on
+    # without the page would make the launcher kill it as "stalled" every ~90 s, forever, without saying why.
+    from rt.status import start_status_server
+    warnings = []
+    with pytest.raises(SystemExit) as stopped:
+        start_status_server(StatusBoard(cfg), "127.0.0.1", busy_port, required=True, log=lambda m: None,
+                            warn=warnings.append)
+    assert stopped.value.code == 3
+    assert "cannot listen on port %d" % busy_port in warnings[0] and "status.port" in warnings[0]
+
+
+def test_busy_port_in_a_manual_run_only_warns(cfg, busy_port):
+    # Run by hand (not required): rt goes on without the page, with a warning.
+    from rt.status import start_status_server
+    warnings = []
+    server = start_status_server(StatusBoard(cfg), "127.0.0.1", busy_port, required=False, log=lambda m: None,
+                                 warn=warnings.append)
+    assert server is None
+    assert "Running without the status page" in warnings[0]
+
+
+def test_free_port_starts_the_page(cfg):
+    from rt.status import start_status_server
+    lines = []
+    server = start_status_server(StatusBoard(cfg), "127.0.0.1", 0, required=True, log=lines.append)
+    try:
+        assert server is not None and lines[0].startswith("status page: http://127.0.0.1:")
+    finally:
+        server.stop()
