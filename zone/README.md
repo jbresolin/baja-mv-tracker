@@ -96,6 +96,7 @@ spotter frame -> car detector on the corridor ROI (rt/) -> ByteTrack (rt/) -> s,
 | `zonefile.py` | `zone.json`: path points, keyframes (pose + preset), corridor; save with backup |
 | `path.py` | `s` along the path, projection with a monotonic window, pose(s) (pchip / linear, with ease-in) |
 | `spotter.py` | corridor ROI crop (`downscale` / `tile` / `full`) in front of the rt detector, then rt's ByteTrack |
+| `bench_detector.py` | bench only: a stock COCO YOLO11 in place of the Baja detector (`spotter.detector = "coco"`) |
 | `progress.py` | s/v Kalman filter per track, speed profile learned from finished passes (`zone.speed.json`) |
 | `director.py` | STOPPED / PASSIVE / AUTO (waiting, tracking, returning) and the lock / drop rules |
 | `speedmap.py` | wanted rate -> speed step: inverse table, hysteresis, ramp, minimum smooth step |
@@ -173,6 +174,63 @@ report too.
   the defaults and once with `--set profile=strict` (or `profile = "strict"` in `site.toml`), and compare the PTZ
   recordings and the replay scores. Profiles live in `[profiles.<name>]` at the end of `zone.example.toml`; `--set`
   still wins over them.
+
+### Bench detector (COCO, home tests only)
+
+The deployed car detector was trained on Baja buggies and may barely see ordinary street cars. For a bench test with
+the spotter pointed at a public street, the spotter can use a stock COCO-trained YOLO11n instead:
+`spotter.detector = "coco"` (default `"baja"`). The COCO classes in `spotter.coco_classes` (default car, truck, bus,
+motorcycle; add `"person"` for a walk test) all become the tracker's single "car" class, with their own threshold
+`spotter.coco_conf` (default 0.25). Everything after the detector (ROI crop, ByteTrack, progress, director,
+controller) is unchanged.
+
+* Each box is scored by its best class **among the selected ones**, so a van whose top COCO class is "train" or
+  "boat" still counts (rt's Baja detector keeps the usual best-of-all-classes rule).
+* YOLO removes duplicate boxes per class only, so one pickup can come out as both "car" and "truck". Two boxes of
+  any selected classes that overlap by more than `spotter.coco_agnostic_iou` (default 0.5, IoU) are one vehicle:
+  the weaker one is dropped. Raise it if two cars side by side get merged; lower it if one vehicle gets two tracks.
+* `spotter.detector` must be `"baja"`, `"coco"` or `"blobs"` (`"rt"` = old name of `"baja"`). Any other value, e.g.
+  a typo, now stops the program at startup with an error listing the valid ones (before, any unknown value
+  silently ran the Baja detector).
+
+**Bench only.** COCO models are unreliable on muddy Baja cars (LESSONS.md), and the Ultralytics YOLO11 weights are
+**AGPL-3.0**: don't ship it in the race setup. While it is on, the page shows an amber "DETECTOR DE BANCADA (COCO)"
+banner in the header and a red "detector" line in the health panel, and the console prints a warning at startup.
+
+Export the model once on your PC, in a separate venv (ultralytics pulls in torch; keep it out of the tracker's env).
+In a `cmd` window:
+
+```
+python -m venv %USERPROFILE%\venv-yolo-export
+%USERPROFILE%\venv-yolo-export\Scripts\activate
+pip install ultralytics
+yolo export model=yolo11n.pt format=onnx "imgsz=[384,640]" opset=17 simplify=True dynamic=False
+copy yolo11n.onnx <repo>\deploy\models\yolo11n_coco.onnx
+```
+
+* `yolo11n.pt` is downloaded by the first command that needs it; `yolo11n.onnx` is written next to it (the current
+  folder).
+* `imgsz=[384,640]` (height, width) is the input the spotter feeds the Baja detector: a `downscale` ROI crop is
+  letterboxed to it and `tile` mode cuts tiles of that size. Keep it in quotes (PowerShell would split the comma).
+* `opset=17` loads in the repo's onnxruntime (1.31; any opset up to 21 is fine). `dynamic=False` = fixed input
+  shape, which `rt.models.YoloOnnx` reads from the file.
+* Check: `python -c "import onnxruntime as o; s = o.InferenceSession('deploy/models/yolo11n_coco.onnx'); print(s.get_inputs()[0].shape, s.get_outputs()[0].shape)"`
+  prints `[1, 3, 384, 640] [1, 84, 5040]`. The tracker refuses at startup a missing file or a model whose output is
+  not `(1, 84, N)` (80 classes).
+
+Run it with the `bench` profile (detector only) or `bench_strict` (bench detector + the `strict` controller, since only
+one profile can be active at a time). The profiles only switch `spotter.detector`; a `coco_model` (or any other
+`coco_*` key) set in `site.toml` is kept:
+
+```
+python -m zone.app --config zone/configs/site.toml --set profile=bench
+python -m zone.app --config zone/configs/site.toml --set profile=bench_strict
+python -m zone.app --config zone/configs/site.toml --set profile=bench --set "spotter.coco_classes=['person']"
+```
+
+Through the launcher (restarts on crash): copy `site.toml` to `site_bench.toml`, add `profile = "bench"` (or
+`"bench_strict"`) as its first line (before any `[section]`), and run `zone\run_zone.bat zone\configs\site_bench.toml`.
+`site.toml` itself stays race-ready.
 
 ### Offline tools
 

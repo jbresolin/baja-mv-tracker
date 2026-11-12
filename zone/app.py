@@ -303,7 +303,9 @@ class ZoneApp:
                         spotter_recording=self.recorder.status() if self.recorder else None,
                         ptz_recording=self.ptz_recording_state(), ptz_driver=self.cfg["ptz"]["driver"],
                         branch=self.settings.controller.branch, report=self.settings.report.summary(),
-                        source=getattr(self.source, "description", "")))
+                        source=getattr(self.source, "description", ""),
+                        # which car detector runs; bench=True (COCO) makes the page show a "bench detector" warning
+                        detector=getattr(self.spotter, "detector_info", None)))
 
     def frame_jpeg(self):
         with self.frame_lock:

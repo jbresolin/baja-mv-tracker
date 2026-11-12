@@ -222,7 +222,12 @@ function render(s) {
   const h = s.health;
   const gb = h.disk_free_gb;
   const sr = h.spotter_recording, pr = h.ptz_recording;
+  // the bench-only COCO detector must not be left on at the race: a banner in the header + a red health line
+  const det = h.detector;
+  $("#benchWarn").style.display = det && det.bench ? "" : "none";
   kv($("#health"), [
+    ["detector", det ? (det.bench ? `DETECTOR DE BANCADA (${det.kind}) – não usar na prova · ${det.desc}`
+                                  : `${det.kind} · ${det.desc}`) : "–", det && det.bench ? "bad" : ""],
     ["processamento", `${h.fps} fps (descartados ${h.dropped})`, h.fps < 7 ? "bad" : "good"],
     ["último quadro", `${s.frame.age_s} s atrás`, s.frame.age_s > 2 ? "bad" : ""],
     ["PTZ", `${h.ptz_driver} · ${h.ptz_reachable === null || h.ptz_reachable === undefined
