@@ -434,3 +434,58 @@ def test_run_py_starts_the_beam_only_when_configured(cfg):
     cfg["beam"].update(driver="modem-line", line="txd")                                       # a typo in the config
     assert start_beam(cfg, FakeEmitter(), None, True, print, warnings.append) is None
     assert "beam input NOT started" in warnings[0]
+
+
+# ------------------------------------------------------------------------------------------------ thread race
+class RacySource(FakeBeamSource):
+    """A fake driver that lets the test run "the dispatcher thread" at the worst possible moment: after the reader
+    has stamped an edge but before that edge is in the queue. In real life the two threads can interleave exactly
+    like that, for a fraction of a millisecond."""
+
+    def __init__(self, *args, between=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.between = between          # called inside poll(), after stamping, before returning the edges
+
+    def poll(self):
+        edges = super().poll()
+        if edges and self.between is not None:
+            self.between()
+        return edges
+
+
+def test_dispatcher_does_not_close_a_break_before_the_reader_queued_its_next_edge(cfg):
+    # One car: pulses at T+0.50 and T+0.70 (0.2 s apart, less than group_gap_s = 0.25: ONE break).
+    # The second pulse is stamped at T+0.70; then, before it reaches the queue, the clock jumps 0.1 s (the PC was
+    # busy) and the dispatcher runs. Measured from "now" (T+0.80) the break looks quiet for 0.3 s and would be
+    # closed, splitting the car into two breaks. The dispatcher must only advance up to what the reader queued.
+    clock = TickingClock(wall=WALL0, mono=T)
+    cfg["beam"].update(driver="fake")
+    svc_box = []
+
+    def dispatcher_runs_now():
+        clock.advance(0.1)                      # the reader thread is delayed between stamping and queueing
+        svc_box[0].dispatch_step(timeout=0)     # ... and the dispatcher runs meanwhile
+
+    src = RacySource([(T + 0.50, 1), (T + 0.53, 0), (T + 0.70, 1), (T + 0.73, 0)], clock=clock, sleep=clock.sleep,
+                     poll_s=0.01)
+    events = []
+    svc = BeamService(cfg, events.append, source=src, clock=clock, sleep=clock.sleep)
+    svc_box.append(svc)
+    run_for(svc, clock, 0.65)                   # first pulse handled normally
+    src.between = dispatcher_runs_now           # the next poll that returns an edge triggers the race
+    run_for(svc, clock, 2.0)
+    breaks = of_type(events, "beam_break")
+    assert len(breaks) == 1                     # one car = one break, the race did not split it
+    assert breaks[0]["n_pulses"] == 2
+
+
+def test_grouping_time_is_behind_now_by_the_guard(cfg):
+    # Without any reader information, the grouper is advanced to now - advance_guard_s (20 ms by default).
+    svc, _, clock = make_service(cfg, [])
+    now = clock.mono()
+    assert svc._grouping_time(now, None) == pytest.approx(now - 0.02)
+    # With a reader horizon 5 ms ago: that one (it is earlier).
+    assert svc._grouping_time(now, now - 0.005) == pytest.approx(now - 0.02)
+    assert svc._grouping_time(now, now - 0.5) == pytest.approx(now - 0.5)
+    # A reader silent for more than 1 s does not hold the grouping back.
+    assert svc._grouping_time(now, now - 5.0) == pytest.approx(now - 0.02)

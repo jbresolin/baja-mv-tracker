@@ -56,6 +56,8 @@ class BeamService:
         self.assoc_window = float(b.get("assoc_window_s", 1.0))
         self.assoc_offset = float(b.get("assoc_offset_s", 0.0))
         self.max_edge_events = int(b.get("max_edge_events_per_s", 100))
+        # The dispatcher never lets the grouper's time run past what the reader has surely queued (see _advance).
+        self.advance_guard = float(b.get("advance_guard_s", 0.02))
         self.poll_report_s = float(b.get("poll_report_s", 60))
         self.led = LedWatcher(b.get("led_roi") or [], float(b.get("led_threshold", 128)))
         self.led_max_latency = float(b.get("led_max_latency_s", 0.5))
@@ -69,6 +71,9 @@ class BeamService:
         self.next_open_mono = None
         self.polled_since_open = False
         self.last_poll_report = None
+        # Monotonic time up to which every edge the reader has seen is already in the queue. Written by the reader
+        # (one float assignment, atomic in Python) AFTER it queued a poll's edges; read by the dispatcher.
+        self.reader_horizon_mono = None
 
         # dispatcher-thread state
         self.state, self.detail, self.state_since = "starting", "", self.clock.wall()
@@ -123,6 +128,8 @@ class BeamService:
         for e in edges:
             self.q.put(("edge", e))
         now = self.clock.mono()
+        # Every edge stamped up to `now` is queued: any later edge will be stamped later than this.
+        self.reader_horizon_mono = now
         if now - self.last_poll_report >= self.poll_report_s:
             self.last_poll_report = now
             self.q.put(("poll", self.source.poll_stats.report(now)))
@@ -174,13 +181,16 @@ class BeamService:
             item = self.q.get(timeout=timeout) if timeout > 0 else self.q.get_nowait()
         except queue.Empty:
             item = None
+        # Read the reader's horizon BEFORE draining the queue: the reader queues its edges first and moves the
+        # horizon after, so every edge up to this horizon is in the queue now and gets handled below.
+        horizon = self.reader_horizon_mono
         while item is not None:
             self._handle(item)
             try:
                 item = self.q.get_nowait()
             except queue.Empty:
                 item = None
-        self._advance()
+        self._advance(horizon)
 
     def _dispatch_loop(self):
         while not self.halt.is_set():
@@ -296,11 +306,22 @@ class BeamService:
                            "(someone in the beam? sensor misaligned? wrong polarity?)" % self.grouper.stuck_s)
             self.emit(ev)
 
-    def _advance(self):
+    def _grouping_time(self, now_mono, reader_horizon):
+        """How far the grouper may let time pass. Not simply "now": the reader may have stamped an edge a moment ago
+        and not queued it yet; closing a break at "now" could then split one car into two breaks. So: at most
+        now - advance_guard_s, and never past the reader's horizon (everything up to it is queued). A reader that
+        has published nothing for over 1 s (port closed, PC stalled) cannot hold the grouping back forever."""
+        t = now_mono - self.advance_guard
+        if reader_horizon is not None and now_mono - reader_horizon < 1.0:
+            t = min(t, reader_horizon)
+        return t
+
+    def _advance(self, reader_horizon=None):
         now_mono, now_wall = self.clock.mono(), self.clock.wall()
         if self.edge_log_window and now_mono - self.edge_log_window[0] >= 1.0:
             self._flush_not_logged()          # the noisy second is over even if no edge followed it
-        for rec in self.grouper.advance(now_mono, now_wall):
+        t_group = self._grouping_time(now_mono, reader_horizon)
+        for rec in self.grouper.advance(t_group, now_wall - (now_mono - t_group)):
             self._on_record(rec)
         self._associate_ready(now_wall + self.offset)
         self._match_led(now_mono)
