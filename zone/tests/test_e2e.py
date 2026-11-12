@@ -144,3 +144,39 @@ def test_big_stop_stops_the_camera_immediately():
     clock.advance(0.5)
     assert not ptz.is_moving()
     assert rt.director.mode == D.STOPPED
+
+
+def test_divergence_guard_drops_the_car_and_returns_to_the_entry():
+    # Follow a car normally; once it's locked, pretend the camera got lost: every cycle the controller is told the
+    # camera points 200 degrees away. After more than `divergence_cycles` cycles the runtime must give the car up
+    # (drop reason "diverged", logged as a "divergence" event) and recall the entry preset.
+    scene = Scene()
+    zone = scene.make_zone()
+    model = PtzModel(inquiry_mode="never", pan_units_per_degree=UNITS_PER_DEGREE,
+                     tilt_units_per_degree=UNITS_PER_DEGREE)
+    st = settings("B", model=model, sets=["controller.divergence_cycles=5"])
+    clock = FakeClock(0.0)
+    ptz = SimulatedPtz(model, clock)
+    for k in zone.keyframes():
+        ptz.define_preset(k.preset, k.pan, k.tilt, k.zoom)
+    events = []
+    rt = ZoneRuntime(st, zone, ptz, clock, on_event=events.append)
+    cars, trk = [Car(scene, 2.0)], ByteTracker()
+    rt.set_mode(D.AUTO)
+    tracked_cycles = 0
+    for k in range(200):
+        t = k * 0.1
+        clock.advance(max(0.0, t + 0.05 - clock.monotonic()))
+        if rt.director.sub == D.TRACKING:
+            rt.controller.pose.set_known(-200 * UNITS_PER_DEGREE, 0)      # "the camera is somewhere else"
+            tracked_cycles += 1
+        b, s = boxes_at(scene, cars, t)
+        rt.cycle(ZoneFrame(None, t, 1.8e9 + t, k), trk.update(b, s))
+        if any(e.get("event") == "release" for e in events):
+            break
+    release = [e for e in events if e.get("event") == "release"]
+    assert release and release[0]["reason"] == "diverged"
+    assert tracked_cycles == 6                       # 5 cycles tolerated, dropped on the 6th
+    assert any(e.get("type") == "divergence" for e in events)
+    assert rt.director.sub == D.RETURNING
+    assert ptz.commands[-1][1] == "preset_recall"    # the last thing sent: back to the entry

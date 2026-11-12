@@ -148,6 +148,18 @@ otherwise **B**. Forcing A on a camera that can't answer while moving falls back
 "auto" in the example config (latency, settle time, inquiry rate, minimum smooth step, pan/tilt sign) come from the
 report too.
 
+### Divergence guard and the `strict` profile
+
+* **Divergence guard** (`controller.divergence_deg = 15`, `divergence_cycles = 5`): every cycle the target is
+  compared with where the controller believes the camera is (dead reckoning in Branch B, inquiry in A). When the gap
+  stays over the limit for more than N cycles in a row, the car is dropped (reason `diverged`, plus a `divergence`
+  event in the control log with the gap) and the PTZ goes back to the entry. `divergence_deg = 0` turns it off.
+* **`strict` profile**: Branch B as pure feed-forward: `dead_reckoning_trust_s = 0` (no feedback on the dead-reckoned
+  pose) and `k_quant = 0` (no quantization compensation). For Sunday's comparison, run the same cars twice, once with
+  the defaults and once with `--set profile=strict` (or `profile = "strict"` in `site.toml`), and compare the PTZ
+  recordings and the replay scores. Profiles live in `[profiles.<name>]` at the end of `zone.example.toml`; `--set`
+  still wins over them.
+
 ### Offline tools
 
 ```

@@ -15,7 +15,7 @@ from pathlib import Path
 from zone.controller import ControllerSettings
 from zone.director import DirectorSettings
 from zone.progress import ProgressSettings
-from zone.ptz.sim import PtzModel
+from zone.ptz.sim import DEFAULT_UNITS_PER_DEGREE, PtzModel
 from zone.speedmap import AxisSpeedMap
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -40,18 +40,30 @@ def _merge(base, user):
 
 
 def load(path=None, overrides=()):
-    """-> nested dict. `overrides` like ["controller.branch=B", "rt.capture.fps=5"]."""
+    """-> nested dict. `overrides` like ["controller.branch=B", "rt.capture.fps=5"].
+
+    Order: defaults (zone.example.toml) < user TOML < profile < overrides. A profile is a named set of changes in
+    the [profiles.<name>] tables, picked with the top-level key `profile` (in the user TOML, or
+    `--set profile=strict`). Profiles are for side-by-side comparison runs; `--set` still wins over them."""
     cfg = tomllib.loads(DEFAULT.read_text(encoding="utf-8"))
     if path and Path(path).resolve() != DEFAULT.resolve():
         _merge(cfg, tomllib.loads(Path(path).read_text(encoding="utf-8")))
     cfg = copy.deepcopy(cfg)
+    sets = {}
     for o in overrides:
         k, v = o.split("=", 1)
         parts = k.strip().split(".")
-        d = cfg
+        d = sets
         for p in parts[:-1]:
             d = d.setdefault(p, {})
         d[parts[-1]] = _parse_value(v.strip())
+    name = sets.get("profile", cfg.get("profile", "")) or ""
+    if name:
+        profiles = cfg.get("profiles", {})
+        if name not in profiles:
+            raise ValueError("unknown config profile %r (known: %s)" % (name, ", ".join(sorted(profiles)) or "none"))
+        _merge(cfg, copy.deepcopy(profiles[name]))
+    _merge(cfg, sets)
     return cfg
 
 
@@ -134,7 +146,10 @@ def build(cfg, report: Report = None) -> Settings:
         model_latency_s=float(m.command_latency_s),
         model_stop_latency_s=float(getattr(m, "stop_latency_s", m.command_latency_s)),
         model_ramp_s=float(m.ramp_s),
-        pan_sign=int(getattr(m, "pan_sign", 1) or 1), tilt_sign=int(getattr(m, "tilt_sign", 1) or 1))
+        pan_sign=int(getattr(m, "pan_sign", 1) or 1), tilt_sign=int(getattr(m, "tilt_sign", 1) or 1),
+        divergence_pan_units=float(c.get("divergence_deg", 0.0)) * units_per_degree(m, "pan"),
+        divergence_tilt_units=float(c.get("divergence_deg", 0.0)) * units_per_degree(m, "tilt"),
+        divergence_cycles=int(c.get("divergence_cycles", 5)))
 
     d = cfg["director"]
     settle = _auto(d["settle_s"], None)
@@ -168,6 +183,11 @@ def build(cfg, report: Report = None) -> Settings:
         director.s_lock = -ease
     return Settings(cfg, report, ctrl, director, progress, pan_map, tilt_map,
                     pose_source_for(cfg["teach"]["pose_source"], report))
+
+
+def units_per_degree(model, axis):
+    """Raw units per degree from the report, or the usual VISCA value when the bench didn't measure it."""
+    return float(getattr(model, axis + "_units_per_degree", None) or DEFAULT_UNITS_PER_DEGREE)
 
 
 def pose_source_for(choice, report: Report):

@@ -16,7 +16,9 @@ Modes (chosen on the page):
         * lost: no detection for longer than `lost_timeout_s` (meanwhile it's predicted ahead on the speed profile),
         * stopped: |v| below `stopped_v` for longer than `stopped_timeout_s`,
         * off the line: outside the corridor for more than `off_corridor_frames` frames in a row,
-        * gone: the track no longer exists at all.
+        * gone: the track no longer exists at all,
+        * diverged: the camera stayed too far from the target for too many cycles (the controller's divergence
+          guard; the runtime calls `drop()`).
       Either way: back to `returning`.
 
 The director never talks to the PTZ itself. `step()` returns a `Decision` and the runtime acts on it, which keeps
@@ -124,6 +126,13 @@ class Director:
         if reason:
             return self._release(t, reason, tr)
         return Decision(FOLLOW, tr)
+
+    def drop(self, t, reason, tr: Optional[TrackView] = None) -> Optional[Decision]:
+        """Let the locked car go for a reason found outside the director (the controller's divergence guard).
+        -> the RECALL_ENTRY decision, or None when no car is being tracked."""
+        if self.mode != AUTO or self.sub != TRACKING:
+            return None
+        return self._release(t, reason, tr)
 
     def _candidate(self, tracks):
         c = self.cfg

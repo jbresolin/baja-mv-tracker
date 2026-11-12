@@ -237,6 +237,16 @@ class ZoneRuntime:
             if decision.action == D.FOLLOW and decision.track is not None:
                 tr = decision.track
                 command = self.controller.follow(tr.s, tr.v, frame.t)
+                if command.diverged:
+                    # the divergence guard: the camera has been too far from the target for too long: give the car
+                    # up and go back to the entry for the next one (logged, and shown on the page as a drop)
+                    self._event(dict(type="divergence", track_id=tr.track_id, s=round(tr.s, 3),
+                                     gap_pan=round(command.gap_pan, 1), gap_tilt=round(command.gap_tilt, 1),
+                                     cycles=self.controller.diverged_cycles))
+                    decision = self.director.drop(now, "diverged", tr) or decision
+                    if decision.action == D.RECALL_ENTRY and self.zone.entry_preset is not None:
+                        self.controller.recall(self.zone.entry_preset, self.entry_pose(),
+                                               self.settings.director.settle_s)
             elif decision.action == D.RECALL_ENTRY and self.zone.entry_preset is not None:
                 self.controller.recall(self.zone.entry_preset, self.entry_pose(), self.settings.director.settle_s)
             elif decision.action == D.STOP:

@@ -4,6 +4,9 @@
 # Relative paths are relative to the repo root (the folder that holds zone/ and rt/).
 # "auto" means: take the value from the PTZ characterization report ([ptz] report), or a safe default without one.
 
+profile = ""                      # a named set of changes from [profiles.<name>] at the end of this file, applied on
+                                  # top of your config (and under --set). e.g. --set profile=strict
+
 [zone]
 file = "zones/zone.json"          # the taught zone (click-teach saves here; backups go to zones/zone_backups/)
 out_dir = "out/zone"              # control logs, spotter recordings, PTZ recordings
@@ -110,6 +113,9 @@ dead_reckoning_trust_s = 4.0      # Branch B: seconds of motion after a recall (
 k_quant = 1.5                     # quantization compensation (1/s): integrates "wanted - commanded rate" (whole speed
                                   # steps are up to ~15% off) and adds it back; 0 = off. Not pose feedback: B uses it too
 ttl_s = 0.3                       # every velocity command expires after this: a dead loop stops the camera
+divergence_deg = 15.0             # divergence guard: drop the car (-> back to the entry) when the target is more than
+divergence_cycles = 5             # this many degrees from the camera's estimated pose for more than this many cycles
+                                  # in a row (logged as a "divergence" event, drop reason "diverged"). 0 deg = off
 zoom_enabled = true
 zoom_min_interval_s = 0.5         # at most 2 zoom commands per second
 zoom_threshold = 150              # only re-send zoom when it changes by more than this (raw units)
@@ -162,3 +168,10 @@ stop_lock_timeout_s = 0.5         # big STOP: wait at most this long for the con
 backoff_initial_s = 2.0           # run_zone.bat: wait before restarting a crashed process, doubling each time ...
 backoff_max_s = 60.0              # ... up to this
 healthy_after_s = 60.0            # a process that ran this long resets the backoff
+
+# ------------------------------------------------------------------------------------------------- profiles
+# Named sets of changes, picked with `profile = "<name>"` (top of this file) or --set profile=<name>.
+
+[profiles.strict.controller]      # Branch B with pure feed-forward: no feedback on the dead-reckoned pose and no
+dead_reckoning_trust_s = 0.0      # quantization compensation. For a comparison run against the default (both
+k_quant = 0.0                     # corrections on), e.g. on Sunday's bench: see zone/README.md

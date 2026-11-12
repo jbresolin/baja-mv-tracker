@@ -59,6 +59,9 @@ class ControllerSettings:
     model_latency_s: float = 0.10        # dead reckoning: command -> motion delay (report command_latency_s)
     model_stop_latency_s: float = 0.10   # ... stop -> deceleration starts (report stop_latency_s)
     model_ramp_s: float = 0.20           # ... time to reach a new speed (report ramp_s)
+    divergence_pan_units: float = 0.0    # divergence guard: give the car up when |target - camera| exceeds this
+    divergence_tilt_units: float = 0.0   # (raw units, 0 = axis not checked) for more than divergence_cycles cycles
+    divergence_cycles: int = 5
     pan_sign: int = 1                    # +1: the reported raw pan grows with a positive (rightward) step; from the
     tilt_sign: int = 1                   # report. Poses (keyframes, inquiry) are in the reported frame; steps physical
 
@@ -233,6 +236,9 @@ class CycleCommand:
     zoom_sent: Optional[int]
     pose_now: PoseNow
     result_ok: bool = True
+    gap_pan: Optional[float] = None      # target minus where the camera will be (raw units), for the divergence guard
+    gap_tilt: Optional[float] = None
+    diverged: bool = False               # the gap was over the limit for more than divergence_cycles cycles
 
     def to_log(self):
         pn = self.pose_now
@@ -246,7 +252,10 @@ class CycleCommand:
                     pan_now=dict(pan=None if pn.pan is None else round(pn.pan, 1),
                                  tilt=None if pn.tilt is None else round(pn.tilt, 1),
                                  zoom=None if pn.zoom is None else round(pn.zoom, 1),
-                                 source=pn.source, trusted=pn.trusted), ok=self.result_ok)
+                                 source=pn.source, trusted=pn.trusted), ok=self.result_ok,
+                    gap=dict(pan=None if self.gap_pan is None else round(self.gap_pan, 1),
+                             tilt=None if self.gap_tilt is None else round(self.gap_tilt, 1)),
+                    diverged=self.diverged)
 
 
 class Controller:
@@ -266,6 +275,7 @@ class Controller:
         self.q_pan = self.q_tilt = 0.0  # quantization deficit (reported units): wanted minus commanded, integrated
         self.t_follow = None            # time of the last follow() (None = the next one starts a new segment)
         self.want = (0.0, 0.0)          # wanted rates of the last cycle (reported units/s)
+        self.diverged_cycles = 0        # consecutive cycles with the camera too far from the target
 
     def set_curve(self, curve: PoseCurve):
         self.curve = curve
@@ -288,15 +298,19 @@ class Controller:
         ff_pan, ff_tilt = slope.pan * v, slope.tilt * v
         pn = self.pose.estimate()
         fb_pan = fb_tilt = 0.0
-        if pn.trusted and pn.pan is not None:
+        gap_pan = gap_tilt = None
+        if pn.pan is not None and pn.source not in ("settling", "unknown"):
             # compare like with like: the target is where the car will be after `lookahead`, so compare it with
             # where the camera will be by then at its current speed (and the inquiry answer is `age_s` old). Without
             # this, the feedback always sees a phantom error of v * lookahead and overdrives the camera.
             horizon = lookahead + pn.age_s
             pan_then = pn.pan + c.pan_sign * self.pan_map.rate_of(self.pan_step) * horizon
             tilt_then = pn.tilt + c.tilt_sign * self.tilt_map.rate_of(self.tilt_step) * horizon
-            fb_pan = _clip(c.k_pan * (target.pan - pan_then), c.max_feedback_pan)
-            fb_tilt = _clip(c.k_tilt * (target.tilt - tilt_then), c.max_feedback_tilt)
+            gap_pan, gap_tilt = target.pan - pan_then, target.tilt - tilt_then
+            if pn.trusted:
+                fb_pan = _clip(c.k_pan * gap_pan, c.max_feedback_pan)
+                fb_tilt = _clip(c.k_tilt * gap_tilt, c.max_feedback_tilt)
+        diverged = self._check_divergence(gap_pan, gap_tilt)
         # rates are in the reported frame; the sign turns them into physical directions (+ step = right / up)
         want_pan, want_tilt = ff_pan + fb_pan, ff_tilt + fb_tilt
         # Quantization compensation: the camera only has whole speed steps, and with hysteresis the chosen step can
@@ -320,7 +334,21 @@ class Controller:
         ok = self._send_velocity()
         zoom_sent = self._maybe_zoom(target.zoom, now)
         return CycleCommand(s, v, s_ahead, lookahead, target, ff_pan, ff_tilt, fb_pan, fb_tilt, self.pan_step,
-                            self.tilt_step, zoom_sent, pn, ok)
+                            self.tilt_step, zoom_sent, pn, ok, gap_pan, gap_tilt, diverged)
+
+    def _check_divergence(self, gap_pan, gap_tilt):
+        """Divergence guard (mostly for Branch B, where nothing else notices). The camera's estimated position (dead
+        reckoning, or inquiry in Branch A) is compared with the target every cycle. If the gap stays above the limit
+        for more than `divergence_cycles` cycles in a row, the car can't be followed any more (it's faster than the
+        camera, the track jumped to another car, the speed table is wrong...): the runtime then drops it and goes
+        back to the entry, instead of chasing it with an ever larger error. -> True when that should happen."""
+        c = self.cfg
+        if gap_pan is None:
+            return False                     # no estimate (settling after a recall, or never known): no verdict
+        over = ((c.divergence_pan_units > 0 and abs(gap_pan) > c.divergence_pan_units)
+                or (c.divergence_tilt_units > 0 and abs(gap_tilt) > c.divergence_tilt_units))
+        self.diverged_cycles = self.diverged_cycles + 1 if over else 0
+        return self.diverged_cycles > c.divergence_cycles > 0 or (over and c.divergence_cycles == 0)
 
     def _send_velocity(self):
         try:
@@ -352,6 +380,7 @@ class Controller:
         return z
 
     def _reset_quant(self):
+        self.diverged_cycles = 0
         self.q_pan = self.q_tilt = 0.0
         self.t_follow = None
         self.want = (0.0, 0.0)

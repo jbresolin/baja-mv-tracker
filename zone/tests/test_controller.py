@@ -195,3 +195,35 @@ def test_ptz_ok_is_unknown_until_the_first_command_then_follows_the_answers():
     ctrl.ptz = TimeoutPtz()
     ctrl.follow(0.2, 0.25, clock.monotonic())
     assert ctrl.ptz_ok is False
+
+
+# ================================================================================= divergence guard
+def test_divergence_guard_needs_more_than_n_cycles_in_a_row():
+    # The guard compares the target with where the controller believes the camera is (dead reckoning in Branch B).
+    # Here we make that belief absurd on purpose: every cycle we tell the estimator the camera is at pan -1000,
+    # while the target is near 0..800. The limit is 300 units and 5 cycles, so cycles 1-5 are tolerated (a short
+    # glitch must not drop a car) and cycle 6 reports "diverged".
+    ctrl, sim, spy, clock, st = setup("B")
+    ctrl.cfg.divergence_pan_units, ctrl.cfg.divergence_cycles = 300.0, 5
+    flags = []
+    for k in range(6):
+        clock.advance(0.1)
+        ctrl.pose.set_known(-1000, 0)
+        cmd = ctrl.follow(0.1 + 0.02 * k, 0.2, clock.monotonic() - 0.05)
+        flags.append(cmd.diverged)
+    assert flags == [False] * 5 + [True]
+    assert cmd.gap_pan > 1000                    # the logged gap: target minus believed camera position
+    # one good cycle (the camera believed to be right on the target) resets the count
+    ctrl.pose.set_known(CURVE.pose(0.22).pan, 0)
+    assert ctrl.follow(0.22, 0.0, clock.monotonic()).diverged is False and ctrl.diverged_cycles == 0
+
+
+def test_normal_following_never_trips_the_divergence_guard():
+    # the default limit (15 degrees, 5 cycles) on an ordinary pass
+    ctrl, sim, spy, clock, st = setup("B")
+    assert st.controller.divergence_pan_units > 0
+    t0 = clock.monotonic()
+    for k in range(40):
+        t = t0 + k * 0.1
+        clock.advance(max(0.0, t + 0.05 - clock.monotonic()))
+        assert not ctrl.follow(-0.05 + 0.25 * k * 0.1, 0.25, t).diverged
