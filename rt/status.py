@@ -340,7 +340,8 @@ def render_beam(b):
     led_txt = ("LED: %s measurements, last %s s, min %s s, ROI mean %s" % (
         led.get("measurements"), led.get("last_latency_s"), led.get("min_latency_s"), led.get("last_mean"))
         if led.get("enabled") else "LED latency off")
-    return """<h2>Beam</h2><span class="%s">%s</span> %s &middot; <a href="/beam">Beam setup</a><br><small>%s on %s, line %s &middot; level <b>%s</b> &middot;
+    return """<h2>Beam</h2><span class="%s">%s</span> %s &middot; <a href="/beam">Beam setup</a>
+<br><small>%s on %s, line %s &middot; level <b>%s</b> &middot;
 %s edges/min (%s total) &middot; %s breaks &middot; poll %s &middot; stuck episodes %s &middot; passes matched %s /
 none %s / ambiguous %s &middot; %s</small>
 <table><tr><th>break (t_beam)</th><th>edges</th><th>duration</th><th>matched pass</th></tr>%s</table>""" % (
