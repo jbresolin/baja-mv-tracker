@@ -211,7 +211,12 @@ class Recorder(threading.Thread):
         self.failures_in_a_row = 0
         self.gave_up = False
         self.last_error = ""
-        self.close_request = None   # set by camera_lost() (capture thread); acted on by the writer thread
+        # A "close the file" request from camera_lost() (capture thread), acted on by the writer thread:
+        # (reason, number of frames offered before the loss), or None. See camera_lost() for why the number.
+        self.close_request = None
+        self.close_request_lock = threading.Lock()
+        self.frames_offered = 0     # frames ever passed to offer(); each queued frame carries its number
+        self.last_handled_seq = 0   # number (from offer) of the last frame the writer thread took from the queue
         self.stopping = threading.Event()
         self.watchdog_poll_s = float(watchdog_poll_s)
         self.seg_lock = threading.Lock()         # guards self.seg between the writer and the watchdog
@@ -235,15 +240,24 @@ class Recorder(threading.Thread):
 
     def camera_lost(self, reason="camera lost"):
         """The camera is gone: close the current file (the writer thread does it). The next frame starts a new
-        file, with the camera settings read back at the reopen."""
-        self.close_request = reason
+        file, with the camera settings read back at the reopen.
+
+        The file must close AFTER the frames that were already offered before the loss, not right now. Why: the
+        frames wait in the queue and the writer thread may be behind (ffmpeg is busy, the CPU is loaded). If the
+        writer closed the file as soon as it saw this request, the frames from just before the loss that were still
+        waiting in the queue would be written to a NEW file, cutting the recording in the wrong place (and the file
+        list no longer matches the camera sessions). So the request remembers how many frames had been offered
+        when the camera was lost; the writer closes the file just before the first frame offered after that."""
+        with self.close_request_lock:
+            self.close_request = (reason, self.frames_offered)
 
     def offer(self, data, t_wall, t_mono, camera_frame_no):
         """Queue one frame for recording. Never blocks. When the queue is full the oldest queued frame is dropped
         (counted), so the queue never holds more than queue_frames frames. Returns False if recording gave up."""
         if self.gave_up:
             return False
-        item = (data, t_wall, t_mono, camera_frame_no)
+        self.frames_offered += 1    # only the capture thread offers frames, so this count needs no lock
+        item = (data, t_wall, t_mono, camera_frame_no, self.frames_offered)
         while True:
             try:
                 self.q.put_nowait(item)
@@ -272,8 +286,14 @@ class Recorder(threading.Thread):
                 continue
             if item is None:
                 break
-            self.handle(*item)
+            self.write_queued(item)
         self.close_segment("stopped")
+
+    def write_queued(self, item):
+        """Write one item taken from the queue (what offer() put there) and remember its number."""
+        data, t_wall, t_mono, camera_frame_no, frame_seq = item
+        self.handle(data, t_wall, t_mono, camera_frame_no, frame_seq)
+        self.last_handled_seq = frame_seq
 
     def stop(self):
         """Write what is queued, close the file. Call once at the end of the run."""
@@ -305,19 +325,35 @@ class Recorder(threading.Thread):
             self.log("WARNING recording: %s; killing it" % seg.failed)
             seg.kill()          # unblocks a stuck write (it raises BrokenPipeError)
 
-    def _apply_close_request(self):
-        reason, self.close_request = self.close_request, None
-        if reason:
-            self.close_segment(reason)
+    def _apply_close_request(self, next_frame_seq=None):
+        """Close the file if camera_lost() asked for it and every frame offered before the loss has been taken care
+        of. With a frame about to be written (`next_frame_seq` = its number from offer()): close only if that frame
+        came after the loss. Without one (`None`: the queue was found empty, or a test calls handle() directly):
+        close only if the writer has already taken the last frame offered before the loss. Do not trust "the queue
+        was empty" alone: between the writer finding it empty and getting here, the capture thread may have queued
+        more frames from before the loss and then reported the loss."""
+        with self.close_request_lock:
+            if self.close_request is None:
+                return
+            reason, frames_offered_before_loss = self.close_request
+            if next_frame_seq is not None:
+                due = next_frame_seq > frames_offered_before_loss
+            else:
+                due = self.last_handled_seq >= frames_offered_before_loss
+            if not due:
+                return                                   # frames from before the loss still belong in this file
+            self.close_request = None
+        self.close_segment(reason)
 
     def _check_failed_segment(self, t_mono):
         seg = self.seg
         if seg is not None and seg.failed:
             self._segment_failed(seg.failed, t_mono)
 
-    def handle(self, data, t_wall, t_mono, camera_frame_no):
-        """Write one frame (the recorder thread calls this; tests call it directly)."""
-        self._apply_close_request()
+    def handle(self, data, t_wall, t_mono, camera_frame_no, frame_seq=None):
+        """Write one frame (the recorder thread calls this; tests call it directly). `frame_seq` = the frame's number
+        from offer(), used to act on a camera loss at the right frame (see camera_lost)."""
+        self._apply_close_request(frame_seq)
         if self.gave_up:
             return
         self.check_disk(t_mono)
@@ -420,7 +456,11 @@ class Recorder(threading.Thread):
         base = segment_name(t_wall)
         path = self.out_dir / (base + ".mkv")
         suffix_no = 1
-        while path.exists():
+        # Two files can start in the same second (a camera loss and a quick reopen): the second one gets "_1". Test
+        # the .json sidecar, not only the .mkv: the sidecar is written right here, before this method returns, but
+        # the .mkv is created by ffmpeg whenever its process gets going, which may be later. Testing only the .mkv,
+        # the second file could get the same name and its ffmpeg (-y) and sidecars would overwrite the first.
+        while path.exists() or path.with_suffix(".json").exists():
             path = self.out_dir / ("%s_%d.mkv" % (base, suffix_no))
             suffix_no += 1
         cmd, encoder = self.ffmpeg_cmd(kind, size, path, t_wall)
