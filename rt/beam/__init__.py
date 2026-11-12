@@ -6,6 +6,10 @@ counting; the beam only gives times. Shadow mode: nothing goes to the lap app.
   grouping.py   raw edges -> one break per car (group_gap_s), stuck-beam detection
   associate.py  live pass <-> break rule, LED latency detector
   service.py    BeamService: reader + dispatcher threads, JSONL events, status page numbers
+  control.py    BeamController: on-site setup from the status page (validation, <config>.beam.toml, restart only
+                the beam), serial port list
+  monitor.py    BeamMonitor: the probe built into rt (live lines / bytes for the setup panel, Suggest)
+  setup_page.py the setup panel's HTML + script (/beam)
 Tools: rt/tools/beam_probe.py (which line / bytes does the adapter use?), rt/tools/fuse_beam.py (offline fusion).
 """
 from .associate import LedWatcher, associate_pass

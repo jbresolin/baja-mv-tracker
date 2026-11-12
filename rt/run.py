@@ -149,7 +149,7 @@ def main():
         if board is not None:
             board.recorder = recorder
 
-    beam = start_beam(cfg, em, board, live_camera, log, warn)
+    beam = start_beam(cfg, em, board, live_camera, log, warn, config_path=a.config or C.DEFAULT)
 
     roster, teams = C.read_roster(a.event)
     m = cfg["models"]
@@ -257,26 +257,20 @@ def main():
     em.close()
 
 
-def start_beam(cfg, em, board, live_camera, log, warn):
-    """The beam input (rt/beam/, WP-L2) when beam.driver is not "off": its own two threads, its events in the same
-    JSONL, a section on the status page. It never touches the pass logic. Returns the BeamService or None."""
-    if str(cfg["beam"].get("driver", "off")).lower() == "off":
-        return None
-    from rt.beam import BeamService, PassBeamSink
-    try:
-        beam = BeamService(cfg, em.emit)
-    except ValueError as e:                   # a config mistake (driver / line / polarity name): say it, run without
-        warn("beam input NOT started: %s" % e)
-        return None
+def start_beam(cfg, em, board, live_camera, log, warn, config_path=None):
+    """The beam input (rt/beam/, WP-L2) behind a BeamController: the controller always exists (so the status page's
+    Beam setup panel can turn the beam on on site); the BeamService and its two threads only run when beam.driver
+    is not "off". It never touches the pass logic. Returns the BeamController."""
+    from rt.beam.control import BeamController, ControllerSink
+    controller = BeamController(cfg, em.emit, config_path=config_path)
     with em.lock:
-        em.sinks.append(PassBeamSink(beam))   # pass_end -> pass_beam (live association)
+        em.sinks.append(ControllerSink(controller))   # pass_end -> pass_beam (live association), via the controller
     if board is not None:
-        board.beam = beam
-    if not live_camera:
+        board.beam = controller
+    if not live_camera and str(cfg["beam"].get("driver", "off")).lower() != "off":
         warn("beam input is on but the source is not a live camera: beam and frame times will not line up")
-    beam.start()
-    log("beam input: driver %s, port %s (status page: Beam section)" % (beam.source.driver, beam.source.port))
-    return beam
+    controller.start_from_config()
+    return controller
 
 
 def is_camera(source):

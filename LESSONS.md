@@ -1747,3 +1747,30 @@ probe.
   with 3 pulses). Modem-line on a pty fails at the DTR ioctl ("Inappropriate ioctl") and correctly shows `retrying`;
   it needs a real adapter. Not verified: the CP2102's modem-line read rate on Windows (expected ~1 kHz with Python
   3.11+'s high-resolution sleep; the `beam_poll` event and the status page show the real rate).
+
+### Review fixes on PR #5 + on-site beam setup (2026-11-12)
+
+* **Correction: a modem-line unplug was not detected on Windows.** pyserial's `serialwin32` reads CTS/DSR/DCD/RI
+  through `GetCommModemStatus` but ignores its return value, so an unplugged adapter just reads "not asserted" and
+  nothing raises. The driver now checks `in_waiting` (ClearCommError, which does raise) every 100 ms and before
+  reporting any change, plus GetCommModemStatus' own BOOL via ctypes on Windows. The test fake now behaves like
+  real pyserial (lines read False, `in_waiting` raises).
+* **Correction: break grouping could split one car in two** when the dispatcher advanced the grouper to "now"
+  between the reader stamping an edge and queueing it. The grouper now only advances to min(now - 20 ms, the
+  reader's published horizon), and a byte-stream message still being assembled holds the horizon back.
+* **Correction: byte-stream edges were per read, not per message.** A message split over two USB reads gave two
+  pulses (and the probe saw fragments, so its two-message alternation guess failed). Bytes less than 3 character
+  times apart (from the baud: 3.1 ms at 9600) are now one message, stamped at its first byte, in the driver and
+  the probe.
+* **Correction: the probe took the polarity from the majority of time**; a person standing in the beam turned it
+  around. It now takes the state at the start of the probe as "clear" and warns when the time share disagrees.
+* **Launcher**: "camera lost, rt reopens it" is no longer unlimited: restart rt after 600 s of recovery, or after
+  60 s without a new open attempt (`camera.open_attempts` on the status page). rt calls `timeBeginPeriod(1)` on
+  Windows and logs `sys.version`.
+* **Not done**: marking a pass_beam association as low-confidence when the vision t_cross is the pass logic's
+  fallback (mean track time): `pass_end` carries nothing that tells the fallback apart, and the pass logic was not
+  to be changed.
+* **On-site beam setup**: the status page's `/beam` panel (built-in probe: live lines at ~5 Hz, byte messages,
+  Suggest, Apply / Turn off) saves to `<config>.beam.toml` and restarts only the BeamService. Setup mode pauses the
+  driver (one COM port owner) and ends by itself after 300 s without a page refresh. Checked here with a headless
+  Chrome against fake serial ports; not yet with the real CP2102.

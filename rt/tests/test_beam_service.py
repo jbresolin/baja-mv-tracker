@@ -369,10 +369,10 @@ def test_status_payload_for_the_page(cfg):
 
 def test_status_page_shows_the_beam_section_and_warnings(cfg):
     # The status page (rt/status.py) gets the beam numbers, red warnings for a lost port / a stuck beam, and an
-    # HTML section. Without a beam the section is absent.
+    # HTML section. Without a beam the section is one line: "off" and the link to the Beam setup panel.
     board = StatusBoard(cfg, TickingClock())
     assert board.payload()["beam"] == dict(enabled=False)
-    assert "<h2>Beam</h2>" not in render_html(board.payload())
+    assert '<h2>Beam</h2>off &middot; <a href="/beam">Beam setup</a>' in render_html(board.payload())
     svc, events, clock = make_service(cfg, [(T + 1, 1)], failures=FakeFailures())
     board.beam = svc
     run_for(svc, clock, 8.0)                             # blocked since T+1: stuck
@@ -420,20 +420,28 @@ def test_stop_answers_waiting_passes(cfg):
     assert of_type(events, "pass_beam")[0]["pass_id"] == 1
 
 
-def test_run_py_starts_the_beam_only_when_configured(cfg):
+def test_run_py_starts_the_beam_only_when_configured(cfg, tmp_path):
+    # run.py always creates the beam CONTROLLER (so the status page can set the beam up on site), but the beam
+    # service itself (its threads, the COM port) only runs when beam.driver is not "off". A typo in the config is a
+    # warning, and rt goes on without the beam.
     from rt.run import start_beam
 
     class FakeEmitter:
         def __init__(self):
             import threading
             self.lock, self.sinks = threading.Lock(), []
-            self.emit = lambda ev: None
+            self.events = []
+            self.emit = self.events.append
 
-    warnings = []
-    assert start_beam(cfg, FakeEmitter(), None, True, print, warnings.append) is None       # driver = "off"
-    cfg["beam"].update(driver="modem-line", line="txd")                                       # a typo in the config
-    assert start_beam(cfg, FakeEmitter(), None, True, print, warnings.append) is None
-    assert "beam input NOT started" in warnings[0]
+    cfg["beam_override"] = dict(path=str(tmp_path / "x.beam.toml"))    # never write next to the real config
+    em = FakeEmitter()
+    controller = start_beam(cfg, em, None, True, print, print)
+    assert controller.service is None                                   # driver = "off": nothing runs
+    cfg["beam"].update(driver="modem-line", line="txd")                 # a typo in the config
+    em = FakeEmitter()
+    controller = start_beam(cfg, em, None, True, print, print)
+    assert controller.service is None
+    assert any("beam input NOT started" in e.get("msg", "") for e in em.events)
 
 
 # ------------------------------------------------------------------------------------------------ thread race

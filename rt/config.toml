@@ -92,6 +92,8 @@ fps_window_s = 10
 time_check_s = 60               # re-measure the clock offset this often
 required = false                # true: exit (code 3) if the port is busy. The launcher always asks for this
                                 # (--require-status), since it watches rt through the page
+setup_token = ""                # Beam setup panel (/beam): if set, its POSTs need this token (the page asks once).
+                                # "" = no token: anyone on the LAN can change the beam settings (only the beam)
 
 [launch]                        # rt/supervise.py (rt\run_lapline.bat): one unattended rt
 name = "lapline"
@@ -181,6 +183,7 @@ read_timeout_s = 0.002          # byte-stream: longest wait for a byte per read
 byte_merge_chars = 3            # byte-stream: bytes closer than this many character times (from baud) = one message
 group_gap_s = 0.25              # edges closer than this belong to the same car (tube frames give several pulses)
 stuck_s = 5.0                   # a break longer than this is not a car: beam_stuck, no breaks until it clears
+setup_idle_s = 300              # Beam setup page closed this long while in setup mode -> beam restarts as saved
 advance_guard_s = 0.02          # breaks are closed this far behind "now" (the reader may not have queued an edge yet)
 reopen_first_s = 1              # port missing / unplugged: retry after 1 s, doubling ...
 reopen_max_s = 30               # ... up to 30 s

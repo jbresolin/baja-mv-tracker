@@ -132,6 +132,33 @@ serial adapter (Silicon Labs CP2102) brings it to the lap-line laptop, and `rt/b
 to the same JSONL. Vision stays responsible for identity and counting; the beam only gives times. Shadow mode:
 nothing goes to the lap app. Off by default (`[beam] driver = "off"`).
 
+**On site (the usual way, from a phone, rt running, nothing to edit or restart):**
+
+1. Plug the CP2102 adapter into the lap-line laptop and wire the sensor (see "Wiring" below).
+2. On the phone (same network) open the status page `http://<laptop IP>:8765/` and tap **Beam setup**
+   (`/beam`). The CP2102 is listed first, marked "CP2102 (10C4:EA60)".
+3. Choose the port (baud 9600 unless known otherwise), tick DTR / RTS if they power a pull-up, tap
+   **Start monitor**. The beam driver pauses; the four lines (CTS / DSR / DCD / RI) and any bytes now show live.
+4. With the beam clear, tap **Clear**, then walk / wave a hand through the beam 5-10 times: one line should flip
+   (green = asserted) or byte messages should appear.
+5. Tap **Suggest**: the probe's guess (driver, line, polarity or byte pattern) fills the settings, with notes.
+   Check them (group gap 0.25 s and stuck after 5 s are fine to start with).
+6. Tap **Apply**: rt validates the settings, saves them to `<config>.beam.toml` next to the config
+   (`rt/configs/lapline.beam.toml`, loaded at every start on top of `[beam]`; delete it to go back) and restarts
+   ONLY the beam (never detection, capture or recording).
+7. Check "Beam now" on the same page (or the Beam section of the status page): state `open`, the level flips
+   when the beam is broken, **edges/min** goes up, and each pass through the beam adds one line to **last
+   breaks** (2-10 edges for a car). **Turn off** sets driver = off (saved) if anything misbehaves.
+
+Setup mode ends by itself (beam restarted with the saved settings) when the page has not been refreshed for
+`beam.setup_idle_s` (300 s), so a locked phone never leaves the race without its beam. Only the beam setup
+actions accept POST (JSON only, at most 8 KB, every value checked on the laptop; a bad value is refused and
+changes nothing, a setting that still fails to start leaves the beam off with the error in red). The rest of the
+page stays read-only. Anyone on the LAN can use the panel unless `[status] setup_token` is set: then the page asks
+for it once (kept in the phone's browser) and sends it in the `X-Setup-Token` header.
+
+The command-line probe does the same with rt closed (only one program can open a COM port):
+
 ```
 python -m rt.tools.beam_probe --list               (which COM port is the adapter: USB id 10C4:EA60 = CP210x)
 python -m rt.tools.beam_probe --port COM5          (break the beam 5-10 times, then Ctrl+C: it prints a guess)
@@ -206,7 +233,7 @@ of `rt/configs/lapline.toml` (example and every key: `rt/configs/lapline.example
   two in practice.
 
 **Reading the status page (Beam section)**: driver, port and state (`open` in green; `retrying` / `lost` in red with
-the error and the next try), the line and its **current level** (wave a hand in the beam: it must flip to ACTIVE and
+the error and the next try; a **Beam setup** link next to it), the line and its **current level** (wave a hand in the beam: it must flip to ACTIVE and
 back), edges per minute, breaks, poll rate and largest gap (red below 200 Hz), stuck episodes (STUCK in red while it
 lasts), live association counts, LED numbers, and the **last 10 breaks** (time, edges, duration, matched pass and its
 number). On race day: a car crossing should add one break with 2-10 edges and, ~10 s later, the matching pass.
@@ -286,8 +313,10 @@ value shapes), so a pt-BR Windows with Portuguese labels and a cp850 console wor
 | recording | queue_frames / csv_flush_rows | 10 / 30 | frames waiting for ffmpeg (oldest dropped when full); frames.csv flush period |
 | recording | write_timeout_s / retry_wait_s / max_failures | 10 / 10 / 5 | watchdog: ffmpeg stuck or dead -> kill, new file after the wait; give up after this many failures in a row |
 | status | enabled / bind / port / passes / time_check_s / required | true / 0.0.0.0 / 8765 / 20 / 60 / false | status page; `required` (or `--require-status`, which the launcher passes): exit with code 3 if the port is busy |
+| status | setup_token | "" | Beam setup POSTs need this token in `X-Setup-Token` when set; "" = no token (LAN only) |
 | launch | event / source / out_dir / extra_args | "" / camera / out/lapline / [] | read by rt/supervise.py |
 | launch | restart_first_s / restart_max_s / healthy_reset_min / stall_s / startup_grace_s | 5 / 60 / 10 / 30 / 60 | restart rules |
+| launch | camera_recover_max_s / camera_attempt_stall_s | 600 / 60 | camera recovering this long, or rt's open-attempt counter not moving this long -> restart rt |
 | clock | mode | auto | files: overlay (OBS clock) > creation_time > mtime-duration; `pts`, `system` also accepted |
 | clock | offset_s / video_minus_server_s | 0 / 0 | correction added to frame times / this PC minus the lap server (LapAppSink) |
 | detection | conf / nms_iou | 0.15 / 0.7 | as the offline tracking stage |
@@ -305,6 +334,9 @@ value shapes), so a pt-BR Windows with Portuguese labels and a cp850 console wor
 | beam | line / active / poll_hz / set_dtr / set_rts | cts / high / 1000 / true / true | modem-line: input line, which state = blocked, polls per second, adapter outputs |
 | beam | baud / byte_pattern / byte_release_pattern / read_timeout_s | 9600 / "" / "" / 0.002 | byte-stream: hex patterns ("" = any bytes = a pulse) |
 | beam | group_gap_s / stuck_s | 0.25 / 5 | one break per car; longer = beam_stuck |
+| beam | byte_merge_chars / advance_guard_s / queue_max | 3 / 0.02 / 10000 | byte-stream: bytes closer than this many character times = one message; breaks close this far behind now; reader -> dispatcher queue bound (oldest dropped, counted) |
+| beam | setup_idle_s | 300 | Beam setup page not refreshed this long in setup mode -> setup ends, beam restarts as saved |
+| (file) | `<config>.beam.toml` | absent | beam settings saved by the setup page; loaded after the config's [beam], before --set; broken / invalid = beam off with the error shown |
 | beam | reopen_first_s / reopen_max_s / max_edge_events_per_s / poll_report_s | 1 / 30 / 100 / 60 | port retry backoff; beam_edge lines per second; beam_poll period |
 | beam | assoc_window_s / assoc_offset_s | 1.0 / 0 | live pass_beam rule: window around t_cross - offset |
 | beam | led_roi / led_threshold / led_max_latency_s | [] / 128 / 0.5 | optional LED latency (x, y, w, h in processed-frame pixels) |

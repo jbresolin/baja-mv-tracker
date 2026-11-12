@@ -80,6 +80,8 @@ bind = "0.0.0.0"                # all interfaces: open http://<laptop IP>:8765/ 
 port = 8765                     # Windows asks once to allow Python through the firewall: allow "Private networks"
 passes = 20
 time_check_s = 60
+setup_token = ""                # Beam setup panel: "" = anyone on the LAN can change the beam settings (only the
+                                # beam); set a PIN here and the page asks for it once
 
 [clock]
 ntp_server = "192.168.88.1"     # PLACEHOLDER: set the event router's IP (192.168.88.1 is a MikroTik's default). rt
@@ -94,11 +96,14 @@ enabled = false                 # shadow mode: nothing is written to the lap app
 [beam]
 # Timing light-beam sensor at the line, through the USB serial adapter (Silicon Labs CP2102), WP-L2. Shadow mode: the
 # beam only adds precise crossing times to the JSONL (beam_edge / beam_break / pass_beam); vision still does the
-# identity and the counting, and nothing goes to the lap app. OFF until the adapter is known to work:
+# identity and the counting, and nothing goes to the lap app. OFF until the adapter is known to work.
+# On site, the usual way: status page on the phone -> Beam setup -> Start monitor -> wave through the beam ->
+# Suggest -> Apply. That saves the settings to lapline.beam.toml next to this file (loaded on top of this section at
+# every start; delete it to go back to what is written here). See rt/README.md "Beam input".
+# Without the page (rt closed: only one program can open a COM port):
 #   1. python -m rt.tools.beam_probe --list               (find the port: the CP2102 shows USB id 10C4:EA60)
 #   2. python -m rt.tools.beam_probe --port COM5          (break the beam a few times, Ctrl+C: it prints a guess)
 #   3. copy the guessed lines here, set the port, start rt; check the Beam section of the status page.
-# rt must not be running during the probe (only one program can open a COM port).
 driver = "off"                  # "off" | "modem-line" | "byte-stream" | "fake" (synthetic car every fake_every_s,
                                 # to check the chain and the status page without hardware)
 port = "COM5"                   # the adapter's COM port (Device Manager > Ports, or the probe's --list)

@@ -34,6 +34,7 @@ def load(path=None, overrides=()):
         user = tomllib.loads(path.read_text(encoding="utf-8"))
         for sec, kv in user.items():
             base.setdefault(sec, {}).update(kv)
+    apply_beam_override(base, path)
     cfg = copy.deepcopy(base)
     for o in overrides:
         k, v = o.split("=", 1)
@@ -48,6 +49,21 @@ def load(path=None, overrides=()):
         if isinstance(m.get(r), str) and m[r]:
             m[r] = str(resolve(m[r]))
     return cfg
+
+
+def apply_beam_override(cfg, config_path):
+    """The beam settings saved from the status page (Beam setup -> Apply) live in `<config>.beam.toml` next to the
+    config file. Load order: rt/config.toml, then the user config, then this file's [beam], then --set options.
+    cfg["beam_override"] says what happened (path, loaded, error). A broken or invalid file never stops rt: the
+    beam is turned off and the error is shown on the status page (rt/beam/control.py)."""
+    from rt.beam.control import load_override, override_path
+    path = override_path(config_path)
+    settings, error = load_override(path)
+    cfg["beam_override"] = dict(path=str(path), config=str(config_path), loaded=settings is not None, error=error)
+    if error:
+        cfg.setdefault("beam", {})["driver"] = "off"
+    elif settings is not None:
+        cfg.setdefault("beam", {}).update(settings)
 
 
 ALIASES = {"car_detector": ("car_detector", "car"), "car_detector_alt": ("car_detector_alt",),
