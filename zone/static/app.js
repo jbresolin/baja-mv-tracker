@@ -1,0 +1,242 @@
+// Zona PTZ page: polls /api/state, refreshes /frame.jpg, sends teach / mode actions. No build step.
+"use strict";
+const $ = (s) => document.querySelector(s);
+let S = null;              // last /api/state
+let clickMode = null;      // "path" | "keyframe" | "move" | null
+let speedLevel = 1;        // 0 slow, 1 medium, 2 fast
+let jogTimer = null;
+
+function msg(t, isErr) {
+  const m = $("#msg");
+  m.textContent = t || "";
+  m.style.color = isErr ? "#ff6b5e" : "var(--amber)";
+  if (t) setTimeout(() => { if (m.textContent === t) m.textContent = ""; }, 6000);
+}
+
+async function post(url, body) {
+  try {
+    const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" },
+                                 body: JSON.stringify(body || {}) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { msg(j.detail || ("erro " + r.status), true); return null; }
+    return j;
+  } catch (e) { msg("sem conexão com o programa", true); return null; }
+}
+
+// ------------------------------------------------------------------ frame
+function refreshFrame() {
+  const img = $("#frame");
+  const next = new Image();
+  next.onload = () => { img.src = next.src; setTimeout(refreshFrame, 150); };
+  next.onerror = () => setTimeout(refreshFrame, 1000);
+  next.src = "/frame.jpg?t=" + Date.now();
+}
+
+$("#frame").addEventListener("click", async (ev) => {
+  if (!clickMode || !S || !S.frame.size) return;
+  const img = ev.target, rect = img.getBoundingClientRect();
+  const x = (ev.clientX - rect.left) * S.frame.size[0] / rect.width;
+  const y = (ev.clientY - rect.top) * S.frame.size[1] / rect.height;
+  if (clickMode === "move") {
+    if (S.teach.selected === null || S.teach.selected === undefined) { msg("selecione um ponto na lista primeiro"); return; }
+    await post("/api/teach/move", { index: S.teach.selected, x, y });
+  } else {
+    const r = await post("/api/teach/point", { x, y, keyframe: clickMode === "keyframe" });
+    if (r && clickMode === "keyframe") msg("keyframe gravado no preset " + r.result.keyframe.preset);
+  }
+  setClickMode(null);
+  poll();
+});
+
+function setClickMode(m) {
+  clickMode = m;
+  document.querySelectorAll("[data-click]").forEach((b) => b.classList.toggle("on", b.dataset.click === m));
+  const h = $("#clickHint");
+  h.style.display = m ? "block" : "none";
+  h.textContent = { path: "clique no caminho", keyframe: "clique onde a PTZ está enquadrando",
+                    move: "clique na nova posição" }[m] || "";
+}
+document.querySelectorAll("[data-click]").forEach((b) =>
+  b.addEventListener("click", () => setClickMode(clickMode === b.dataset.click ? null : b.dataset.click)));
+
+// ------------------------------------------------------------------ modes
+document.querySelectorAll("[data-mode]").forEach((b) =>
+  b.addEventListener("click", async () => { await post("/api/mode", { mode: b.dataset.mode }); poll(); }));
+async function bigStop() { stopJog(); await post("/api/stop"); msg("PARADO"); poll(); }
+$("#bigStop").addEventListener("click", bigStop);
+
+// ------------------------------------------------------------------ jog
+document.querySelectorAll("[data-speed]").forEach((b) => b.addEventListener("click", () => {
+  speedLevel = +b.dataset.speed;
+  document.querySelectorAll("[data-speed]").forEach((x) => x.classList.toggle("on", x === b));
+}));
+
+function startJog(dp, dt, dz) {
+  if (!S) return;
+  const t = S.teach;
+  if (!t.velocity_jog) {           // absolute "nudges": one per press
+    const u = t.nudge_units[speedLevel], zu = t.zoom_nudge_units[speedLevel];
+    post("/api/teach/nudge", { pan: dp * u, tilt: dt * u, zoom: dz * zu, speed: t.jog_speeds[speedLevel] });
+    return;
+  }
+  const step = t.jog_speeds[speedLevel];
+  const body = { pan: dp * step, tilt: dt * step, zoom: dz * t.jog_zoom_speed };
+  stopJog(true);
+  post("/api/teach/jog", body);
+  jogTimer = setInterval(() => post("/api/teach/jog", body), 150);   // the PTZ TTL stops it if this stops
+}
+function stopJog(silent) {
+  if (jogTimer) { clearInterval(jogTimer); jogTimer = null; if (!silent) post("/api/teach/jog_stop"); }
+}
+function bindHold(el, dp, dt, dz) {
+  el.addEventListener("pointerdown", (e) => { e.preventDefault(); startJog(dp, dt, dz); });
+  ["pointerup", "pointerleave", "pointercancel"].forEach((k) => el.addEventListener(k, () => stopJog()));
+}
+document.querySelectorAll("[data-jog]").forEach((b) => {
+  const [p, t] = b.dataset.jog.split(",").map(Number);
+  bindHold(b, p, t, 0);
+});
+document.querySelectorAll("[data-zoom]").forEach((b) => bindHold(b, 0, 0, +b.dataset.zoom));
+$("#jogStop").addEventListener("click", () => { stopJog(true); post("/api/teach/jog_stop"); });
+$("#home").addEventListener("click", () => post("/api/teach/home"));
+$("#zeroHere").addEventListener("click", () => post("/api/teach/zero_here"));
+
+const KEYS = { ArrowLeft: [-1, 0, 0], ArrowRight: [1, 0, 0], ArrowUp: [0, 1, 0], ArrowDown: [0, -1, 0],
+               PageUp: [0, 0, 1], PageDown: [0, 0, -1] };
+let keyDown = null;
+document.addEventListener("keydown", (e) => {
+  if (e.target.tagName === "INPUT") return;
+  if (e.key === "Escape") { e.preventDefault(); bigStop(); return; }
+  const k = KEYS[e.key];
+  if (!k || keyDown === e.key) return;
+  e.preventDefault();
+  keyDown = e.key;
+  startJog(...k);
+});
+document.addEventListener("keyup", (e) => { if (e.key === keyDown) { keyDown = null; stopJog(); } });
+
+// ------------------------------------------------------------------ teach list
+$("#setCorridor").addEventListener("click", () => post("/api/teach/corridor", { half_width: +$("#corridor").value }));
+$("#save").addEventListener("click", async () => {
+  const r = await post("/api/teach/save");
+  if (r) msg("zona salva" + (r.result ? " (backup: " + r.result.split(/[\\/]/).pop() + ")" : ""));
+  poll();
+});
+
+async function act(url, index, confirmText) {
+  if (confirmText && !confirm(confirmText)) return;
+  await post(url, { index });
+  poll();
+}
+
+function renderPoints(z, t) {
+  const tb = $("#points tbody");
+  tb.innerHTML = "";
+  z.points.forEach((p) => {
+    const tr = document.createElement("tr");
+    if (t.selected === p.i) tr.className = "sel";
+    const kf = p.keyframe;
+    const kind = kf ? `keyframe P${kf.preset}${kf.approximate ? " ~" : ""}` : "caminho";
+    tr.innerHTML = `<td>${p.i}</td><td title="${kf ? `pan ${kf.pan} tilt ${kf.tilt} zoom ${kf.zoom}` : ""}">${kind}</td>
+      <td>${Math.round(p.x)},${Math.round(p.y)}</td><td></td>`;
+    const cell = tr.lastElementChild;
+    const add = (label, fn, title) => {
+      const b = document.createElement("button"); b.textContent = label; b.title = title || "";
+      b.addEventListener("click", (e) => { e.stopPropagation(); fn(); }); cell.appendChild(b);
+    };
+    add("↑", () => post("/api/teach/reorder", { index: p.i, delta: -1 }).then(poll), "subir");
+    add("↓", () => post("/api/teach/reorder", { index: p.i, delta: 1 }).then(poll), "descer");
+    if (kf) {
+      add("testar", () => act("/api/teach/goto", p.i), "chamar o preset deste keyframe");
+      add("re-ensinar", () => act("/api/teach/reteach", p.i, "Gravar o enquadramento atual neste keyframe?"),
+          "gravar o enquadramento atual");
+      add("→caminho", () => act("/api/teach/unkeyframe", p.i), "virar ponto de caminho");
+    } else {
+      add("→keyframe", () => act("/api/teach/make_keyframe", p.i, "Usar o enquadramento atual neste ponto?"),
+          "usar o enquadramento atual");
+    }
+    add("✕", () => act("/api/teach/delete", p.i, `Excluir o ponto ${p.i}?`), "excluir");
+    tr.addEventListener("click", () => post("/api/teach/select", { index: t.selected === p.i ? null : p.i }).then(poll));
+    tb.appendChild(tr);
+  });
+}
+
+// ------------------------------------------------------------------ state
+function kv(el, rows) {
+  el.innerHTML = rows.map(([k, v, cls]) => `<div>${k}</div><div class="${cls || ""}">${v}</div>`).join("");
+}
+
+function render(s) {
+  S = s;
+  const d = s.runtime.director;
+  const badge = $("#modeBadge");
+  badge.textContent = { STOPPED: "PARADO", PASSIVE: "PASSIVO", AUTO: "AUTO" }[d.mode] || d.mode;
+  badge.className = "state " + d.mode;
+  $("#subState").textContent = d.sub ? ({ waiting: "aguardando carro", tracking: "seguindo",
+                                           returning: "voltando à entrada" }[d.sub] || d.sub) : "";
+  const L = s.runtime.locked;
+  $("#locked").textContent = L ? `carro ${L.id}  s=${L.s.toFixed(2)}  v=${L.v.toFixed(2)}/s${L.predicted ? " (previsto)" : ""}` : "";
+  document.querySelectorAll("[data-mode]").forEach((b) => b.classList.toggle("on", b.dataset.mode === d.mode));
+  document.querySelector('[data-mode="AUTO"]').disabled = !s.runtime.zone_ready;
+
+  const z = s.zone, t = s.teach;
+  if (document.activeElement !== $("#corridor")) $("#corridor").value = z.corridor;
+  $("#dirty").textContent = z.dirty ? "alterações não salvas" : "salvo";
+  $("#dirty").className = z.dirty ? "bad" : "good";
+  $("#poseSrc").textContent = { inquiry: "consulta à câmera", commanded: "movimento absoluto",
+                                dead_reckoning: "estimada (aproximada)" }[t.pose_source] || t.pose_source;
+  $("#zoneFile").textContent = z.file.split(/[\\/]/).pop();
+  $("#poseButtons").style.display = t.velocity_jog && t.pose_source !== "dead_reckoning" ? "none" : "flex";
+  $("#home").style.display = t.pose_source === "commanded" ? "" : "none";
+  $("#zeroHere").style.display = t.pose_source === "dead_reckoning" ? "" : "none";
+  document.querySelectorAll("[data-click],[data-jog],[data-zoom],#save,#setCorridor").forEach((b) => b.disabled = !t.allowed);
+  renderPoints(z, t);
+
+  const h = s.health;
+  const gb = h.disk_free_gb;
+  const sr = h.spotter_recording, pr = h.ptz_recording;
+  kv($("#health"), [
+    ["processamento", `${h.fps} fps (descartados ${h.dropped})`, h.fps < 7 ? "bad" : "good"],
+    ["último quadro", `${s.frame.age_s} s atrás`, s.frame.age_s > 2 ? "bad" : ""],
+    ["PTZ", `${h.ptz_driver} · ${h.ptz_reachable === null ? "?" : (h.ptz_reachable ? "respondendo" : "SEM RESPOSTA")}`,
+     h.ptz_reachable === false ? "bad" : "good"],
+    ["ramo de controle", `${h.branch} · ${h.report.reason || h.report.path || "sem relatório"}`],
+    ["relógio (NTP)", h.ntp_server ? (h.ntp_offset_s === null ? "sem resposta de " + h.ntp_server
+                                     : `${h.ntp_offset_s >= 0 ? "+" : ""}${h.ntp_offset_s} s vs ${h.ntp_server}`)
+                                  : (h.clock_warnings.length ? h.clock_warnings.join(" ") : "não configurado"),
+     (h.ntp_offset_s !== null && Math.abs(h.ntp_offset_s) > 0.5) || h.clock_warnings.length ? "bad" : ""],
+    ["disco livre", gb === null ? "?" : gb + " GB", gb !== null && gb < 5 ? "bad" : ""],
+    ["gravação spotter", sr ? `${sr.alive ? "gravando" : "PARADA"} ${sr.file} (${sr.written} quadros, ${sr.dropped} perdidos)` : "desligada",
+     sr && !sr.alive ? "bad" : ""],
+    ["gravação PTZ", pr.enabled ? (pr.file ? `${pr.growing ? "gravando" : "PARADA"} ${pr.file} ${pr.size_mb} MB` : "nenhum arquivo")
+                                : "desligada", pr.enabled && !pr.growing ? "bad" : ""],
+    ["perfil de velocidade", `${s.runtime.profile_passes} passagens`],
+    ["fonte", h.source || "–"],
+  ]);
+  $("#events").innerHTML = s.events.slice().reverse().map((e) =>
+    `<div>${e.wall_iso} ${e.event || e.type} ${e.reason || e.why || ""} ${e.track_id !== undefined ? "carro " + e.track_id : ""}
+     ${e.new ? "→ " + e.new : ""} ${e.msg || ""}</div>`).join("");
+}
+
+async function poll() {
+  try {
+    const r = await fetch("/api/state");
+    if (r.ok) render(await r.json());
+  } catch (e) { $("#modeBadge").textContent = "SEM CONEXÃO"; }
+}
+
+async function pollPose() {
+  if (S && S.teach.allowed) {
+    try {
+      const r = await fetch("/api/teach/pose");
+      const j = await r.json();
+      $("#poseNow").textContent = j.result ? `pan ${j.result[0]} · tilt ${j.result[1]} · zoom ${j.result[2]}` : "desconhecida";
+    } catch (e) { /* ignore */ }
+  }
+  setTimeout(pollPose, 1000);
+}
+
+setInterval(poll, 500);
+poll();
+refreshFrame();
+pollPose();
