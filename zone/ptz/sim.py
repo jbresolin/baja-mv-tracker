@@ -11,7 +11,13 @@ What it models, per axis (pan, tilt, zoom):
 - **Travel limits:** the axis stops at its limit.
 - **Inquiry behaviour:** "always" answers, "at_rest" answers only when stopped, "never", or "frozen_while_moving"
   (answers, but with the last at-rest value while moving). An optional `inquiry_latency_s` makes answers that old.
-- **Position moves** (absolute, relative, presets, zoom direct, home): constant speed to the target, no ramp.
+  `inquiry_refresh_hz` makes a "stale cache" camera: it answers every inquiry at once, but the position it reports
+  is only refreshed that many times a second (between refreshes it repeats the last value).
+- **Inquiry rate:** `inquiry_poll_hz` is the fastest the camera can be asked. Asked faster, it repeats its last
+  answer (`inquiry_overpoll="stale"`) or doesn't answer (`"drop"`).
+- **Position moves** (absolute, relative, zoom direct): constant speed to the target, no ramp. Preset recalls and
+  home arrive `preset_settle_s` after the command when the bench measured it (`preset_settle_measured`), whatever
+  the distance; otherwise they travel at `preset_move_speed`.
 - **TTL dead-man:** the same semantics as the real driver.
 
 How time works: the sim never reads real time. Every call first moves the model forward to `clock.monotonic()`,
@@ -22,6 +28,7 @@ from __future__ import annotations
 
 import bisect
 import json
+import math
 from collections import deque
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
@@ -33,6 +40,8 @@ from zone.ptz.interface import ANSWERED, COMPLETED, ERROR, TIMEOUT, CommandResul
 STEP_S = 0.005  # integration step (seconds of simulated time)
 HISTORY_S = 2.0  # how much pose history is kept for `inquiry_latency_s`
 INQUIRY_MODES = ("always", "at_rest", "never", "frozen_while_moving")
+OVERPOLL_MODES = ("stale", "drop")  # what an inquiry asked faster than inquiry_poll_hz gets
+POLL_RATE_TOLERANCE = 0.9  # an inquiry 10% early still counts as on time (polling loops jitter)
 DEFAULT_UNITS_PER_DEGREE = 1 / 0.075  # the usual VISCA value: 0.075 degrees per raw unit
 
 
@@ -70,9 +79,14 @@ class PtzModel:
     inquiry_mode: str = "always"  # pan/tilt inquiry: one of INQUIRY_MODES
     zoom_inquiry_mode: str = "always"
     inquiry_latency_s: float = 0.0
-    inquiry_poll_hz: float | None = 20.0  # highest rate the bench found reliable (None: inquiry unusable)
-    preset_move_speed: float = 1000.0  # units/s for preset recalls and home
+    # "Stale cache": the camera refreshes the position it reports only this often (None: every answer is fresh).
+    # A camera like that answers 50 inquiries a second but its value changes only a few times a second.
+    inquiry_refresh_hz: float | None = None
+    inquiry_poll_hz: float | None = 20.0  # highest rate the bench found reliable (None: no limit enforced)
+    inquiry_overpoll: str = "stale"  # polled faster than inquiry_poll_hz: "stale" (repeat last answer) or "drop"
+    preset_move_speed: float = 1000.0  # units/s for preset recalls and home, when preset_settle_measured is False
     preset_settle_s: float = 2.0  # recall -> at rest, as measured by the bench
+    preset_settle_measured: bool = False  # True: recalls take preset_settle_s (the bench measured it)
     pan_min_smooth_step: int = 1
     tilt_min_smooth_step: int = 1
     pan_units_per_degree: float | None = DEFAULT_UNITS_PER_DEGREE
@@ -87,6 +101,8 @@ class PtzModel:
         for name in ("inquiry_mode", "zoom_inquiry_mode"):
             if getattr(self, name) not in INQUIRY_MODES:
                 raise ValueError(f"{name} must be one of {INQUIRY_MODES}, not {getattr(self, name)!r}")
+        if self.inquiry_overpoll not in OVERPOLL_MODES:
+            raise ValueError(f"inquiry_overpoll must be one of {OVERPOLL_MODES}, not {self.inquiry_overpoll!r}")
 
     @property
     def pan_step_max(self) -> int:
@@ -229,6 +245,8 @@ class SimulatedPtz:
         self._frozen_pan_tilt: tuple[int, int] = (round(pan), round(tilt))
         self._frozen_zoom: int = round(zoom)
         self.last_inquiry: CommandResult | None = None
+        # For the inquiry rate limit: when each kind of inquiry ("pan_tilt", "zoom") last really got an answer.
+        self._last_answer: dict[str, tuple[float, Any]] = {}
         self.commands: list[tuple[float, str, tuple[Any, ...]]] = []  # what was sent, for tests
 
     # --- time --------------------------------------------------------------------------------------------------
@@ -385,11 +403,13 @@ class SimulatedPtz:
         value: tuple[int, int] | None
         if mode == "never" or (mode == "at_rest" and self._pan_tilt_moving()):
             value = None
+        elif self._polled_too_fast("pan_tilt"):
+            value = self._overpoll_answer("pan_tilt")
         elif mode == "frozen_while_moving":
-            value = self._frozen_pan_tilt
+            value = self._answered("pan_tilt", self._frozen_pan_tilt)
         else:
-            _, pan, tilt, _ = self._pose_at(self._now - self.model.inquiry_latency_s)
-            value = self._reported_pan_tilt(pan, tilt)
+            _, pan, tilt, _ = self._pose_at(self._refreshed_at(self._now) - self.model.inquiry_latency_s)
+            value = self._answered("pan_tilt", self._reported_pan_tilt(pan, tilt))
         self.last_inquiry = self._inquiry_result(value)
         return value
 
@@ -399,11 +419,28 @@ class SimulatedPtz:
         value: int | None
         if mode == "never" or (mode == "at_rest" and self.zoom.is_moving(self._now)):
             value = None
+        elif self._polled_too_fast("zoom"):
+            value = self._overpoll_answer("zoom")
         elif mode == "frozen_while_moving":
-            value = self._frozen_zoom
+            value = self._answered("zoom", self._frozen_zoom)
         else:
-            value = round(self._pose_at(self._now - self.model.inquiry_latency_s)[3])
+            value = self._answered("zoom", round(self._pose_at(self._now - self.model.inquiry_latency_s)[3]))
         self.last_inquiry = self._inquiry_result(value)
+        return value
+
+    def _polled_too_fast(self, kind: str) -> bool:
+        """True if this inquiry comes sooner after the last real answer than `inquiry_poll_hz` allows."""
+        hz = self.model.inquiry_poll_hz
+        last = self._last_answer.get(kind)
+        return bool(hz) and last is not None and self._now - last[0] < POLL_RATE_TOLERANCE / hz
+
+    def _overpoll_answer(self, kind: str) -> Any:
+        """What an inquiry asked too fast gets: the previous answer again ("stale"), or nothing ("drop")."""
+        return self._last_answer[kind][1] if self.model.inquiry_overpoll == "stale" else None
+
+    def _answered(self, kind: str, value: Any) -> Any:
+        """Note a real answer (for the rate limit) and return it."""
+        self._last_answer[kind] = (self._now, value)
         return value
 
     def preset_recall(self, n: int) -> CommandResult:
@@ -412,15 +449,28 @@ class SimulatedPtz:
         pan, tilt, zoom = self._presets.get(n, (0.0, 0.0, self.model.zoom_limits[0]))
         self._pan_tilt_deadline = None
         self._zoom_deadline = None
-        speed = self.model.preset_move_speed
         zoom_speed = self.model.zoom_speed_table[self.model.zoom_step_max]
 
         def apply(t: float) -> None:
-            self.pan.move_to(pan, speed)
-            self.tilt.move_to(tilt, speed)
-            self.zoom.move_to(zoom, zoom_speed)
+            self._preset_move(self.pan, pan, self.model.preset_move_speed)
+            self._preset_move(self.tilt, tilt, self.model.preset_move_speed)
+            self._preset_move(self.zoom, zoom, zoom_speed)
         self._schedule(self.model.command_latency_s, apply)
         return self._done("preset_recall", n)
+
+    def _preset_move(self, axis: _Axis, target: float, unmeasured_speed: float) -> None:
+        """Start a preset/home move on one axis.
+
+        With a bench-measured settle time, every preset recall arrives `preset_settle_s` after the command, so the
+        speed is whatever covers the distance in the time left after the command latency. That is what the bench
+        measured; how a real camera picks its preset speed isn't known. Without it, the old model: a fixed speed.
+        """
+        m = self.model
+        if m.preset_settle_measured:
+            move_time = max(STEP_S, m.preset_settle_s - m.command_latency_s)
+            axis.move_to(target, max(abs(target - axis.position) / move_time, 1e-9))
+        else:
+            axis.move_to(target, unmeasured_speed)
 
     def preset_store(self, n: int) -> CommandResult:
         self.tick()
@@ -437,11 +487,10 @@ class SimulatedPtz:
     def home(self) -> CommandResult:
         self.tick()
         self._pan_tilt_deadline = None
-        speed = self.model.preset_move_speed
 
         def apply(t: float) -> None:
-            self.pan.move_to(0.0, speed)
-            self.tilt.move_to(0.0, speed)
+            self._preset_move(self.pan, 0.0, self.model.preset_move_speed)
+            self._preset_move(self.tilt, 0.0, self.model.preset_move_speed)
         self._schedule(self.model.command_latency_s, apply)
         return self._done("home")
 
@@ -475,6 +524,17 @@ class SimulatedPtz:
 
     def _reported_pan_tilt(self, pan: float, tilt: float) -> tuple[int, int]:
         return round(pan * self.model.pan_sign), round(tilt * self.model.tilt_sign)
+
+    def _refreshed_at(self, t: float) -> float:
+        """When the camera last refreshed the position it reports, as seen at time `t`.
+
+        A live camera refreshes all the time, so that is `t` itself. A "stale cache" camera (`inquiry_refresh_hz`)
+        refreshes on a fixed grid: with 2 Hz, at 0.0, 0.5, 1.0... so at t = 0.7 it still reports the pose of 0.5.
+        """
+        hz = self.model.inquiry_refresh_hz
+        if not hz:
+            return t
+        return math.floor(t * hz + 1e-9) / hz
 
     def _pose_at(self, t: float) -> tuple[float, float, float, float]:
         if t >= self._now or not self._history:

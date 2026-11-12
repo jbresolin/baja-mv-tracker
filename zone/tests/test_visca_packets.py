@@ -163,3 +163,12 @@ def test_encode_decode_round_trip():
     payload = packets.encode_pan_tilt_answer(-1234, 567)
     assert packets.parse_pan_tilt_position(payload) == (-1234, 567)
     assert packets.parse_zoom_position(packets.encode_zoom_answer(9999)) == 9999
+
+
+def test_drive_speeds_are_clamped_to_the_cameras_top_steps():
+    # A camera whose top tilt step is 0x14 (20) is never sent more, even if asked for 23.
+    assert packets.pan_tilt_drive(30, 23, pan_max=0x18, tilt_max=0x14) == hx("81 01 06 01 18 14 02 01 FF")
+    # A top step above the protocol's own ceiling is ignored: tilt never goes above 0x17.
+    assert packets.pan_tilt_drive(1, 30, tilt_max=0x30)[5] == 0x17
+    assert packets.absolute_position(0, 0, 24, 23, tilt_max=0x14)[5] == 0x14
+    assert packets.relative_position(0, 0, 24, 23, pan_max=0x10)[4] == 0x10
