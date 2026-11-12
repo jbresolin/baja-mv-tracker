@@ -11,7 +11,8 @@ in front of it, sends it as one UDP datagram, and waits for the camera's reply, 
 - for an inquiry: the answer carrying data.
 
 Only one request is on the wire at a time: a lock makes the driver thread-safe, so the controller and the dead-man
-thread can both call it.
+thread can both call it. The timeout is one budget for the whole call, counted from when it starts: waiting for the
+lock, a sequence reset that may be due, and waiting for the reply all come out of the same `timeout`.
 
 The dead-man switch (TTL)
 -------------------------
@@ -236,7 +237,8 @@ class ViscaPtz:
         with self._lock:
             return self._reset_sequence_locked()
 
-    def _reset_sequence_locked(self) -> str:
+    def _reset_sequence_locked(self, deadline: float | None = None) -> str:
+        """Send the reset and wait for its ACK until `deadline` (clock.monotonic(); default: one timeout from now)."""
         sent_at = self.clock.monotonic()
         datagram = packets.sequence_reset()
         self._transport.send(datagram)
@@ -244,7 +246,8 @@ class ViscaPtz:
         self._sequence = 1
         self._recent.clear()
         status = TIMEOUT
-        deadline = sent_at + self.timeout
+        if deadline is None:
+            deadline = sent_at + self.timeout
         while (remaining := deadline - self.clock.monotonic()) > 0:
             reply_datagram = self._transport.receive(remaining)
             if reply_datagram is None:
@@ -302,12 +305,15 @@ class ViscaPtz:
         arm: Callable[[float], None] | None,
     ) -> CommandResult:
         started = self.clock.monotonic()
-        if not self._lock.acquire(timeout=self.timeout):
+        # One deadline for the whole call. Everything below waits only for what is left of it, so the caller is
+        # never blocked longer than `timeout` (before, lock wait + sequence reset + reply wait could add up to 3x).
+        deadline = started + self.timeout
+        if not self._lock.acquire(timeout=max(0.0, deadline - self.clock.monotonic())):
             # Someone else holds the wire for longer than our whole budget: give up rather than block.
             self.stats["timeouts"] += 1
             return CommandResult(TIMEOUT, sent_at=started)
         try:
-            return self._exchange_locked(payload, payload_type, parser, what, wait_for_completion, arm)
+            return self._exchange_locked(payload, payload_type, parser, what, wait_for_completion, arm, deadline)
         finally:
             self._lock.release()
 
@@ -319,10 +325,18 @@ class ViscaPtz:
         what: str,
         wait_for_completion: bool,
         arm: Callable[[float], None] | None,
+        deadline: float | None = None,
     ) -> CommandResult:
-        """Send one request and wait for its reply. The caller holds `self._lock`."""
+        """Send one request and wait for its reply until `deadline` (default: one timeout from now).
+        The caller holds `self._lock`.
+
+        If a sequence reset is due it goes first, out of the same budget. If the reset used it all up, the request
+        is still sent (a stop should go out even then) but not waited for.
+        """
+        if deadline is None:
+            deadline = self.clock.monotonic() + self.timeout
         if self._needs_reset:
-            self._reset_sequence_locked()
+            self._reset_sequence_locked(deadline)
         sequence = self._sequence
         self._sequence = ((self._sequence + 1) & 0xFFFFFFFF) or 1
         self._recent.append(sequence)
@@ -334,7 +348,7 @@ class ViscaPtz:
         self.stats["sent"] += 1
         self._log("tx", datagram, sent_at, what=what, seq=sequence)
         return self._await_reply(sequence, sent_at, payload_type == packets.PAYLOAD_INQUIRY, parser,
-                                 wait_for_completion)
+                                 wait_for_completion, deadline)
 
     def _await_reply(
         self,
@@ -343,8 +357,8 @@ class ViscaPtz:
         is_inquiry: bool,
         parser: Callable[[bytes], object] | None,
         wait_for_completion: bool,
+        deadline: float,
     ) -> CommandResult:
-        deadline = sent_at + self.timeout
         acked: CommandResult | None = None
         while (remaining := deadline - self.clock.monotonic()) > 0:
             datagram = self._transport.receive(remaining)

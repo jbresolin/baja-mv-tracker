@@ -130,6 +130,64 @@ def test_no_reply_times_out_after_exactly_the_timeout():
     assert rig.ptz.stats["timeouts"] == 1
 
 
+# --- S1: one time budget per call ------------------------------------------------------------------------------
+#
+# The promise: no call blocks the caller longer than `timeout` (200 ms), whatever goes wrong. Before the fix, a call
+# could wait for the lock (up to 200 ms), then for a pending sequence reset (200 ms), then for its reply (200 ms).
+
+
+def test_pending_reset_and_reply_share_one_timeout():
+    # A camera that has gone completely silent, and a sequence reset is due before the next command.
+    rig = make_rig(behaviour={"sequence_reset": "silent", "pan_tilt_drive": "silent"})
+    rig.ptz._needs_reset = True  # as after a "sequence number" error from the camera
+    before = rig.clock.monotonic()
+    result = rig.ptz.pan_tilt_velocity(3, 0)
+    assert result.status == TIMEOUT
+    # Both the reset and the command were sent, but the whole call took one timeout, not two.
+    assert rig.clock.monotonic() - before == pytest.approx(rig.ptz.timeout)
+    assert rig.camera.received[-2:] == [("sequence_reset", b"\x01"), ("pan_tilt_drive", packets.pan_tilt_drive(3, 0))]
+
+
+class _SlowLock:
+    """Stands in for the driver's lock: getting it takes `wait` seconds of fake time, as if another thread held it.
+
+    With `never=True` it is never free: it waits the whole timeout it was given and then reports failure.
+    """
+
+    def __init__(self, clock: FakeClock, wait: float, never: bool = False) -> None:
+        self.clock, self.wait, self.never = clock, wait, never
+        self.timeouts_asked: list[float] = []
+
+    def acquire(self, timeout: float = -1) -> bool:
+        self.timeouts_asked.append(timeout)
+        if self.never:
+            self.clock.advance(timeout)
+            return False
+        self.clock.advance(min(self.wait, timeout))
+        return True
+
+    def release(self) -> None:
+        pass
+
+
+def test_time_spent_waiting_for_the_lock_comes_out_of_the_timeout():
+    rig = make_rig(behaviour={"pan_tilt_drive": "silent"})
+    rig.ptz._lock = _SlowLock(rig.clock, wait=0.15)  # another thread holds the wire for 150 ms
+    before = rig.clock.monotonic()
+    assert rig.ptz.pan_tilt_velocity(3, 0).status == TIMEOUT
+    # 150 ms for the lock + only the remaining 50 ms for the reply = 200 ms in total (it used to be 350 ms).
+    assert rig.clock.monotonic() - before == pytest.approx(rig.ptz.timeout)
+
+
+def test_a_lock_that_never_frees_times_out_after_one_timeout():
+    rig = make_rig()
+    rig.ptz._lock = _SlowLock(rig.clock, wait=0.0, never=True)
+    before = rig.clock.monotonic()
+    assert rig.ptz.stop().status == TIMEOUT
+    assert rig.clock.monotonic() - before == pytest.approx(rig.ptz.timeout)
+    assert rig.ptz._lock.timeouts_asked == [pytest.approx(rig.ptz.timeout)]
+
+
 def test_ack_without_completion_gives_acked_when_waiting_for_completion():
     rig = make_rig(behaviour={"home": "ack_only"})
     assert rig.ptz.command(packets.home(), wait_for_completion=True).status == ACKED
