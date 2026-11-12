@@ -13,8 +13,11 @@ extra_args = ["--stats"]        # more rt/run.py arguments: --stats samples CPU/
 restart_first_s = 5             # after rt exits or stalls: wait 5 s, then 10, 20, 40, 60, 60, ...
 restart_max_s = 60
 healthy_reset_min = 10          # a run that lasted 10 min resets the wait to 5 s
-stall_s = 30                    # status page fps = 0 (or no answer) for 30 s -> kill rt and restart it
+stall_s = 30                    # status page silent, or fps = 0 while the camera says streaming, for 30 s ->
+                                # kill rt and restart it (camera lost/retrying: rt reopens it itself, no kill)
 startup_grace_s = 60            # no stall check in the first 60 s of a run (models load, camera opens)
+camera_recover_max_s = 600      # camera lost / reopening this long in one go -> restart rt anyway
+camera_attempt_stall_s = 60     # camera lost and rt's open-attempt counter not moving this long -> restart rt
 poll_s = 2                      # how often the launcher looks at rt
 
 [runtime]
@@ -77,6 +80,8 @@ bind = "0.0.0.0"                # all interfaces: open http://<laptop IP>:8765/ 
 port = 8765                     # Windows asks once to allow Python through the firewall: allow "Private networks"
 passes = 20
 time_check_s = 60
+setup_token = ""                # Beam setup panel: "" = anyone on the LAN can change the beam settings (only the
+                                # beam); set a PIN here and the page asks for it once
 
 [clock]
 ntp_server = "192.168.88.1"     # PLACEHOLDER: set the event router's IP (192.168.88.1 is a MikroTik's default). rt
@@ -87,3 +92,60 @@ offset_s = 0.0                  # manual correction only if the PC clock can't b
 
 [lapapp]
 enabled = false                 # shadow mode: nothing is written to the lap app at this event
+
+[beam]
+# Timing light-beam sensor at the line, through the USB serial adapter (Silicon Labs CP2102), WP-L2. Shadow mode: the
+# beam only adds precise crossing times to the JSONL (beam_edge / beam_break / pass_beam); vision still does the
+# identity and the counting, and nothing goes to the lap app. OFF until the adapter is known to work.
+# On site, the usual way: status page on the phone -> Beam setup -> Start monitor -> wave through the beam ->
+# Suggest -> Apply. That saves the settings to lapline.beam.toml next to this file (loaded on top of this section at
+# every start; delete it to go back to what is written here). See rt/README.md "Beam input".
+# Without the page (rt closed: only one program can open a COM port):
+#   1. python -m rt.tools.beam_probe --list               (find the port: the CP2102 shows USB id 10C4:EA60)
+#   2. python -m rt.tools.beam_probe --port COM5          (break the beam a few times, Ctrl+C: it prints a guess)
+#   3. copy the guessed lines here, set the port, start rt; check the Beam section of the status page.
+driver = "off"                  # "off" | "modem-line" | "byte-stream" | "fake" (synthetic car every fake_every_s,
+                                # to check the chain and the status page without hardware)
+port = "COM5"                   # the adapter's COM port (Device Manager > Ports, or the probe's --list)
+
+# --- driver = "modem-line": the sensor switches one of the adapter's input lines ---
+line = "cts"                    # which line: "cts", "dsr", "cd" (= DCD) or "ri"; the probe tells
+active = "high"                 # "high": line asserted (RS232 positive) = beam blocked; "low": the opposite
+poll_hz = 1000                  # line reads per second; the edge time is within 1 ms (see beam_poll / status page)
+set_dtr = true                  # the adapter's DTR / RTS outputs: true = asserted (+V on RS232). Can power a
+set_rts = true                  # pull-up resistor for an open-collector sensor (rt/README.md "Beam input")
+# Example:
+#   driver = "modem-line"
+#   port = "COM5"
+#   line = "dsr"
+#   active = "low"
+
+# --- driver = "byte-stream": the adapter sends bytes for each pulse ---
+baud = 9600                     # serial speed (try the probe with --baud if the bytes look like garbage)
+byte_pattern = ""               # hex of the message that means "beam blocked", e.g. "0D0A"; "" = any bytes = a pulse
+byte_release_pattern = ""       # hex of the message that means "clear", if the adapter sends one; "" = pulses only
+# Example:
+#   driver = "byte-stream"
+#   port = "COM5"
+#   baud = 9600
+#   byte_pattern = "31"
+#   byte_release_pattern = "30"
+
+# --- grouping: raw edges -> one break per car ---
+group_gap_s = 0.25              # edges closer than this = same car (a tube frame gives several pulses per car); cars
+                                # nose to tail closer than this become one break (fuse_beam.py flags that)
+stuck_s = 5.0                   # blocked / flickering longer than this = someone in the beam: one beam_stuck event,
+                                # no breaks until it clears (status page shows STUCK in red)
+
+# --- live association with the vision passes (pass_beam events; the real fusion is rt/tools/fuse_beam.py) ---
+assoc_window_s = 1.0            # a pass gets t_beam when exactly one break is within this of its t_cross
+assoc_offset_s = 0.0            # expected t_cross - t_beam (camera centre line vs beam); set it from fuse_beam.py's
+                                # "camera - beam offset" after a test session
+
+# --- port problems ---
+reopen_first_s = 1              # adapter missing / unplugged: retry after 1 s, 2 s, 4 s ... (rt keeps running)
+reopen_max_s = 30
+
+# --- optional: camera latency from an LED in view (lit by the sensor output) ---
+led_roi = []                    # [x, y, w, h] in pixels of the processed frame (1920x1080 by default); [] = off
+led_threshold = 128             # mean brightness 0-255 above which the LED counts as on (status page shows the mean)

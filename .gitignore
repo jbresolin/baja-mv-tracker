@@ -18,3 +18,5 @@ PAUSE
 deploy/models/*.onnx
 # test fixture: a 7.5 s 26SE clip (rt/tests/test_e2e_clip.py)
 !rt/tests/fixtures/*.mp4
+*.beam.toml
+*.beam.toml.tmp

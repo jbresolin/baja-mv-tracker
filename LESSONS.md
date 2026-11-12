@@ -1783,3 +1783,62 @@ The reviewer read OpenCV 4.x `modules/videoio/src/cap_dshow.cpp`. **Corrections 
   ffmpeg creates when its process gets going, possibly after the next segment is opened; a second segment within the
   same second could get the same name and overwrite the first (ffmpeg `-y`, sidecars). It now also checks the `.json`
   sidecar, which is written before `open_segment()` returns.
+
+## Session 3: beam input for rt/ (WP-L2, AUTOPTZ-23, 2026-11-12)
+
+Code: `rt/beam/` (`sources.py` drivers modem-line / byte-stream / fake, `grouping.py` edges -> breaks + stuck beam,
+`associate.py` live pass rule + LED watcher, `service.py` reader + dispatcher threads), `rt/tools/beam_probe.py`,
+`rt/tools/fuse_beam.py`, `[beam]` in `rt/config.toml` and `rt/configs/lapline.example.toml` (off by default), a Beam
+section on the status page, tests `rt/tests/test_beam_*.py` + `test_fuse_beam.py`. Pass logic, tracker and models are
+unchanged (beam results are separate `pass_beam` events), so the 26SE replay numbers above still hold. Written before
+the adapter arrived: how the pulse reaches the PC (a modem line or bytes) is still unknown, hence two drivers and the
+probe.
+
+* **Clocks**: beam edges are stamped with the same `time.time()` / `time.monotonic()` pair as frames. On DirectShow
+  frames are stamped after `retrieve()` (decode included, see the PR #1 review fixes above), so frame times run late
+  by the decode time; `assoc_offset_s` and the LED latency absorb it. `t_beam` gets `clock.offset_s` like frames but NOT `capture.live_latency_s` (a camera property), so `t_cross -
+  t_beam` = camera latency + where the camera's centre line sits relative to the beam + the pass logic's definition
+  of t_cross. fuse_beam.py estimates that offset from clean single matches; `assoc_offset_s` takes it for live use.
+* **Isolation**: the reader thread does nothing but read and stamp (it never takes rt's emitter lock or writes a
+  file); a dispatcher thread writes the events. rt's `Emitter` holds a non-reentrant lock while calling sinks, so the
+  sink that feeds `pass_end` to the beam may only queue; emitting from inside a sink would deadlock.
+* **Live association waits for its window**: a pass is decided only after `t_cross - offset + window + group_gap`
+  (in practice at once, since `pass_end` comes ~10 s after the car), and at most `window + 5 s` after it arrived so a
+  wall-clock jump cannot hold it forever.
+* **LED latency is quantised by the 10 fps processing**: a value is grab time of the first processed frame showing the
+  LED minus the edge, i.e. latency + 0-100 ms. Use the minimum of many `clean` values. Multi-pulse cars make the
+  pairing ambiguous (`clean` = false).
+* **Launcher fix (same PR)**: PR #1's launcher killed rt after 30 s of fps = 0 even when rt's own page said the camera
+  was lost and rt was reopening it. Now `lost` / `retrying` / `opening` with a live status page is left to rt; an
+  unreachable page, or fps = 0 while the camera says `streaming`, is still a stall.
+* Checked here without hardware: byte-stream with real pyserial on a Linux pty (3 messages 50 ms apart -> 1 break
+  with 3 pulses). Modem-line on a pty fails at the DTR ioctl ("Inappropriate ioctl") and correctly shows `retrying`;
+  it needs a real adapter. Not verified: the CP2102's modem-line read rate on Windows (expected ~1 kHz with Python
+  3.11+'s high-resolution sleep; the `beam_poll` event and the status page show the real rate).
+
+### Review fixes on PR #5 + on-site beam setup (2026-11-12)
+
+* **Correction: a modem-line unplug was not detected on Windows.** pyserial's `serialwin32` reads CTS/DSR/DCD/RI
+  through `GetCommModemStatus` but ignores its return value, so an unplugged adapter just reads "not asserted" and
+  nothing raises. The driver now checks `in_waiting` (ClearCommError, which does raise) every 100 ms and before
+  reporting any change, plus GetCommModemStatus' own BOOL via ctypes on Windows. The test fake now behaves like
+  real pyserial (lines read False, `in_waiting` raises).
+* **Correction: break grouping could split one car in two** when the dispatcher advanced the grouper to "now"
+  between the reader stamping an edge and queueing it. The grouper now only advances to min(now - 20 ms, the
+  reader's published horizon), and a byte-stream message still being assembled holds the horizon back.
+* **Correction: byte-stream edges were per read, not per message.** A message split over two USB reads gave two
+  pulses (and the probe saw fragments, so its two-message alternation guess failed). Bytes less than 3 character
+  times apart (from the baud: 3.1 ms at 9600) are now one message, stamped at its first byte, in the driver and
+  the probe.
+* **Correction: the probe took the polarity from the majority of time**; a person standing in the beam turned it
+  around. It now takes the state at the start of the probe as "clear" and warns when the time share disagrees.
+* **Launcher**: "camera lost, rt reopens it" is no longer unlimited: restart rt after 600 s of recovery, or after
+  60 s without a new open attempt (`camera.open_attempts` on the status page). rt calls `timeBeginPeriod(1)` on
+  Windows and logs `sys.version`.
+* **Not done**: marking a pass_beam association as low-confidence when the vision t_cross is the pass logic's
+  fallback (mean track time): `pass_end` carries nothing that tells the fallback apart, and the pass logic was not
+  to be changed.
+* **On-site beam setup**: the status page's `/beam` panel (built-in probe: live lines at ~5 Hz, byte messages,
+  Suggest, Apply / Turn off) saves to `<config>.beam.toml` and restarts only the BeamService. Setup mode pauses the
+  driver (one COM port owner) and ends by itself after 300 s without a page refresh. Checked here with a headless
+  Chrome against fake serial ports; not yet with the real CP2102.

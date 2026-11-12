@@ -8,9 +8,13 @@ Rules:
   * rt exits (crash, or any exit code): start it again after a wait that doubles each time: 5 s, 10 s, 20 s, 40 s,
     60 s, 60 s, ... If the run that just ended had been up for `healthy_reset_min` minutes, the wait starts again at
     5 s (one crash after hours of running is not a crash loop).
-  * rt is alive but its status page (http://127.0.0.1:<status.port>/status.json) reports processing fps = 0, or
-    does not answer, for `stall_s` seconds in a row: kill it and restart it the same way. Nothing is checked during
-    the first `startup_grace_s` seconds of a run (models load, the camera opens).
+  * rt is alive but its status page (http://127.0.0.1:<status.port>/status.json) does not answer, or reports
+    processing fps = 0 while the camera claims to be streaming, for `stall_s` seconds in a row: kill it and restart
+    it the same way. Nothing is checked during the first `startup_grace_s` seconds of a run (models load, the camera
+    opens).
+  * fps = 0 while the status page says the camera is lost / retrying / opening is NOT a stall: rt is alive (it
+    answers) and is already reopening the camera in-process with its own backoff. Killing rt there would not bring
+    the camera back sooner, and every restart costs a model load and a new output file.
   * Every start, exit, stall and kill is written to the launcher log (`<out_dir>/launcher.log`) and the console.
 
 The kill takes the whole process tree: on Windows `.venv\\Scripts\\python.exe` is a launcher that starts the real
@@ -66,11 +70,27 @@ def kill_tree(proc, timeout=10.0):
         pass
 
 
+# Camera states (rt/livecam.py) in which rt is handling a missing camera by itself: it answers its status page, has
+# 0 fps because there are no frames, and keeps trying to reopen the camera with backoff.
+CAMERA_RECOVERING_STATES = ("lost", "retrying", "opening")
+
+
 def probe_fps(url, timeout=2.0):
     """processing fps from rt's status page, or None if it does not answer."""
+    status = probe_status(url, timeout)
+    return None if status is None else status["fps"]
+
+
+def probe_status(url, timeout=2.0):
+    """What the launcher needs from rt's status page: {"fps": processing fps, "camera_state": the camera's state
+    ("streaming", "lost", ...; None if the page has no camera), "camera_attempts": how many times rt has tried to
+    open the camera (None if the page does not say)}, or None if the page does not answer."""
     try:
         with urllib.request.urlopen(url, timeout=timeout) as response:
-            return float(json.loads(response.read().decode("utf-8"))["processing"]["fps"])
+            payload = json.loads(response.read().decode("utf-8"))
+        camera = payload.get("camera") or {}
+        return dict(fps=float(payload["processing"]["fps"]), camera_state=camera.get("state"),
+                    camera_attempts=camera.get("open_attempts"))
     except Exception:  # noqa: BLE001
         return None
 
@@ -84,11 +104,22 @@ class Supervisor:
     """The restart rules as a small state machine. tick() is called every `poll_s` seconds by run(); tests call it
     directly with a fake clock, a fake process and a fake fps probe, so no test ever sleeps.
 
-    make_cmd() -> the command list for one run; spawn(cmd) -> a process object (poll(), pid); probe() -> fps or
-    None; kill(proc) stops it; clock() -> seconds (monotonic); log(msg) writes a line."""
+    make_cmd() -> the command list for one run; spawn(cmd) -> a process object (poll(), pid); probe() -> the
+    status page's {"fps", "camera_state", "camera_attempts"} (probe_status), a bare fps number (camera state
+    unknown), or None when the page does not answer; kill(proc) stops it; clock() -> seconds (monotonic); log(msg)
+    writes a line.
+
+    Camera lost: rt reopens the camera by itself, so 0 fps with the camera lost / retrying / opening is not a stall,
+    within two limits (both measured on the launcher's own clock):
+      * camera_recover_max_s (600 s): the camera has been recovering for this long in one go -> restart rt anyway
+        (a fresh process sometimes gets a camera back that a reopen inside the old one does not);
+      * camera_attempt_stall_s (60 s): rt's open-attempt counter (camera.open_attempts on the page) has not gone up
+        for this long -> rt's reopen loop is stuck (an open() that never returns): restart rt. rt retries at least
+        every camera.reopen_max_s (30 s), so a healthy reopen loop always moves the counter within 60 s."""
 
     def __init__(self, make_cmd, spawn, probe, kill, clock, log, first_wait_s=5.0, max_wait_s=60.0, stall_s=30.0,
-                 grace_s=60.0, healthy_reset_s=600.0, check_stall=True):
+                 grace_s=60.0, healthy_reset_s=600.0, check_stall=True, camera_recover_max_s=600.0,
+                 camera_attempt_stall_s=60.0):
         self.make_cmd, self.spawn, self.probe, self.kill, self.clock, self.log = make_cmd, spawn, probe, kill, clock, log
         self.backoff = Backoff(first_wait_s, 2.0, max_wait_s)
         self.stall_s, self.grace_s, self.healthy_reset_s = float(stall_s), float(grace_s), float(healthy_reset_s)
@@ -97,6 +128,12 @@ class Supervisor:
         self.started_at = None
         self.next_start_at = None     # None = start now
         self.zero_since = None
+        self.camera_wait_logged = False   # the "camera lost, rt handles it" message is logged once per episode
+        self.camera_recover_max_s = float(camera_recover_max_s)
+        self.camera_attempt_stall_s = float(camera_attempt_stall_s)
+        self.recovering_since = None      # when the current camera-recovering episode started (launcher clock)
+        self.last_attempts = None         # rt's camera open-attempt counter as last seen ...
+        self.attempts_changed_at = None   # ... and when the launcher saw it change
         self.starts = 0
         self.restarts = []            # (time, reason, wait) of every scheduled restart
 
@@ -108,6 +145,25 @@ class Supervisor:
         self.started_at = now
         self.zero_since = None
         self.next_start_at = None
+        self._end_recovering()
+
+    def _end_recovering(self):
+        self.recovering_since = self.last_attempts = self.attempts_changed_at = None
+        self.camera_wait_logged = False
+
+    def _camera_recovery_stuck(self, now, attempts):
+        """Called on every tick while rt says the camera is recovering. Returns why rt should be restarted, or
+        None while rt's own reopen loop deserves more time."""
+        if self.recovering_since is None:
+            self.recovering_since = now
+        if attempts is not None and attempts != self.last_attempts:
+            self.last_attempts, self.attempts_changed_at = attempts, now
+        if now - self.recovering_since >= self.camera_recover_max_s:
+            return "camera not back after %.0f s of reopening" % (now - self.recovering_since)
+        if self.attempts_changed_at is not None and now - self.attempts_changed_at >= self.camera_attempt_stall_s:
+            return "rt's camera reopen loop is stuck (no new open attempt for %.0f s, attempt #%s)" % (
+                now - self.attempts_changed_at, self.last_attempts)
+        return None
 
     def _schedule_restart(self, now, reason):
         ran = now - self.started_at if self.started_at is not None else 0.0
@@ -132,14 +188,36 @@ class Supervisor:
             return
         if not self.check_stall or now - self.started_at < self.grace_s:
             return
-        fps = self.probe()
+        answer = self.probe()
+        if isinstance(answer, dict):
+            fps, camera_state, attempts = answer.get("fps"), answer.get("camera_state"), answer.get("camera_attempts")
+        else:                                  # a bare number (or None): camera state unknown
+            fps, camera_state, attempts = answer, None, None
         if fps is not None and fps > 0:
             self.zero_since = None
+            self._end_recovering()
             return
+        if fps is not None and camera_state in CAMERA_RECOVERING_STATES:
+            # rt answers and says the camera is gone: it is reopening it by itself. Not a stall, unless that has
+            # gone on too long or rt's reopen loop stopped trying.
+            self.zero_since = None
+            why = self._camera_recovery_stuck(now, attempts)
+            if why is not None:
+                self.log("%s: killing pid %s" % (why, self.proc.pid))
+                self.kill(self.proc)
+                self._schedule_restart(now, "camera recovery stuck")
+                return
+            if not self.camera_wait_logged:
+                self.camera_wait_logged = True
+                self.log("status: fps = 0, camera %s: rt is reopening the camera itself; not restarting" %
+                         camera_state)
+            return
+        self._end_recovering()
         if self.zero_since is None:
             self.zero_since = now
-            self.log("status: %s; restart if it lasts %.0f s" % ("no answer" if fps is None else "fps = 0",
-                                                                 self.stall_s))
+            self.log("status: %s; restart if it lasts %.0f s" % (
+                "no answer" if fps is None else "fps = 0 (camera %s)" % (camera_state or "state unknown"),
+                self.stall_s))
         if now - self.zero_since >= self.stall_s:
             self.log("rt stalled (%s for %.0f s): killing pid %s" % (
                 "no status answer" if fps is None else "fps = 0", now - self.zero_since, self.proc.pid))
@@ -199,10 +277,12 @@ def main():
         log("WARNING status page disabled: stalls cannot be detected, only exits")
     sup = Supervisor(make_cmd=lambda: build_command(cfg, a.config),
                      spawn=lambda cmd: subprocess.Popen(cmd, cwd=str(ROOT)),
-                     probe=lambda: probe_fps(url), kill=kill_tree, clock=time.monotonic, log=log,
+                     probe=lambda: probe_status(url), kill=kill_tree, clock=time.monotonic, log=log,
                      first_wait_s=float(launch_cfg["restart_first_s"]), max_wait_s=float(launch_cfg["restart_max_s"]),
                      stall_s=float(launch_cfg["stall_s"]), grace_s=float(launch_cfg["startup_grace_s"]),
-                     healthy_reset_s=float(launch_cfg["healthy_reset_min"]) * 60, check_stall=check)
+                     healthy_reset_s=float(launch_cfg["healthy_reset_min"]) * 60, check_stall=check,
+                     camera_recover_max_s=float(launch_cfg.get("camera_recover_max_s", 600)),
+                     camera_attempt_stall_s=float(launch_cfg.get("camera_attempt_stall_s", 60)))
     log("launcher start: config %s, status %s" % (a.config, url))
     try:
         while True:

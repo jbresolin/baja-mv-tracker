@@ -121,6 +121,11 @@ class CameraCapture(Capture):
         # retrieve_every_frame mode, successful grabs in grab_then_retrieve mode).
         self.camera_frames = self.grab_calls = self.retrieve_calls = 0
         self.failed_reads = self.corrupt = self.reopens = 0
+        # Open attempts (first open and every reopen): the launcher (rt/supervise.py) watches this counter while the
+        # camera is lost. If it stops going up, the reopen loop itself is stuck (e.g. an open() that never returns)
+        # and only a restart of rt can help.
+        self.open_attempts = 0
+        self.last_attempt_mono = None
         self.last_good_mono = None
         self.w = self.h = None
         self.info = dict(device=str(self.device))
@@ -139,7 +144,10 @@ class CameraCapture(Capture):
                     info=self.cam_info, read_mode=self.read_mode, raw_mjpeg=self.raw,
                     camera_frames=self.camera_frames, grab_calls=self.grab_calls,
                     retrieve_calls=self.retrieve_calls, failed_reads=self.failed_reads, processed=self.captured,
-                    dropped=self.dropped, corrupt=self.corrupt, reopens=self.reopens, last_frame_age_s=age)
+                    dropped=self.dropped, corrupt=self.corrupt, reopens=self.reopens, last_frame_age_s=age,
+                    open_attempts=self.open_attempts,
+                    last_attempt_age_s=None if self.last_attempt_mono is None else round(
+                        self.clock.mono() - self.last_attempt_mono, 2))
 
     def describe(self):
         return ("camera %s (%s): opened by the capture thread; processing %.3g fps; read mode %s; clock %s" %
@@ -157,6 +165,8 @@ class CameraCapture(Capture):
         processed_no = 0
         while not self.stop_ev.is_set():
             cam = self.factory()
+            self.open_attempts += 1
+            self.last_attempt_mono = self.clock.mono()
             try:
                 self._set_state("opening")
                 self.cam_info = cam.open()

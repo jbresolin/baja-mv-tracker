@@ -3,4 +3,5 @@ numpy
 opencv-python-headless   # or opencv-python (the laptop's runtime install); either works for the tests
 onnxruntime              # rt/models.py imports it; only test_e2e_clip.py runs a model, and only if the .onnx files exist
 psutil
+pyserial                 # rt/beam (beam input) at run time; the tests themselves use a fake serial port
 pytest

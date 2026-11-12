@@ -92,6 +92,8 @@ fps_window_s = 10
 time_check_s = 60               # re-measure the clock offset this often
 required = false                # true: exit (code 3) if the port is busy. The launcher always asks for this
                                 # (--require-status), since it watches rt through the page
+setup_token = ""                # Beam setup panel (/beam): if set, its POSTs need this token (the page asks once).
+                                # "" = no token: anyone on the LAN can change the beam settings (only the beam)
 
 [launch]                        # rt/supervise.py (rt\run_lapline.bat): one unattended rt
 name = "lapline"
@@ -102,8 +104,10 @@ extra_args = []                 # more rt/run.py arguments, e.g. ["--stats", "--
 restart_first_s = 5             # restart backoff: 5 s, doubling ...
 restart_max_s = 60              # ... up to 60 s
 healthy_reset_min = 10          # a run that lasted this long resets the backoff to restart_first_s
-stall_s = 30                    # status fps = 0 (or no answer) this long -> kill and restart
+stall_s = 30                    # no status answer, or fps = 0 while the camera says streaming, this long -> kill + restart
 startup_grace_s = 60            # no stall check during the first seconds of a run
+camera_recover_max_s = 600      # camera lost / reopening this long in one go -> restart rt anyway
+camera_attempt_stall_s = 60     # camera lost and rt's open-attempt counter not moving this long -> restart rt
 poll_s = 2
 
 [clock]
@@ -163,3 +167,33 @@ fonte_id = 5                    # a new contagem_fonte row for the camera (26SE 
 dispositivo_id = 0
 only_numbered = true            # contagem_passagem.equipe_numero is NOT NULL in every 26SE row
 outbox = ""                     # JSONL file of the would-be rows; default: <--out>.lapapp.jsonl
+
+[beam]                          # rt/beam/: timing light-beam sensor through a USB serial adapter (WP-L2). Shadow mode only
+driver = "off"                  # off | modem-line | byte-stream | fake (scripted cars, dry run without hardware)
+port = "COM5"                   # serial port of the adapter (python -m rt.tools.beam_probe --list shows them)
+line = "cts"                    # modem-line: cts | dsr | cd (= dcd) | ri
+active = "high"                 # modem-line: which line state means "beam blocked": high = asserted, low = not asserted
+poll_hz = 1000                  # modem-line: polls per second (the time stamp is within 1/poll_hz of the real edge)
+set_dtr = true                  # modem-line: drive the adapter's DTR / RTS outputs high (can power a pull-up / sensor)
+set_rts = true
+baud = 9600                     # byte-stream (and the port open): serial speed
+byte_pattern = ""               # byte-stream: hex bytes that mean "pulse/blocked" ("" = any received bytes = one edge)
+byte_release_pattern = ""       # byte-stream: hex bytes that mean "clear" ("" = pulses only)
+read_timeout_s = 0.002          # byte-stream: longest wait for a byte per read
+byte_merge_chars = 3            # byte-stream: bytes closer than this many character times (from baud) = one message
+group_gap_s = 0.25              # edges closer than this belong to the same car (tube frames give several pulses)
+stuck_s = 5.0                   # a break longer than this is not a car: beam_stuck, no breaks until it clears
+setup_idle_s = 300              # Beam setup page closed this long while in setup mode -> beam restarts as saved
+advance_guard_s = 0.02          # breaks are closed this far behind "now" (the reader may not have queued an edge yet)
+reopen_first_s = 1              # port missing / unplugged: retry after 1 s, doubling ...
+reopen_max_s = 30               # ... up to 30 s
+max_edge_events_per_s = 100     # beam_edge lines written per second at most (a noisy line still groups, counted)
+queue_max = 10000               # beam reader -> dispatcher queue bound (full: the oldest item is dropped, counted)
+poll_report_s = 60              # beam_poll event (achieved poll rate and jitter) this often
+assoc_window_s = 1.0            # live: a pass_end gets t_beam if exactly one break is within this of its t_cross
+assoc_offset_s = 0.0            # live: expected t_cross - t_beam (camera centre line vs beam); fuse_beam.py measures it
+led_roi = []                    # [x, y, w, h] pixels of the processed frame: LED in view -> camera_latency; [] = off
+led_threshold = 128             # mean brightness (0-255) above which the LED counts as on
+led_max_latency_s = 0.5         # an LED frame is paired with an active beam edge at most this much earlier
+fake_every_s = 20.0             # fake driver: one synthetic car every this many seconds ...
+fake_pulses = 3                 # ... blocking the beam this many times

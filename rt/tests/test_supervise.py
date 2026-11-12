@@ -7,6 +7,8 @@ The rules being checked:
   * rt exits -> start it again after 5 s, then 10, 20, 40, 60, 60 s if it keeps dying;
   * a run that lasted 10 minutes before dying resets the wait to 5 s;
   * rt alive but processing 0 fps (or not answering) for 30 s -> kill it, restart it;
+  * ... EXCEPT when the status page answers and says the camera is lost / retrying / opening: rt is reopening the
+    camera by itself, so the launcher leaves it alone (killing it would not bring the camera back any sooner);
   * nothing is checked during the first 60 s of a run (models load, the camera opens).
 """
 import pytest
@@ -222,3 +224,190 @@ def test_kill_tree_also_kills_grandchildren():
     kill_tree(parent, timeout=5)
     assert parent.poll() is not None
     assert not any(k.is_running() and k.status() != psutil.STATUS_ZOMBIE for k in kids)
+
+
+# ------------------------------------------------------------------------------------------------ camera lost
+# The status page also tells the camera's state. In these tests the fake status page answers with a small dict, like
+# rt.supervise.probe_status() returns from the real page: {"fps": ..., "camera_state": ...}.
+
+def supervisor_with_camera_state(w, **kw):
+    """A supervisor whose fake status page reports both the fps and the camera state stored in the World."""
+    w.camera_state = "streaming"
+    return Supervisor(make_cmd=lambda: ["python", "rt/run.py"], spawn=w.spawn,
+                      probe=lambda: None if w.fps is None else dict(fps=w.fps, camera_state=w.camera_state),
+                      kill=w.kill, clock=lambda: w.now, log=w.logs.append, **kw)
+
+
+@pytest.mark.parametrize("state", ["lost", "retrying", "opening"])
+def test_camera_lost_is_left_to_rt_not_killed(state):
+    # The webcam was unplugged: rt keeps running, its page answers, fps is 0 and the camera state is "lost" (or
+    # "retrying" / "opening" while it tries again). Even after 5 minutes the launcher must NOT kill rt.
+    w = World()
+    sup = supervisor_with_camera_state(w, grace_s=60, stall_s=30)
+    w.run(sup, 70)                       # normal running
+    w.fps, w.camera_state = 0.0, state
+    w.run(sup, 300)
+    assert not w.procs[0].killed and len(w.procs) == 1
+    # It said why, once (not every 2 s for 5 minutes).
+    assert sum("reopening the camera itself" in m for m in w.logs) == 1
+
+
+def test_zero_fps_while_camera_claims_streaming_is_still_a_stall():
+    # The camera says "streaming" but no frame is processed: detection is hung. That is the real stall: kill it.
+    w = World()
+    sup = supervisor_with_camera_state(w, grace_s=60, stall_s=30)
+    w.run(sup, 70)
+    w.fps = 0.0                          # camera_state stays "streaming"
+    w.run(sup, 31)
+    assert w.procs[0].killed
+    assert any("camera streaming" in m for m in w.logs)
+
+
+def test_no_answer_is_still_a_stall_with_the_new_probe():
+    # The page does not answer at all (probe gives None): rt is frozen, whatever the camera was doing. Kill it.
+    w = World()
+    sup = supervisor_with_camera_state(w, grace_s=60, stall_s=30)
+    w.run(sup, 70)
+    w.fps = None
+    w.run(sup, 31)
+    assert w.procs[0].killed
+
+
+def test_camera_back_then_hang_counts_from_the_hang():
+    # Camera lost for 2 minutes (no kill), it comes back and streams, then detection hangs: the 30 s count starts
+    # at the hang, not at the moment the camera was lost.
+    w = World()
+    sup = supervisor_with_camera_state(w, grace_s=60, stall_s=30)
+    w.run(sup, 70)
+    w.fps, w.camera_state = 0.0, "lost"
+    w.run(sup, 120)
+    w.camera_state = "streaming"         # back, but fps still 0: hung
+    w.run(sup, 29)
+    assert not w.procs[0].killed         # only 29 s of "streaming at 0 fps"
+    w.run(sup, 2)
+    assert w.procs[0].killed
+
+
+def test_probe_status_reads_fps_and_camera_state_from_a_real_page():
+    # A tiny real HTTP server that serves a status.json like rt's: probe_status() must read both fields from it.
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from rt.supervise import probe_fps, probe_status
+
+    body = json.dumps(dict(processing=dict(fps=0.0), camera=dict(state="lost"))).encode()
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):  # noqa: N802
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        url = "http://127.0.0.1:%d/status.json" % server.server_address[1]
+        assert probe_status(url) == dict(fps=0.0, camera_state="lost", camera_attempts=None)
+        assert probe_fps(url) == 0.0                  # the old helper still works
+    finally:
+        server.shutdown()
+        server.server_close()
+    # Nothing listening on that port any more: "no answer" is None.
+    assert probe_status(url, timeout=0.5) is None
+
+
+# ------------------------------------------------------------------------------------------------ camera lost too long
+# "Leave a lost camera to rt" has two limits, so a camera that never comes back (or a reopen loop that hangs) cannot
+# keep rt useless for the whole race day:
+#   * camera_recover_max_s: the camera has been "recovering" this long in one go -> restart rt anyway;
+#   * camera_attempt_stall_s: rt's count of camera open attempts (on its status page) has not gone up this long ->
+#     rt's own reopen loop is stuck -> restart rt.
+# The fake status page below also reports that open-attempt counter (w.attempts).
+
+def supervisor_with_attempts(w, **kw):
+    """Like supervisor_with_camera_state, plus the open-attempt counter rt shows on its page."""
+    w.camera_state = "streaming"
+    w.attempts = 1
+    return Supervisor(make_cmd=lambda: ["python", "rt/run.py"], spawn=w.spawn,
+                      probe=lambda: None if w.fps is None else dict(fps=w.fps, camera_state=w.camera_state,
+                                                                    camera_attempts=w.attempts),
+                      kill=w.kill, clock=lambda: w.now, log=w.logs.append, **kw)
+
+
+def run_with_attempts_every(w, sup, seconds, every_s):
+    """Advance fake time `seconds` (1 s per tick); rt "tries to open the camera" once every `every_s` seconds."""
+    for k in range(int(seconds)):
+        if every_s and k % every_s == 0:
+            w.attempts += 1
+        sup.tick()
+        w.now += 1.0
+
+
+def test_camera_lost_with_a_live_reopen_loop_is_left_alone_up_to_the_cap():
+    # rt keeps trying every 30 s (its normal maximum wait): 9 minutes of that is fine, no kill.
+    w = World()
+    sup = supervisor_with_attempts(w, grace_s=60, stall_s=30, camera_recover_max_s=600, camera_attempt_stall_s=60)
+    w.run(sup, 70)
+    w.fps, w.camera_state = 0.0, "lost"
+    run_with_attempts_every(w, sup, 540, every_s=30)
+    assert not w.procs[0].killed
+
+
+def test_camera_lost_longer_than_the_cap_restarts_rt():
+    # Same, but the camera never comes back: after 600 s of "lost" the launcher restarts rt anyway.
+    w = World()
+    sup = supervisor_with_attempts(w, grace_s=60, stall_s=30, camera_recover_max_s=600, camera_attempt_stall_s=60)
+    w.run(sup, 70)
+    w.fps, w.camera_state = 0.0, "lost"
+    run_with_attempts_every(w, sup, 599, every_s=30)
+    assert not w.procs[0].killed          # 599 s: not yet
+    run_with_attempts_every(w, sup, 2, every_s=30)
+    assert w.procs[0].killed              # 600 s: restart
+    assert any("camera not back after 600 s" in m for m in w.logs)
+    assert sup.restarts[-1][1] == "camera recovery stuck"
+
+
+def test_reopen_loop_that_stops_trying_restarts_rt_after_60_s():
+    # The camera is "opening" and rt's attempt counter does not move (an open() that never returns): after 60 s
+    # without a new attempt, restart rt. Long before the 600 s cap.
+    w = World()
+    sup = supervisor_with_attempts(w, grace_s=60, stall_s=30, camera_recover_max_s=600, camera_attempt_stall_s=60)
+    w.run(sup, 70)
+    w.fps, w.camera_state = 0.0, "opening"
+    run_with_attempts_every(w, sup, 59, every_s=0)     # every_s=0: the counter never changes
+    assert not w.procs[0].killed
+    run_with_attempts_every(w, sup, 2, every_s=0)
+    assert w.procs[0].killed
+    assert any("reopen loop is stuck" in m for m in w.logs)
+
+
+def test_camera_coming_back_resets_both_limits():
+    # 500 s lost, then the camera streams again for a while, then it is lost again: the 600 s count starts over.
+    w = World()
+    sup = supervisor_with_attempts(w, grace_s=60, stall_s=30, camera_recover_max_s=600, camera_attempt_stall_s=60)
+    w.run(sup, 70)
+    w.fps, w.camera_state = 0.0, "lost"
+    run_with_attempts_every(w, sup, 500, every_s=30)
+    w.fps, w.camera_state = 10.0, "streaming"
+    w.run(sup, 20)
+    w.fps, w.camera_state = 0.0, "lost"
+    run_with_attempts_every(w, sup, 500, every_s=30)
+    assert not w.procs[0].killed
+
+
+def test_old_rt_without_the_attempt_counter_still_gets_the_cap():
+    # A status page without camera_attempts (None): only the 600 s cap applies; the 60 s rule cannot be used.
+    w = World()
+    sup = supervisor_with_camera_state(w, grace_s=60, stall_s=30, camera_recover_max_s=600,
+                                       camera_attempt_stall_s=60)
+    w.run(sup, 70)
+    w.fps, w.camera_state = 0.0, "retrying"
+    w.run(sup, 300)
+    assert not w.procs[0].killed
+    w.run(sup, 301)
+    assert w.procs[0].killed

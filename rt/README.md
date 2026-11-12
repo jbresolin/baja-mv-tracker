@@ -19,7 +19,7 @@ and the vote is WP10b's `vote_boxed` with the val-picked tau / k. Results and ca
 Python 3.11+ (3.13 tested) and ffmpeg/ffprobe on PATH (Windows: `winget install Gyan.FFmpeg`). Then:
 
 ```
-pip install onnxruntime numpy opencv-python psutil          # psutil: CPU/RAM stats, CPU affinity, launcher kill
+pip install onnxruntime numpy opencv-python psutil pyserial # psutil: CPU/RAM stats, affinity, launcher kill; pyserial: beam
 pip install openvino                                        # optional: Intel CPU / iGPU backend
 ```
 
@@ -109,16 +109,141 @@ private networks when Windows asks).
   Windows time service's phase offset), recording state and free disk, last 20 passes with thumbnail, number,
   confidence and t_cross. `/status.json` has the same data. Read-only.
 * **Launcher** (`rt/supervise.py`, `rt\run_lapline.bat`, `[launch]`): restarts rt when it exits (5 s, doubling, max
-  60 s; reset after a 10-min healthy run) or when the status page reports 0 fps (or does not answer) for 30 s
-  (after a 60 s start-up grace). It kills the whole process tree. It starts rt with `--require-status`: if the
-  status port is busy (another rt, or another program), rt exits with code 3 and says why, and launcher.log names
-  the reason, instead of rt running blind and being killed as "stalled" every ~90 s. On Windows the page binds
-  its port exclusively (Python's default SO_REUSEADDR would let two programs share it silently). Each run writes
+  60 s; reset after a 10-min healthy run) or when the status page does not answer, or reports 0 fps while the camera
+  says "streaming", for 30 s (after a 60 s start-up grace). 0 fps with the camera "lost" / "retrying" / "opening" is
+  left to rt, which is already reopening the camera itself, within two limits: rt is restarted anyway when the
+  camera has been recovering for `camera_recover_max_s` (600 s) in one go, or when rt's camera open-attempt counter
+  (`open_attempts` on the status page) has not gone up for `camera_attempt_stall_s` (60 s: rt's reopen loop is
+  stuck, e.g. an open that never returns; keep `camera.reopen_max_s` well below it). It kills the whole process tree. It starts rt with
+  `--require-status`: if the status port is busy (another rt, or another program), rt exits with code 3 and says
+  why, and launcher.log names the reason, instead of rt running blind and being killed as "stalled" every ~90 s. On
+  Windows the page binds its port exclusively (Python's default SO_REUSEADDR would let two programs share it
+  silently). Each run writes
   `out/lapline/<date>/lapline_<time>.jsonl` (+ csv, stats, rec/); restarts are logged in `out/lapline/launcher.log`.
 
 Replay a recording through rt like any file (`--source out/lapline/<date>/rec/rec_....mkv`): when the file's
 `.frames.csv` is next to it, each frame gets its recorded time from it (the authoritative clock); otherwise the
 file's `creation_time` tag (the segment's start) + the nominal frame rate.
+
+## Beam input: timing light-beam sensor at the line (WP-L2)
+
+The event's timing sensors (a light beam across the start/finish line) give a digital pulse when a car crosses. A USB
+serial adapter (Silicon Labs CP2102) brings it to the lap-line laptop, and `rt/beam/` adds **precise crossing times**
+to the same JSONL. Vision stays responsible for identity and counting; the beam only gives times. Shadow mode:
+nothing goes to the lap app. Off by default (`[beam] driver = "off"`).
+
+**On site (the usual way, from a phone, rt running, nothing to edit or restart):**
+
+1. Plug the CP2102 adapter into the lap-line laptop and wire the sensor (see "Wiring" below).
+2. On the phone (same network) open the status page `http://<laptop IP>:8765/` and tap **Beam setup**
+   (`/beam`). The CP2102 is listed first, marked "CP2102 (10C4:EA60)".
+3. Choose the port (baud 9600 unless known otherwise), tick DTR / RTS if they power a pull-up, tap
+   **Start monitor**. The beam driver pauses; the four lines (CTS / DSR / DCD / RI) and any bytes now show live.
+4. With the beam clear, tap **Clear**, then walk / wave a hand through the beam 5-10 times: one line should flip
+   (green = asserted) or byte messages should appear.
+5. Tap **Suggest**: the probe's guess (driver, line, polarity or byte pattern) fills the settings, with notes.
+   Check them (group gap 0.25 s and stuck after 5 s are fine to start with).
+6. Tap **Apply**: rt validates the settings, saves them to `<config>.beam.toml` next to the config
+   (`rt/configs/lapline.beam.toml`, loaded at every start on top of `[beam]`; delete it to go back) and restarts
+   ONLY the beam (never detection, capture or recording).
+7. Check "Beam now" on the same page (or the Beam section of the status page): state `open`, the level flips
+   when the beam is broken, **edges/min** goes up, and each pass through the beam adds one line to **last
+   breaks** (2-10 edges for a car). **Turn off** sets driver = off (saved) if anything misbehaves.
+
+Setup mode ends by itself (beam restarted with the saved settings) when the page has not been refreshed for
+`beam.setup_idle_s` (300 s), so a locked phone never leaves the race without its beam. Only the beam setup
+actions accept POST (JSON only, at most 8 KB, every value checked on the laptop; a bad value is refused and
+changes nothing, a setting that still fails to start leaves the beam off with the error in red). The rest of the
+page stays read-only. Anyone on the LAN can use the panel unless `[status] setup_token` is set: then the page asks
+for it once (kept in the phone's browser) and sends it in the `X-Setup-Token` header.
+
+The command-line probe does the same with rt closed (only one program can open a COM port):
+
+```
+python -m rt.tools.beam_probe --list               (which COM port is the adapter: USB id 10C4:EA60 = CP210x)
+python -m rt.tools.beam_probe --port COM5          (break the beam 5-10 times, then Ctrl+C: it prints a guess)
+python -m rt.tools.beam_probe --port COM5 --baud 115200 --seconds 60      (if bytes arrive and look like garbage)
+```
+
+Close rt first (only one program can open a COM port). The probe prints every change of the four modem input
+lines (CTS, DSR, DCD, RI, read 1000 times a second) and every message of bytes, with times (bytes less than 3
+character times apart are one message, as in rt). At the end it guesses the driver, the line and the polarity (the
+line's state at the start = beam clear, so start with the beam clear; a warning if the line then spent most of the
+time in the other state), or the byte pattern and prints the lines to paste into the `[beam]` section
+of `rt/configs/lapline.toml` (example and every key: `rt/configs/lapline.example.toml`).
+
+* **Two ways the pulse can arrive**, because the adapter is not known yet:
+  * `modem-line`: the sensor switches one adapter input line. A dedicated thread polls it at `poll_hz` (1 kHz) and
+    stamps each change. `active = "high"` means line asserted = beam blocked; `"low"` the opposite.
+  * `byte-stream`: the adapter sends bytes per pulse. Bytes less than `byte_merge_chars` (3) character times apart
+    (3.1 ms at 9600 baud) are joined into one message even if they arrive in several reads; each message (or each
+    `byte_pattern`, hex) is an edge, stamped at the receipt of the message's first byte; the raw bytes are kept. With `byte_release_pattern` the "clear" message is an edge too.
+  * `fake`: one synthetic tube-frame car every `fake_every_s` (check the chain and the status page without hardware).
+* **Same clocks as the frames.** Each edge is stamped right after it is seen with `time.time()` and
+  `time.monotonic()` (the clock object rt/livecam.py stamps frames with). `t_edge` / `t_beam` = wall time +
+  `clock.offset_s`, like frame times. The camera's `capture.live_latency_s` is subtracted from frames only, so
+  `t_cross - t_beam` contains the camera latency and where the camera's centre line is relative to the beam. On
+  DirectShow frames are stamped after `retrieve()` (decode included), so frame times run late by the decode time
+  too; `assoc_offset_s` and the LED latency absorb it.
+  At 1 kHz an edge is stamped within ~1 ms (the `poll_gap_ms` field says how long the gap before it was). Windows:
+  Python 3.11+ sleeps with a high-resolution timer, and rt also calls `timeBeginPeriod(1)` at start (1 ms timer
+  tick, undone at exit; rt/wintimer.py), so 1 kHz is reachable; rt logs `sys.version` and warns below 3.11; the `beam_poll` event (every 60 s) and
+  the status page show the achieved rate and the largest gap.
+* **One break per car, in software.** A tube-frame car blocks the beam several times (nose, driver, firewall,
+  wheels). Edges less than `group_gap_s` (0.25 s) apart form one `beam_break`; its first edge is the crossing time.
+  Cars nose to tail closer than that become one break (the offline fusion flags it). No hardware hold-off.
+* **Stuck beam.** A break that lasts more than `stuck_s` (5 s: a person standing in the beam, a car stopped on the
+  line, a misaligned sensor, or the polarity set the wrong way round) gives one `beam_stuck` "stuck" event, no breaks,
+  and one "cleared" event when the beam has been quiet again.
+* **Never in the way.** The reader thread only reads and stamps; a second thread writes the events. A missing or
+  unplugged adapter is logged, shown in red on the status page, and reopened with backoff (1 s, doubling, max 30 s;
+  on Windows pyserial reads the modem lines of an unplugged adapter as "not asserted" without an error, so the
+  modem-line driver also checks the port every 100 ms and before reporting any change: `in_waiting`, which does
+  fail, plus GetCommModemStatus' own result);
+  detection never waits for the beam. A wrong `[beam]` setting is a warning at start and rt runs without the beam.
+* **Live association** (`pass_beam`, one per `pass_end`): exactly one break within `assoc_window_s` of
+  `t_cross - assoc_offset_s` -> `matched` with `t_beam`; none -> `none`; several -> `ambiguous`. The pass events
+  themselves are unchanged. The real fusion is offline (below).
+* **LED latency (optional).** If the sensor output can also light an LED in the camera's view, set `led_roi`
+  (x, y, w, h in processed-frame pixels) and `led_threshold`: every LED off -> on in a processed frame gives a
+  `camera_latency` event = frame grab time - the beam edge before it. Frames are processed at 10 fps, so a single
+  value is up to 100 ms too high: use the minimum of many `clean` ones (one beam edge in the window).
+
+**Wiring a CP2102 RS232 adapter** (DB9 male on the adapter, PC side = DTE):
+
+* Inputs (what the probe watches): **DCD pin 1, DSR pin 6, CTS pin 8, RI pin 9**; ground **pin 5**. Outputs:
+  **DTR pin 4, RTS pin 7** (rt asserts both: `set_dtr`, `set_rts`), TXD pin 3. RXD pin 2 is the byte input.
+* **RS232 levels**: an input reads "asserted" above about +3 V and "not asserted" below about -3 V; real receivers
+  (MAX3232 type) switch around +1.3 to +1.5 V and read an open input as not asserted (they have a ~5 kOhm resistor to
+  ground). A 0 / 5 V signal therefore usually works on an RS232 input even though it is out of spec; 0 / 3.3 V is
+  marginal. Up to +-25 V is allowed, so a 12 V PNP sensor output is fine on an RS232 input.
+* **3.3 V TTL adapters are different**: a bare CP2102 module with CTS / DSR / DCD / RI header pins is 3.3 V logic,
+  **active low** (0 V = asserted) and must **never** see RS232 voltages or a 12 V sensor output. Keep the signal
+  within 0-3.3 V (5 V only if the module says its inputs tolerate it). The probe and `active` handle the inverted
+  polarity.
+* **NPN open-collector sensor outputs only pull down**: with the beam in the other state the output floats, and the
+  line reads whatever it likes. It needs a **pull-up**. On RS232: a resistor from **DTR (pin 4) or RTS (pin 7)**
+  (asserted = about +5 to +10 V) to the input pin, the sensor output to the same input pin, and the sensor's 0 V to
+  pin 5. Because the receiver has its own ~5 kOhm to ground, use a small pull-up (1-2.2 kOhm) and check with a
+  multimeter that the input is above +3 V when the transistor is off. On a 3.3 V TTL module: 10 kOhm to 3.3 V
+  (unless the module already has one). PNP (sourcing) outputs need a pull-down instead (the RS232 receiver's own
+  resistor usually does it).
+* Ask the adapter's designer: which pin the input lands on (or what it sends), voltage range and polarity, whether it
+  is opto-isolated (then the sensor ground is separate), and the sensor's response time. The probe answers the first
+  two in practice.
+
+**Reading the status page (Beam section)**: driver, port and state (`open` in green; `retrying` / `lost` in red with
+the error and the next try; a **Beam setup** link next to it), the line and its **current level** (wave a hand in the beam: it must flip to ACTIVE and
+back), edges per minute, breaks, poll rate and largest gap (red below 200 Hz), stuck episodes (STUCK in red while it
+lasts), live association counts, LED numbers, and the **last 10 breaks** (time, edges, duration, matched pass and its
+number). On race day: a car crossing should add one break with 2-10 edges and, ~10 s later, the matching pass.
+
+**After the event**: `python rt/tools/fuse_beam.py out/lapline/<date>/*.jsonl [--dump <lap app dump.sql>
+--video-minus-server <s>]` matches breaks to passes one-to-one (nearest first within `--window`, after the
+camera - beam offset it estimates from clean single matches), classifies the rest (`shared_break` = two cars side by
+side on one break, `break_no_pass` = marshals / unseen cars, `pass_no_break`), and with a dump compares the crossings
+with the human laps and the vision numbers with the human car numbers. CSV + `.summary.json` + a printed summary. Set
+`assoc_offset_s` to its "camera - beam offset" for the next run.
 
 ## Tests
 
@@ -130,7 +255,8 @@ python -m pytest rt/tests -v
 No camera, GPU or footage needed: the capture runs on a fake camera and a fake clock, the launcher on a fake process.
 `rt/tests/test_e2e_clip.py` also runs the whole pipeline on a 7.5 s 26SE clip (`rt/tests/fixtures/`, car 14 at
 11:45:17) when the ONNX models are present (it must find one pass and read 14); otherwise it is skipped. Every test
-explains what it checks and why in plain words.
+explains what it checks and why in plain words. The beam tests (`test_beam_*.py`, `test_fuse_beam.py`) use a fake
+serial port (`rt/tests/beam_fakes.py`) and a fake clock: no adapter, no sensor, no waiting.
 
 ## Run
 
@@ -187,8 +313,10 @@ value shapes), so a pt-BR Windows with Portuguese labels and a cp850 console wor
 | recording | queue_frames / csv_flush_rows | 10 / 30 | frames waiting for ffmpeg (oldest dropped when full); frames.csv flush period |
 | recording | write_timeout_s / retry_wait_s / max_failures | 10 / 10 / 5 | watchdog: ffmpeg stuck or dead -> kill, new file after the wait; give up after this many failures in a row |
 | status | enabled / bind / port / passes / time_check_s / required | true / 0.0.0.0 / 8765 / 20 / 60 / false | status page; `required` (or `--require-status`, which the launcher passes): exit with code 3 if the port is busy |
+| status | setup_token | "" | Beam setup POSTs need this token in `X-Setup-Token` when set; "" = no token (LAN only) |
 | launch | event / source / out_dir / extra_args | "" / camera / out/lapline / [] | read by rt/supervise.py |
 | launch | restart_first_s / restart_max_s / healthy_reset_min / stall_s / startup_grace_s | 5 / 60 / 10 / 30 / 60 | restart rules |
+| launch | camera_recover_max_s / camera_attempt_stall_s | 600 / 60 | camera recovering this long, or rt's open-attempt counter not moving this long -> restart rt |
 | clock | mode | auto | files: overlay (OBS clock) > creation_time > mtime-duration; `pts`, `system` also accepted |
 | clock | offset_s / video_minus_server_s | 0 / 0 | correction added to frame times / this PC minus the lap server (LapAppSink) |
 | detection | conf / nms_iou | 0.15 / 0.7 | as the offline tracking stage |
@@ -202,6 +330,17 @@ value shapes), so a pt-BR Windows with Portuguese labels and a cp850 console wor
 | identity | queue_max | 64 | identity backlog; provisional jobs are skipped first |
 | output | csv / crops_dir | "" | CSV path (default `<out>.csv`); save each pass's selected crops (review / training data) |
 | lapapp | enabled, fonte_id, dispositivo_id, only_numbered, outbox | false, 5, 0, true, "" | LapAppSink stub |
+| beam | driver / port | off / COM5 | off, modem-line, byte-stream, fake (section "Beam input") |
+| beam | line / active / poll_hz / set_dtr / set_rts | cts / high / 1000 / true / true | modem-line: input line, which state = blocked, polls per second, adapter outputs |
+| beam | baud / byte_pattern / byte_release_pattern / read_timeout_s | 9600 / "" / "" / 0.002 | byte-stream: hex patterns ("" = any bytes = a pulse) |
+| beam | group_gap_s / stuck_s | 0.25 / 5 | one break per car; longer = beam_stuck |
+| beam | byte_merge_chars / advance_guard_s / queue_max | 3 / 0.02 / 10000 | byte-stream: bytes closer than this many character times = one message; breaks close this far behind now; reader -> dispatcher queue bound (oldest dropped, counted) |
+| beam | setup_idle_s | 300 | Beam setup page not refreshed this long in setup mode -> setup ends, beam restarts as saved |
+| (file) | `<config>.beam.toml` | absent | beam settings saved by the setup page; loaded after the config's [beam], before --set; broken / invalid = beam off with the error shown |
+| beam | reopen_first_s / reopen_max_s / max_edge_events_per_s / poll_report_s | 1 / 30 / 100 / 60 | port retry backoff; beam_edge lines per second; beam_poll period |
+| beam | assoc_window_s / assoc_offset_s | 1.0 / 0 | live pass_beam rule: window around t_cross - offset |
+| beam | led_roi / led_threshold / led_max_latency_s | [] / 128 / 0.5 | optional LED latency (x, y, w, h in processed-frame pixels) |
+| beam | fake_every_s / fake_pulses | 20 / 3 | fake driver: synthetic cars |
 
 Manifest format accepted (`deploy/models/manifest.json`; paths relative to the manifest):
 `{"car_detector": {"path": "cars_n640.onnx", "imgsz": [384, 640]}, "panel_detector": {"path": "num_n320.onnx",
@@ -223,6 +362,13 @@ the frame being processed). Times are epoch seconds of the video PC's clock, eac
 | `pass_provisional` | first confident read while the pass is open (same rule as auto-confirm) | `pass_id`, `number`, `confidence`, `support`, `n_read`, `top3` |
 | `pass_end` | the pass closed: all its tracks gone and 10 s without a box (the re-attach windows expired) | `pass_id`, `t_enter`, `t_cross`, `t_exit`, `dwell_s`, `n_frames`, `n_tracks`, `tracks`, `exited`, `hmax`, `n_crops` |
 | `pass_identity` | identity of the closed pass is done (async) | everything in `pass_end` plus `number` (null = no panel box in any crop), `team`, `confidence` (vote share), `auto_confirm`, `support`, `n_read`, `n_boxed`, `n_boxes`, `top3` [{number, share}], `provisional_number`, `identity_latency_s` |
+| `beam` | beam port state change (open, retrying, lost, stopped) | `state`, `detail`, `driver`, `port` |
+| `beam_edge` | every raw beam edge (at most `max_edge_events_per_s`) | `edge_no`, `line`, `level` (1 blocked, 0 clear), `raw` (line state / bytes hex), `t_edge` (wall + offset_s), `t_wall`, `t_mono`, `poll_gap_ms` |
+| `beam_break` | one car: edges grouped by `group_gap_s` | `break_id`, `t_beam` (first edge = crossing), `t_beam_mono`, `t_last`, `t_last_mono`, `n_edges`, `n_pulses`, `duration_s`, `started_blocked`, `interrupted` |
+| `beam_stuck` | beam blocked / flickering longer than `stuck_s`; again when it clears | `state` (stuck / cleared), `t_since`, `since_mono`, `n_edges`, `duration_s`, `reason` |
+| `beam_poll` | every `poll_report_s` | `rate_hz`, `polls`, `mean_gap_ms`, `max_gap_ms`, `late_polls` (gap > 5 ms), `window_s` |
+| `pass_beam` | after each `pass_end` (live association) | `pass_id`, `status` (matched / none / ambiguous), `t_cross`, `t_beam`, `beam_minus_cross_s`, `break_id`, `n_candidates`, `candidates`, `break_also_matched_to` |
+| `camera_latency` | LED ROI off -> on (only with `led_roi`) | `latency_s` (frame grab mono - edge mono), `frame_t`, `t_edge`, `residual_s` (frame t - t_edge), `clean`, `roi_mean` |
 
 * `t_enter` = the first frame of the pass's first track. This is the human-click equivalent: the counters stand at the
   entry side (LESSONS: median click -> enter +0.35 s), and it is the time the evaluation matches on.
@@ -250,6 +396,10 @@ the frame being processed). Times are epoch seconds of the video PC's clock, eac
   grab/retrieve behaviour as read in OpenCV 4.x cap_dshow.cpp) and a paced fake camera through run.py; it has not
   met a real webcam yet. **RTSP** is written but
   untested here; it was exercised with `--as-live` on a file.
+* **Beam input** (WP-L2) is tested with a fake serial port and a fake clock, and the byte-stream driver once with
+  real pyserial on a Linux pseudo-terminal. It has not met the real CP2102 adapter or the sensors: run the probe
+  first. Not done: event-driven line waits (Windows `WaitCommEvent`) instead of 1 kHz polling; the FTDI latency
+  timer setting (irrelevant for the CP2102).
 * **OpenVINO GPU (Intel iGPU)**: implemented with static shapes and a fallback to ORT CPU, but untested here
   (Ryzen, no Intel GPU). OpenVINO CPU was tested. Run `rt/bench_laptop.py` on the laptop.
 * Re-ID for mud cars (car 1), a pass minimum in seconds instead of frames, and the exposure of time sync to the lap
