@@ -1716,6 +1716,27 @@ The reviewer read OpenCV 4.x `modules/videoio/src/cap_dshow.cpp`. **Corrections 
   shapes) from bytes decoded with the console code page. No real pt-BR `w32tm /query /status /verbose` capture was
   available: paste one from the T14 into rt/tests/test_timesync.py to replace the constructed sample.
 
+### Flaky CI on PR #1 (2026-11-12): recorder tests that depended on the runner's disk, and two real recorder races
+
+* **The CI failure was not a race: the tests read the runner's real free disk.** Same commit, two ubuntu-26.04 runs:
+  one passed (Azure runner), one failed 4 tests with `rec.segments == []` (an AWS us-east-2 runner, different image
+  build). The 4 failing tests were exactly the 4 that build a `Recorder` without `disk_free_gb`, so the disk guard read
+  the real disk; under `stop_free_gb` (5 GB) it records nothing, by design and silently in the tests
+  (`log=lambda m: None`). Reproduced 100% by giving pytest a 4 GB tmpfs as `--basetemp` (600/600 + 20/20 failed, same
+  errors, same ~10 ms run time as in CI). Fix: tests inject `plenty_of_free_disk` (rt/tests/conftest.py).
+* **Real race found while stress-testing: a camera loss split the recording at the wrong frame.** `camera_lost()` set
+  a flag that the writer acted on at the next frame it wrote, so frames from before the loss still in the queue went
+  into the next file. The e2e clip test failed with 2 segments in 2 of ~160 local runs (rare: it needs the writer to be
+  behind exactly at the loss). In the field it misplaces the split whenever the writer is behind (CPU load, slow
+  encoder). Now each queued frame carries its offer number and the request remembers how many frames were offered
+  before the loss; the file closes just before the first later frame (or, when the queue is idle, once the writer has
+  taken the last frame from before the loss). Two unit tests replay both orderings by hand and fail every time on the
+  old code.
+* **Second real race: segment names in the same second.** The "name taken?" check looked only for the `.mkv`, which
+  ffmpeg creates when its process gets going, possibly after the next segment is opened; a second segment within the
+  same second could get the same name and overwrite the first (ffmpeg `-y`, sidecars). It now also checks the `.json`
+  sidecar, which is written before `open_segment()` returns.
+
 ## Session 3: beam input for rt/ (WP-L2, AUTOPTZ-23, 2026-11-12)
 
 Code: `rt/beam/` (`sources.py` drivers modem-line / byte-stream / fake, `grouping.py` edges -> breaks + stuck beam,

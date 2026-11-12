@@ -17,6 +17,8 @@ import pytest
 from rt.backoff import FakeClock
 from rt.recorder import Recorder
 
+from .conftest import plenty_of_free_disk
+
 
 class FakeFfmpeg:
     """Stands in for subprocess.Popen(ffmpeg ...): remembers the command, collects what is written to stdin, and
@@ -275,6 +277,75 @@ def test_camera_loss_closes_the_file_and_the_next_one_has_the_new_settings(cfg, 
     assert second["camera"]["settings"]["exposure"]["read_back"] == -9.0
 
 
+def test_camera_loss_splits_the_file_at_the_loss_even_when_the_writer_is_behind(cfg, tmp_path, fake_ffmpeg):
+    # Two threads are involved here. The CAPTURE thread puts frames in a queue (offer) and, when the camera
+    # disappears, says so (camera_lost). The WRITER thread (the Recorder itself, started with start()) takes frames
+    # out of the queue and writes them to ffmpeg. The writer can fall behind: ffmpeg is busy, the CPU is loaded.
+    #
+    # The bug this test guards: camera_lost() used to make the writer close the file at the NEXT frame it wrote,
+    # whatever that frame was. If frames from before the loss were still waiting in the queue, the file was cut too
+    # early and those frames went into the next file. Whether that happened depended on how far behind the writer
+    # was at that instant, so a test could pass many times and then fail once (seen: 1 run in ~20).
+    #
+    # Here we make the "writer is behind" case happen every time, with no timing involved: we put ALL the frames
+    # and the camera loss in the queue BEFORE the writer thread even starts. The writer must still split the
+    # recording exactly where the camera was lost: 5 frames in the first file, 3 in the second.
+    cfg["recording"]["queue_frames"] = 100           # room for every frame of the test (none dropped)
+    clock = FakeClock()
+    rec, _ = make_recorder(cfg, tmp_path, clock, fake_ffmpeg)
+    for frame_no in range(5):                        # 5 frames before the loss
+        rec.offer(jpeg_bytes(), clock.wall(), clock.mono(), frame_no)
+        clock.advance(0.1)
+    rec.camera_lost("camera lost")
+    for frame_no in range(3):                        # 3 frames after the camera came back. No time gap, on purpose:
+        rec.offer(jpeg_bytes(), clock.wall(), clock.mono(), frame_no)   # only camera_lost may split the file here
+        clock.advance(0.1)
+    rec.start()                                      # the writer starts only now: it is as far behind as it can be
+    rec.stop()                                       # writes everything queued, then closes the last file
+
+    assert len(rec.segments) == 2
+    # Both files started in the same second, and this fake ffmpeg never creates the .mkv (a real one may also be
+    # late to): the second file must still get its own name ("_1"), or it would overwrite the first one.
+    assert rec.segments[1].name == rec.segments[0].stem + "_1.mkv"
+    first = json.loads(rec.segments[0].with_suffix(".json").read_text())
+    second = json.loads(rec.segments[1].with_suffix(".json").read_text())
+    assert (first["frames"], first["closed_because"]) == (5, "camera lost")
+    assert (second["frames"], second["closed_because"]) == (3, "stopped")
+
+
+def test_an_empty_queue_check_does_not_close_the_file_before_the_frames_queued_just_before_a_loss(
+        cfg, tmp_path, fake_ffmpeg):
+    # The writer thread also checks for a camera loss when it finds the queue empty (so a file is closed even if
+    # the camera never comes back). But "the queue was empty" can be out of date by the time it acts: in between,
+    # the capture thread may have queued more frames and then reported the loss. Those frames still belong in
+    # the current file.
+    #
+    # This test plays the writer thread's part by hand, step by step, so the order of events is fixed:
+    #   1. three frames are offered, then the camera is lost;
+    #   2. the writer writes frame 1 (the file opens);
+    #   3. the writer does its "queue empty" check, as if it had looked just before frames 2 and 3 arrived:
+    #      the file must stay open, because frames 2 and 3 (from before the loss) are not written yet;
+    #   4. the writer writes frames 2 and 3, then does the check again: now the file closes, with 3 frames.
+    cfg["recording"]["queue_frames"] = 100
+    clock = FakeClock()
+    rec, _ = make_recorder(cfg, tmp_path, clock, fake_ffmpeg)
+    for frame_no in range(3):
+        rec.offer(jpeg_bytes(), clock.wall(), clock.mono(), frame_no)
+        clock.advance(0.1)
+    rec.camera_lost("camera lost")
+
+    rec.write_queued(rec.q.get_nowait())             # step 2: frame 1
+    rec._apply_close_request()                       # step 3: the "queue empty" check
+    assert rec.seg is not None                       # still open: frames 2 and 3 are not written yet
+
+    rec.write_queued(rec.q.get_nowait())             # step 4: frames 2 and 3, then the check again
+    rec.write_queued(rec.q.get_nowait())
+    rec._apply_close_request()
+    assert rec.seg is None                           # closed now
+    side = json.loads(rec.segments[0].with_suffix(".json").read_text())
+    assert (side["frames"], side["closed_because"]) == (3, "camera lost")
+
+
 def test_sidecar_is_written_at_open_and_finalised_at_close(cfg, tmp_path, fake_ffmpeg):
     # If the laptop dies mid-file, the sidecar must already exist (start times, camera settings), and the frames
     # CSV must be on disk up to the last flush (every 30 rows), not only in memory.
@@ -420,7 +491,8 @@ def test_real_ffmpeg_writes_a_playable_file(cfg, tmp_path, kind):
     # camera JPEG bytes, what a passthrough backend (V4L2) gives.
     cfg["recording"]["queue_frames"] = 100         # the test offers 30 frames at once, faster than real time:
                                                     # a big queue so none is dropped before ffmpeg has started
-    rec = Recorder(cfg, tmp_path, fps=10, version="test", log=lambda m: None, encoder="libx264")
+    rec = Recorder(cfg, tmp_path, fps=10, version="test", log=lambda m: None, encoder="libx264",
+                   disk_free_gb=plenty_of_free_disk)   # not the real disk: see plenty_of_free_disk in conftest.py
     rec.start()
     for frame_no in range(30):
         img = np.full((48, 64, 3), (frame_no * 8) % 255, np.uint8)
@@ -466,7 +538,8 @@ def test_replay_of_a_recording_uses_the_frames_csv_times(cfg, tmp_path):
     from rt.capture import FileCapture
 
     cfg["recording"]["queue_frames"] = 100
-    rec = Recorder(cfg, tmp_path, fps=10, version="test", log=lambda m: None, encoder="libx264")
+    rec = Recorder(cfg, tmp_path, fps=10, version="test", log=lambda m: None, encoder="libx264",
+                   disk_free_gb=plenty_of_free_disk)   # not the real disk: see plenty_of_free_disk in conftest.py
     rec.start()
     t_wall, recorded = 1_800_000_000.0, []
     for frame_no in range(20):
