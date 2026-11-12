@@ -271,9 +271,14 @@ class Characterizer:
     def go_home(self) -> tuple[float | None, Any]:
         start = self.ptz.inquire_pan_tilt()
         if self.o.home_preset is not None:
-            self.ptz.preset_recall(self.o.home_preset)
+            command = self.ptz.preset_recall(self.o.home_preset)
         else:
-            self.ptz.home()
+            command = self.ptz.home()
+        if "home_command" not in self.report:
+            self.report["home_command"] = {"preset": self.o.home_preset, "status": command.status}
+            if not command.ok:
+                self.ui.info(f"  !! the camera did not accept the home command ({command.status}); measuring from "
+                             "where it is. Consider --home-preset.")
         self.sleep(0.2)
         return self.wait_at_rest(start, expect_change=False)
 
@@ -978,6 +983,9 @@ def summarize(report: dict[str, Any]) -> str:
     lines.append(f"PTZ characterization: {cam.get('ip', '?')}:{cam.get('port', '?')}")
     if report.get("aborted"):
         lines.append(f"!! run incomplete: {report['aborted']}")
+    home = report.get("home_command", {})
+    if home and home.get("status") not in ("acked", "completed"):
+        lines.append(f"!! home command not accepted ({home.get('status')}): measured from wherever the camera was")
     for name in ("feedback", "speed_table", "latency", "absolute", "zoom", "repeatability", "units"):
         if isinstance(report.get(name), dict) and "error" in report[name]:
             lines.append(f"!! section {name} failed: {report[name]['error']}")

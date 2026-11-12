@@ -30,6 +30,7 @@ import contextlib
 import json
 import socket
 import threading
+import time
 from collections import deque
 from typing import Callable, Protocol
 
@@ -56,30 +57,39 @@ class Transport(Protocol):
 
 
 class UdpTransport:
-    """The real network: a UDP socket connected to the camera's address."""
+    """The real network: a UDP socket that sends to the camera and accepts replies from the camera's IP.
+
+    Deliberately not a "connected" UDP socket: a connected socket drops replies that come back from a different
+    source port, and some cameras reply from one. ptz_test.py used sendto/recvfrom with the SMTAV the same way.
+    """
 
     def __init__(self, host: str, port: int = packets.VISCA_PORT) -> None:
+        self._address = (socket.gethostbyname(host), port)
         self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            self._socket.connect((host, port))
-        except OSError:
-            self._socket.close()
-            raise
+        self._socket.bind(("", 0))
 
     def send(self, datagram: bytes) -> None:
         # An unreachable camera shows up as missing replies, not as an exception here.
         with contextlib.suppress(OSError):
-            self._socket.send(datagram)
+            self._socket.sendto(datagram, self._address)
 
     def receive(self, timeout: float) -> bytes | None:
-        self._socket.settimeout(max(timeout, 1e-4))
-        try:
-            return self._socket.recv(2048)
-        except (socket.timeout, BlockingIOError, InterruptedError):
-            return None
-        except OSError:
-            # Windows reports an earlier ICMP "port unreachable" on the next recv (WSAECONNRESET).
-            return None
+        deadline = time.monotonic() + max(timeout, 0.0)
+        while True:
+            remaining = deadline - time.monotonic()
+            self._socket.settimeout(max(remaining, 1e-4))
+            try:
+                datagram, sender = self._socket.recvfrom(2048)
+            except (socket.timeout, BlockingIOError, InterruptedError):
+                return None
+            except OSError:
+                # Windows reports an earlier ICMP "port unreachable" on the next recv (WSAECONNRESET):
+                # not a reply, keep waiting for the rest of the timeout.
+                datagram, sender = None, None
+            if datagram is not None and sender[0] == self._address[0]:
+                return datagram
+            if time.monotonic() >= deadline:
+                return None
 
     def close(self) -> None:
         self._socket.close()
