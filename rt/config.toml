@@ -50,8 +50,13 @@ height = 1080
 fps = 30
 fourcc = "MJPG"                 # set explicitly: without it DirectShow often falls back to YUY2 at 5 fps for 1080p
 require_fourcc = true           # fail (and retry) if the camera does not deliver this FOURCC
-raw_mjpeg = true                # ask for the compressed frames: recording without re-encoding, decode only processed frames
-lost_after_failed_grabs = 30    # failed grabs in a row (50 ms apart) before the camera counts as lost
+raw_mjpeg = false               # ask for the camera's JPEG bytes (CONVERT_RGB = 0). DirectShow ignores it for MJPG (it
+                                # always decodes); V4L2 honours it. rt checks the first frame and falls back to images.
+read_mode = "auto"              # auto: from the backend (dshow -> retrieve_every_frame, v4l2 -> grab_then_retrieve);
+                                # see rt/camsource.py. retrieve_every_frame is always correct; grab_then_retrieve
+                                # busy-loops on a backend whose grab() does not wait (DirectShow).
+lost_after_s = 3.0              # no good frame for this long (monotonic clock) = camera lost -> status "lost", reopen
+lost_after_failures = 10        # ... or this many failed reads in a row
 reopen_first_s = 1              # reopen backoff: 1 s, doubling ...
 reopen_max_s = 30               # ... up to 30 s
 clock_map_every_s = 60          # a `clock_map` event (wall vs monotonic time of a grab) this often

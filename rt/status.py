@@ -263,8 +263,8 @@ def render_html(p):
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>rt status</title><style>%s</style></head>
 <body><h1>rt lap line &middot; %s</h1><small>%s &middot; up %.0f s &middot; %s</small>%s
 <h2>Processing</h2><span class="%s">%.1f fps</span> (target %.0f) &middot; %d frames &middot; %d dropped
-<h2>Camera</h2><span class="%s">%s</span> %s<br><small>%s %sx%s @ %s fps, raw MJPEG %s, %s grabbed, %s corrupt,
-%s reopens</small><table>%s</table>
+<h2>Camera</h2><span class="%s">%s</span> %s<br><small>%s %sx%s @ %s fps, read mode %s, %s camera frames, %s failed
+reads, %s corrupt, %s reopens, last frame %s s ago</small><table>%s</table>
 <h2>Clock offset</h2>%s
 <h2>Recording</h2><span class="%s">%s</span> %s<br><small>%s GB free (warn &lt; %s, stop &lt; %s) &middot; %s frames
 &middot; %s dropped &middot; %s</small>
@@ -273,8 +273,9 @@ def render_html(p):
         CSS, _e(p["info"].get("event", "")), _e(p["now"]), p["uptime_s"], _e(p["info"].get("version", "")), warn,
         fps_cls, pr["fps"], pr["target_fps"], pr["frames"], pr["dropped"],
         cam_cls, _e(cam.get("state")), _e(cam.get("detail", "")), _e(info.get("fourcc", "")), _e(info.get("width")),
-        _e(info.get("height")), _e(info.get("fps")), _e(cam.get("raw_mjpeg")), _e(cam.get("grabbed")),
-        _e(cam.get("corrupt")), _e(cam.get("reopens")), settings,
+        _e(info.get("height")), _e(info.get("fps")), _e(cam.get("read_mode")), _e(cam.get("camera_frames")),
+        _e(cam.get("failed_reads")), _e(cam.get("corrupt")), _e(cam.get("reopens")), _e(cam.get("last_frame_age_s")),
+        settings,
         off_html,
         rec_cls, _e(rec.get("state")), _e(rec.get("file") or ""), _e(rec.get("free_gb")), _e(rec.get("warn_free_gb")),
         _e(rec.get("stop_free_gb")), _e(rec.get("frames")), _e(rec.get("dropped")), _e(rec.get("encoder") or ""),

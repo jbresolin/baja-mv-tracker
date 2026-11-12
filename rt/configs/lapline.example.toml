@@ -35,8 +35,9 @@ height = 1080
 fps = 30
 fourcc = "MJPG"                 # 1080p30 over USB 2 needs MJPG; rt fails loudly (and retries) if the camera gives another
 require_fourcc = true
-raw_mjpeg = true                # record the camera's JPEGs as they are, decode only the processed frames
-lost_after_failed_grabs = 30    # ~1.5 s without frames = camera lost -> reopen with backoff (1 s ... 30 s)
+read_mode = "auto"              # DirectShow: every frame is retrieved (decoded) and 2 of 3 are dropped; see rt/README.md
+lost_after_s = 3.0              # no frame for 3 s = camera lost: status page "lost", recording file closed,
+lost_after_failures = 10        # reopen with backoff (1 s ... 30 s) until the camera is back
 reopen_first_s = 1
 reopen_max_s = 30
 clock_map_every_s = 60          # JSONL `clock_map` event: wall clock vs monotonic clock of one grab

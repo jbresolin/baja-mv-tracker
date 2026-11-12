@@ -5,8 +5,9 @@ clock (epoch seconds). Sources:
   WP9: never `select`, it duplicates frames), frame time = file start + pts. File start from the OBS clock overlay
   when present (26SE), else the container creation_time, else mtime - duration. `realtime=True` paces frames at real
   speed and drops frames when detection falls behind (as a live source would); otherwise every frame is processed.
-* USB camera (`camera`, an index, or the [camera] config; rt/livecam.py): grab() every frame, retrieve() only the
-  processed ones; frame time = system clock at grab minus a configured latency; recorded by rt/recorder.py.
+* USB camera (`camera`, an index, or the [camera] config; rt/livecam.py): every camera frame is read, ~10 fps are
+  kept; frame time = system clock when the frame is received minus a configured latency; recorded by
+  rt/recorder.py.
 * rtsp/http/udp URL (ffmpeg pipe, `fps` filter): frame time = system clock at arrival minus a configured latency.
 Live sources never block: a full queue drops the frame.
 """
@@ -33,7 +34,7 @@ class Frame:
     t: float           # wall clock of the video PC (epoch s), incl. clock.offset_s
     pts: float         # seconds into the source (files) or since start (live)
     idx: int           # sampled frame number
-    t_cap: float       # time.monotonic() when captured (live camera: at grab(), the same instant as t)
+    t_cap: float       # time.monotonic() when captured (live camera: the same instant as t; see rt/livecam.py)
 
 
 def probe(ffprobe, src):

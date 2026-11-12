@@ -62,14 +62,32 @@ private networks when Windows asks).
 
 * **Camera** (`rt/livecam.py`, `rt/camsource.py`, `[camera]`): DirectShow on Windows, MJPG FOURCC set explicitly,
   1920x1080 @ 30 fps; what the driver gives is read back and logged, and a camera that will not do MJPG fails loudly
-  (and is retried). `grab()` takes every frame, `retrieve()` only the ~10 fps that are processed: the other 2/3 are
-  never decoded. With `raw_mjpeg` the camera's JPEG bytes are retrieved and only processed frames are decoded.
-  Select the camera by device path (`camera.device`), never by name: identical webcams share a name. Image settings
-  (`[camera.settings]`: manual exposure, gain, white balance, focus) are applied at every open and read back; a
-  setting the camera does not support is a warning. If the camera disappears, rt keeps running and reopens it
-  (1 s, doubling, max 30 s).
-* **Timestamps**: each frame is stamped at `grab()` with the wall clock (`t`, what every event uses) and the monotonic
-  clock (`t_cap`). A `clock_map` event once a minute relates the two (for the beam input, WP-L2).
+  (and is retried). Select the camera by device path (`camera.device`), never by name: identical webcams share a
+  name. Image settings (`[camera.settings]`: manual exposure, gain, white balance, focus) are applied at every open
+  and read back; a setting the camera does not support is a warning.
+* **Read loop per backend** (`camera.read_mode = "auto"`). OpenCV's DirectShow backend (cap_dshow.cpp) does not do
+  what its API suggests: `grab()` returns True at once, and `retrieve()` is what waits (up to ~1 s) for the next
+  frame and decodes it; it also ignores `CONVERT_RGB = 0` for MJPG, so every frame is decoded anyway. A "grab every
+  frame, retrieve only 1 in 3" loop therefore spins grab() at full speed on DirectShow (a whole core and the GIL)
+  and saves nothing. So:
+  * `retrieve_every_frame` (DirectShow, and every backend not verified otherwise): one grab() + one (waiting)
+    retrieve() per camera frame, stamped as soon as retrieve() returns, then 2 of 3 frames are dropped in
+    software. The decode of all 30 fps is paid (~0.6 core on the 3900X, ~1.2 on a U-series laptop: LESSONS WP11);
+    measure it on the T14.
+  * `grab_then_retrieve` (V4L2 on Linux, where grab() really waits for the next buffer): every frame is grabbed and
+    stamped at grab(), only the processed ones are retrieved (decoded).
+  * Future options to avoid decoding 20 of 30 fps on Windows (not implemented): the MSMF backend, if its grab()
+    is confirmed to block per frame; or an ffmpeg `-f dshow -vcodec mjpeg` source that copies the camera's JPEGs
+    through a pipe (decode only the processed ones, and record without re-encoding).
+* **Camera lost**: DirectShow reports an unplug once (one grab() returns False) and then retrieve() just times out,
+  so loss is detected by time: no good frame for `camera.lost_after_s` (3 s, monotonic clock) or
+  `camera.lost_after_failures` (10) failed reads in a row. The status page then shows "camera lost", the recording
+  file is closed, and the camera is reopened with backoff (1 s, doubling, max 30 s) until it is back, in the same
+  process (the launcher is only the last resort).
+* **Timestamps**: each frame is stamped with the wall clock (`t`, what every event uses) and the monotonic clock
+  (`t_cap`) as soon as it is in hand: after retrieve() on DirectShow (this includes the MJPEG decode, ~10-20 ms;
+  fold it into `capture.live_latency_s` once measured), at grab() on V4L2. A `clock_map` event once a minute
+  relates the two clocks (for the beam input, WP-L2).
 * **Recording** (`rt/recorder.py`, `[recording]`): the processed frames (exactly what rt saw) go to
   `<folder of --out>/rec/rec_<date>_<time>.mkv`, one file per 30 min, with a `.json` sidecar (start time on both
   clocks, camera settings read back, software version, encoder) and a `.frames.csv` (true time of every frame).
@@ -146,8 +164,9 @@ so the program makes no network calls unless you set it.
 | capture | hwaccel | none | ffmpeg `-hwaccel` (`d3d11va` / `qsv` on an Intel laptop): software decode of a 1080p30 camera costs ~0.6 core here, ~1 core on the laptop |
 | capture | live_latency_s | 0 | known capture latency subtracted from live frame times |
 | camera | backend / device / width / height / fps / fourcc | auto / 0 / 1920 / 1080 / 30 / MJPG | USB camera (rt/livecam.py); `device` = index or device path (`--list-cameras`) |
-| camera | require_fourcc / raw_mjpeg | true / true | fail if not MJPG; retrieve JPEG bytes, decode only processed frames |
-| camera | lost_after_failed_grabs / reopen_first_s / reopen_max_s / clock_map_every_s | 30 / 1 / 30 / 60 | camera lost after ~1.5 s without frames; reopen backoff; clock_map event period |
+| camera | require_fourcc / raw_mjpeg | true / false | fail if not MJPG; ask for JPEG bytes (V4L2 only; DirectShow always decodes) |
+| camera | read_mode | auto | `retrieve_every_frame` (DirectShow) or `grab_then_retrieve` (V4L2); see "Read loop per backend" |
+| camera | lost_after_s / lost_after_failures / reopen_first_s / reopen_max_s / clock_map_every_s | 3 / 10 / 1 / 30 / 60 | camera lost after 3 s without a good frame or 10 failed reads; reopen backoff; clock_map event period |
 | camera.settings | exposure, gain, auto_exposure, auto_wb, wb_temperature, autofocus, focus, ... | (none) | OpenCV CAP_PROP_* names, backend units; applied at each open and read back |
 | recording | mode / all_frames / segment_min | h264 / false / 30 | h264, mjpeg (copy) or off; record every camera frame (mjpeg only); file length |
 | recording | warn_free_gb / stop_free_gb / h264_encoders | 20 / 5 / qsv, amf, x264 | disk guard; H.264 encoders tried in order |
@@ -183,7 +202,7 @@ the frame being processed). Times are epoch seconds of the video PC's clock, eac
 |---|---|---|
 | `info`, `warning` | start / end / clock problems | `msg` |
 | `camera` | live camera state change (opening, streaming, lost, retrying, stopped) | `state`, `detail` |
-| `clock_map` | live camera, once a minute | `grab_wall` (epoch), `grab_mono` (time.monotonic), `wall_minus_mono`, `grab_no` |
+| `clock_map` | live camera, once a minute | `frame_wall` (epoch), `frame_mono` (time.monotonic) of one frame, `wall_minus_mono`, `camera_frame_no` (frames received from the camera since start), `stamped_at` (`after retrieve` or `grab`) |
 | `pass_start` | a track becomes foreground (box > 0.2 H, bottom > 0.4 H, 6 frames: ~0.6 s after the car appears) and joins no open pass | `pass_id`, `t_enter`, `box` (first box, normalised x1 y1 x2 y2), `hmax` |
 | `pass_provisional` | first confident read while the pass is open (same rule as auto-confirm) | `pass_id`, `number`, `confidence`, `support`, `n_read`, `top3` |
 | `pass_end` | the pass closed: all its tracks gone and 10 s without a box (the re-attach windows expired) | `pass_id`, `t_enter`, `t_cross`, `t_exit`, `dwell_s`, `n_frames`, `n_tracks`, `tracks`, `exited`, `hmax`, `n_crops` |
@@ -211,9 +230,9 @@ the frame being processed). Times are epoch seconds of the video PC's clock, eac
   the reviewer flow (`contagem_decisao`); and server-clock anchoring (`ancora_*` columns).
 * **PTZ interface**: only the events above (`pass_start` with the entry box, `pass_provisional` with the number).
   The transport (UDP / websocket / HTTP) is still to be decided. Add a `Sink` subclass for it.
-* **USB camera capture** (WP-L1) is tested with a fake camera (rt/tests) and a paced fake camera through run.py; it
-  has not met a real webcam yet. DirectShow raw MJPEG passthrough (`raw_mjpeg`) depends on the OpenCV build: if it
-  does not work, rt notices on the first frame, decodes in OpenCV and says so in the log. **RTSP** is written but
+* **USB camera capture** (WP-L1) is tested with fake cameras (rt/tests; `FakeDshowCamera` copies DirectShow's
+  grab/retrieve behaviour as read in OpenCV 4.x cap_dshow.cpp) and a paced fake camera through run.py; it has not
+  met a real webcam yet. **RTSP** is written but
   untested here; it was exercised with `--as-live` on a file.
 * **OpenVINO GPU (Intel iGPU)**: implemented with static shapes and a fallback to ORT CPU, but untested here
   (Ryzen, no Intel GPU). OpenVINO CPU was tested. Run `rt/bench_laptop.py` on the laptop.

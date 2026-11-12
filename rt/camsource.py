@@ -1,20 +1,32 @@
 """Camera devices behind a small interface, so the capture loop (rt/livecam.py) can run on a real webcam or on a fake.
 
-A camera source has four methods:
+A camera source has these methods and one attribute:
 
     info = cam.open()      # open the device and apply the settings; returns what the driver actually gave (dict).
                            # Raises CameraError if the camera is missing or unusable.
-    ok = cam.grab()        # take the next frame from the driver, WITHOUT decoding it (cheap). False = no frame.
-    data = cam.retrieve()  # the last grabbed frame: a BGR image (H, W, 3), or the raw JPEG bytes (1-D uint8) when
-                           # the camera sends MJPEG and raw passthrough works. None = no usable frame.
+    ok = cam.grab()        # ask the driver for the next frame. False = no frame (or, on DirectShow, "the device
+                           # was just disconnected").
+    data = cam.retrieve()  # the frame: a BGR image (H, W, 3), or the raw JPEG bytes (1-D uint8) when the camera
+                           # sends MJPEG and raw passthrough works. None = no usable frame.
     cam.release()
+    cam.grab_blocks        # True if grab() really waits for the next camera frame (see below).
 
-`OpenCvCamera` is the real one (OpenCV, DirectShow on Windows). `FakeCamera` yields frames from a list, a function or
-a video file and is what the tests use; no hardware is ever needed for tests.
+`OpenCvCamera` is the real one (OpenCV, DirectShow on Windows). `FakeCamera` and `FakeDshowCamera` are what the
+tests use; no hardware is ever needed for tests.
 
-Why grab()/retrieve(): a USB webcam sends 30 fps, rt processes 10. read() = grab() + retrieve() decodes every frame;
-grab() alone only takes the compressed frame from the driver. Decoding 1080p MJPEG is the biggest CPU cost of the
-capture, so only the frames that are processed are retrieved (and decoded).
+Why `grab_blocks` matters (found by reading OpenCV 4.x modules/videoio/src/cap_dshow.cpp):
+  * DirectShow: grab() returns True AT ONCE (it only checks that the device is not disconnected). The wait for a
+    new frame (up to ~1 s) happens inside retrieve(), and retrieve() always decodes the MJPEG frame (DirectShow
+    ignores CONVERT_RGB = 0 for MJPG). So "grab every frame, retrieve only some" does not save the decode there; it
+    only spins grab() in a busy loop. On DirectShow rt therefore retrieves every frame (livecam.py,
+    "retrieve_every_frame") and drops the unneeded ones after the decode.
+  * V4L2 (Linux): grab() waits for the driver's next buffer (select + dequeue) and retrieve() decodes it, so
+    "grab every frame, retrieve only the processed ones" really saves the decode of the others.
+  * Media Foundation (msmf) and anything else: not verified, so treated like DirectShow (always correct, maybe
+    slower).
+Possible future sources that would avoid decoding unprocessed frames on Windows (not implemented): the MSMF
+backend if its grab() is confirmed to block, or an ffmpeg `-f dshow -vcodec mjpeg` process that copies the
+camera's JPEGs (decode only the processed ones, record without re-encoding).
 
 Camera identity: identical webcams have the same name, so a camera is selected by index or by device path, never by
 name. On Windows the device path is DirectShow's "alternative name" (`python rt/run.py --list-cameras` prints it).
@@ -33,6 +45,11 @@ class CameraError(Exception):
     """The camera could not be opened or is unusable (missing, wrong format, ...). The capture loop retries."""
 
 
+# Does grab() wait for the next frame on this OpenCV backend? Only backends verified to block are True; the others
+# get the always-correct "retrieve every frame" loop. See the module docstring.
+GRAB_BLOCKS = {"dshow": False, "v4l2": True, "msmf": False, "any": False}
+
+
 def default_backend():
     return "dshow" if sys.platform == "win32" else ("v4l2" if sys.platform.startswith("linux") else "any")
 
@@ -40,12 +57,12 @@ def default_backend():
 def fourcc_str(v):
     """OpenCV's FOURCC property is a float holding 4 characters packed in an int: 1196444237.0 -> 'MJPG'."""
     try:
-        n = int(v)
+        packed = int(v)
     except (TypeError, ValueError):
         return ""
-    if n <= 0:
+    if packed <= 0:
         return ""
-    return "".join(chr((n >> (8 * i)) & 0xFF) for i in range(4)).strip("\x00")
+    return "".join(chr((packed >> (8 * i)) & 0xFF) for i in range(4)).strip("\x00")
 
 
 def is_jpeg(data):
@@ -64,11 +81,11 @@ def list_dshow_video_devices(ffmpeg="ffmpeg", runner=subprocess.run):
     ffmpeg >= 5 prints `"Name" (video)` then `  Alternative name "@device_pnp_\\\\?\\usb#vid_...` per device; older
     versions print a "DirectShow video devices" header and the names under it. Both are handled."""
     try:
-        r = runner([ffmpeg, "-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
-                   capture_output=True, text=True, timeout=20)
+        result = runner([ffmpeg, "-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
+                        capture_output=True, text=True, timeout=20)
     except Exception as e:  # noqa: BLE001
         raise CameraError("cannot list DirectShow devices with %s: %s" % (ffmpeg, e)) from e
-    return parse_dshow_list((r.stderr or "") + (r.stdout or ""))
+    return parse_dshow_list((result.stderr or "") + (result.stdout or ""))
 
 
 def parse_dshow_list(text):
@@ -150,15 +167,15 @@ def apply_settings(cap, cv2, settings, log=print):
         if prop is None:
             continue
         try:
-            got = float(cap.get(prop))
+            read_back = float(cap.get(prop))
         except Exception:  # noqa: BLE001
-            got = None
-        out[name]["read_back"] = got
+            read_back = None
+        out[name]["read_back"] = read_back
         want = out[name]["requested"]
         if not out[name]["accepted"]:
-            log("WARNING camera does not accept %s=%s (reads back %s)" % (name, want, got))
-        elif got is None or abs(got - float(want)) > 1e-3 * max(1.0, abs(float(want))):
-            log("WARNING camera setting %s: asked %s, reads back %s" % (name, want, got))
+            log("WARNING camera does not accept %s=%s (reads back %s)" % (name, want, read_back))
+        elif read_back is None or abs(read_back - float(want)) > 1e-3 * max(1.0, abs(float(want))):
+            log("WARNING camera setting %s: asked %s, reads back %s" % (name, want, read_back))
     return out
 
 
@@ -177,6 +194,7 @@ class OpenCvCamera:
             import cv2 as cv2_module
         self.cv2 = cv2_module
         self.cap = None
+        self.grab_blocks = GRAB_BLOCKS.get(self.backend, False)
 
     def open(self):
         cv2 = self.cv2
@@ -206,20 +224,22 @@ class OpenCvCamera:
             except Exception:  # noqa: BLE001
                 raw = False
         settings = apply_settings(cap, cv2, dict(self.c.get("settings", {}) or {}), self.log)
-        got = dict(backend=self.backend, device=str(self.device), target=str(target),
-                   fourcc=fourcc_str(cap.get(cv2.CAP_PROP_FOURCC)), width=int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
-                   height=int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)), fps=round(float(cap.get(cv2.CAP_PROP_FPS)), 3),
-                   raw_requested=raw_requested, raw_accepted=raw, settings=settings)
-        if bool(self.c.get("require_fourcc", True)) and got["fourcc"] != want_fourcc:
+        actual = dict(backend=self.backend, device=str(self.device), target=str(target),
+                      fourcc=fourcc_str(cap.get(cv2.CAP_PROP_FOURCC)), width=int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                      height=int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)), fps=round(float(cap.get(cv2.CAP_PROP_FPS)), 3),
+                      raw_requested=raw_requested, raw_accepted=raw, grab_blocks=self.grab_blocks,
+                      settings=settings)
+        if bool(self.c.get("require_fourcc", True)) and actual["fourcc"] != want_fourcc:
             cap.release()
             raise CameraError("camera %r gives %r, not %s (at %dx%d %s fps). MJPG is needed for 1080p30 over USB 2; "
                               "check the camera supports it, or set camera.require_fourcc = false" % (
-                                  self.device, got["fourcc"], want_fourcc, got["width"], got["height"], got["fps"]))
-        if (got["width"], got["height"]) != (int(self.c["width"]), int(self.c["height"])):
-            self.log("WARNING camera gives %dx%d, asked %dx%d" % (got["width"], got["height"], int(self.c["width"]),
-                                                                  int(self.c["height"])))
+                                  self.device, actual["fourcc"], want_fourcc, actual["width"], actual["height"],
+                                  actual["fps"]))
+        if (actual["width"], actual["height"]) != (int(self.c["width"]), int(self.c["height"])):
+            self.log("WARNING camera gives %dx%d, asked %dx%d" % (actual["width"], actual["height"],
+                                                                  int(self.c["width"]), int(self.c["height"])))
         self.cap = cap
-        return got
+        return actual
 
     def grab(self):
         return self.cap is not None and bool(self.cap.grab())
@@ -243,9 +263,9 @@ class OpenCvCamera:
 
 # ------------------------------------------------------------------------------------------------ fake camera
 class FakeCamera:
-    """A camera for tests. `frames` is a list of images (BGR arrays), or a function frame_number -> image, or None
-    for small synthetic grey frames. Each grab() advances `clock` (a backoff.FakeClock) by 1/fps, like a real camera
-    delivering frames in real time.
+    """A camera for tests whose grab() blocks for the next frame (like V4L2). `frames` is a list of images (BGR
+    arrays), or a function frame_number -> image, or None for small synthetic grey frames. Each grab() advances
+    `clock` (a backoff.FakeClock) by 1/fps, like a real camera delivering frames in real time.
 
     jpeg=True makes retrieve() return JPEG bytes (a camera with working raw MJPEG passthrough). `fail_opens` = how
     many open() calls fail before one works (a missing camera). `lose_after` = after this many grabs the camera
@@ -263,6 +283,7 @@ class FakeCamera:
         self.is_open = False
         self._since_open = 0
         self._current = None
+        self.grab_blocks = True     # this fake's grab() waits for the frame (it advances the clock)
 
     def open(self):
         self.opens += 1
@@ -274,14 +295,8 @@ class FakeCamera:
         return dict(dict(backend="fake", device="fake", fourcc="MJPG", width=w, height=h, fps=self.fps,
                          raw_requested=self.jpeg, raw_accepted=self.jpeg, settings={}), **self.extra_info)
 
-    def _image(self, n):
-        if callable(self.frames):
-            return self.frames(n)
-        if self.frames is not None:
-            return self.frames[n % len(self.frames)]
-        w, h = self.size
-        img = np.full((h, w, 3), n % 256, np.uint8)
-        return img
+    def _image(self, frame_no):
+        return synthetic_image(self.frames, frame_no, self.size)
 
     def grab(self):
         if not self.is_open:
@@ -330,3 +345,118 @@ class FakeCamera:
         h, w = frames[0].shape[:2]
         kw.setdefault("n_frames", len(frames))
         return cls(frames=frames, size=(w, h), **kw)
+
+
+def synthetic_image(frames, frame_no, size):
+    """Image number `frame_no` for the fakes: from a list (cycled), a function, or a flat grey image whose
+    brightness is the frame number (so a test can tell frames apart)."""
+    if callable(frames):
+        return frames(frame_no)
+    if frames is not None:
+        return frames[frame_no % len(frames)]
+    width, height = size
+    return np.full((height, width, 3), frame_no % 256, np.uint8)
+
+
+class FakeDshowCamera:
+    """A fake camera that behaves exactly like OpenCV's DirectShow backend (cap_dshow.cpp), for tests:
+
+      * grab() never waits and returns True. The only time it returns False is ONCE, right after the device was
+        unplugged (DirectShow reports the disconnect as a one-time event); after that it says True again.
+      * retrieve() is where the waiting happens: it waits (advances the fake clock) until the camera's next frame,
+        and returns it decoded (BGR image; DirectShow decodes MJPEG even when raw frames were asked for).
+        If no frame comes (unplugged, or the stream ended), it gives up after `retrieve_timeout_s` (1 s, as in
+        cap_dshow.cpp) and returns None.
+      * once unplugged, the open handle is dead for good, even after the camera is plugged back: only a new open()
+        works again. open() fails (CameraError) while the camera is unplugged.
+
+    Frames arrive every 1/fps seconds of the fake clock from open(). `unplug_after` = unplug the camera right after
+    this many frames have been delivered in total; `unplugged_for_s` = it comes back that many seconds later (None =
+    never). `n_frames` = the stream simply stops after that many frames (no disconnect event).
+
+    Counters for the tests: grab_calls, retrieve_calls, delivered (frames returned), opens."""
+
+    grab_blocks = False      # what OpenCvCamera says for DirectShow
+
+    def __init__(self, fps=30.0, clock=None, frames=None, size=(64, 48), retrieve_timeout_s=1.0, n_frames=None,
+                 unplug_after=None, unplugged_for_s=None, info=None):
+        if clock is None:
+            raise ValueError("FakeDshowCamera needs a FakeClock: its retrieve() 'waits' by advancing it")
+        self.fps, self.clock, self.frames, self.size = float(fps), clock, frames, size
+        self.retrieve_timeout_s = float(retrieve_timeout_s)
+        self.n_frames, self.unplug_after, self.unplugged_for_s = n_frames, unplug_after, unplugged_for_s
+        self.extra_info = dict(info or {})
+        self.grab_calls = 0
+        self.retrieve_calls = 0
+        self.delivered = 0
+        self.opens = 0
+        self.is_open = False
+        self.plugged = True
+        self.replug_at_mono = None          # when an unplugged camera comes back (fake monotonic time)
+        self.handle_dead = False            # the open handle saw the unplug: it never delivers again
+        self.disconnect_event_pending = False
+        self.next_frame_mono = None         # when the camera's next frame is ready
+        self._auto_unplug_done = False
+
+    # ---- plugging, for the tests
+    def unplug(self, for_s=None):
+        """Pull the USB cable. for_s = plug it back in after that many seconds (None = stays out)."""
+        self.plugged = False
+        self.replug_at_mono = None if for_s is None else self.clock.mono() + float(for_s)
+        if self.is_open:
+            self.handle_dead = True
+            self.disconnect_event_pending = True
+
+    def _maybe_replugged(self):
+        if not self.plugged and self.replug_at_mono is not None and self.clock.mono() >= self.replug_at_mono:
+            self.plugged = True
+
+    # ---- the camera interface
+    def open(self):
+        self.opens += 1
+        self._maybe_replugged()
+        if not self.plugged:
+            raise CameraError("fake DirectShow camera is unplugged")
+        self.is_open = True
+        self.handle_dead = False
+        self.disconnect_event_pending = False
+        self.next_frame_mono = self.clock.mono() + 1.0 / self.fps
+        width, height = self.size
+        return dict(dict(backend="dshow (fake)", device="fake", fourcc="MJPG", width=width, height=height,
+                         fps=self.fps, raw_requested=False, raw_accepted=False, grab_blocks=False, settings={}),
+                    **self.extra_info)
+
+    def grab(self):
+        self.grab_calls += 1                # never advances the clock: DirectShow's grab() does not wait
+        if not self.is_open:
+            return False
+        if self.disconnect_event_pending:   # the one-time disconnect event
+            self.disconnect_event_pending = False
+            return False
+        return True
+
+    def retrieve(self):
+        self.retrieve_calls += 1
+        stream_ended = self.n_frames is not None and self.delivered >= self.n_frames
+        if not self.is_open or self.handle_dead or stream_ended:
+            self.clock.advance(self.retrieve_timeout_s)    # waits for a frame that never comes, then gives up
+            return None
+        period = 1.0 / self.fps
+        now = self.clock.mono()
+        while self.next_frame_mono + period <= now:          # the caller was late: those frames are gone
+            self.next_frame_mono += period
+        if self.next_frame_mono > now:
+            self.clock.advance(self.next_frame_mono - now)   # wait for the next frame
+        self.next_frame_mono += period
+        image = synthetic_image(self.frames, self.delivered, self.size)
+        self.delivered += 1
+        if self.unplug_after is not None and self.delivered >= self.unplug_after and not self._auto_unplug_done:
+            self._auto_unplug_done = True
+            self.unplug(self.unplugged_for_s)
+        return image
+
+    def disable_raw(self):
+        pass
+
+    def release(self):
+        self.is_open = False
