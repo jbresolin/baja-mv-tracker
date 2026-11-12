@@ -62,15 +62,14 @@ autofocus = 0
 focus = 0
 
 [recording]
-mode = "h264"                   # "h264": ~4 GB per hour at 10 fps (measured on 26SE footage), hardware encoder if any
-                                # "mjpeg": the camera's JPEGs copied as they are (no re-encode, no CPU), but ~20-30 GB
-                                #          per hour at 10 fps: only with a big disk; "off": no recording
-all_frames = false              # false = the 10 processed fps (what rt saw); true = all 30 camera fps (mjpeg mode,
-                                # ~66-89 GB per hour: not for a whole race day)
+mode = "h264"                   # "h264": ~4 GB per hour at 10 fps (x264 CRF 23 on 26SE footage; check the real size on
+                                # the T14), hardware encoder (QuickSync / AMF) if one works, else x264 veryfast.
+                                # "off": no recording. ("mjpeg" copy is not possible: DirectShow decodes the frames.)
 segment_min = 30                # one file per 30 minutes: rec_<date>_<time>.mkv + .json sidecar + .frames.csv
+                                # (+ .ffmpeg.log); also a new file after a camera loss or a gap in the frames
 warn_free_gb = 20               # status page warns under 20 GB free
 stop_free_gb = 5                # recording stops under 5 GB (detection never stops); resumes above warn_free_gb
-h264_encoders = ["h264_qsv", "h264_amf", "libx264"]   # only for decoded frames or mode = "h264"
+h264_encoders = ["h264_qsv", "h264_amf", "libx264"]   # probed in this order at start; rt logs the one it uses
 
 [status]
 enabled = true                  # the launcher needs it to detect stalls

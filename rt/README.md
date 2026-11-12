@@ -88,14 +88,22 @@ private networks when Windows asks).
   (`t_cap`) as soon as it is in hand: after retrieve() on DirectShow (this includes the MJPEG decode, ~10-20 ms;
   fold it into `capture.live_latency_s` once measured), at grab() on V4L2. A `clock_map` event once a minute
   relates the two clocks (for the beam input, WP-L2).
-* **Recording** (`rt/recorder.py`, `[recording]`): the processed frames (exactly what rt saw) go to
-  `<folder of --out>/rec/rec_<date>_<time>.mkv`, one file per 30 min, with a `.json` sidecar (start time on both
-  clocks, camera settings read back, software version, encoder) and a `.frames.csv` (true time of every frame).
-  Default H.264 (QuickSync, AMF, else x264 veryfast): ~4 GB/h at 10 fps. `mode = "mjpeg"` copies the camera JPEGs
-  without re-encoding but needs ~20-30 GB/h at 10 fps (66-89 GB/h at 30 fps), measured on 26SE frames. It never
-  slows detection (a full queue drops frames from the recording, counted). Under 20 GB free the status page warns;
-  under 5 GB recording stops (detection goes on) until space is back above 20 GB. The ffmpeg process is the only
-  extra consumer; it reads frames from rt through a pipe, so the webcam has one handle.
+* **Recording** (`rt/recorder.py`, `[recording]`): the processed frames (exactly what rt saw, 10 fps) go to
+  `<folder of --out>/rec/rec_<date>_<time>.mkv` as H.264. The encoder is probed once at start and logged: QuickSync
+  (`h264_qsv`), AMF (`h264_amf`), else x264 `veryfast`. ~4 GB/h at 10 fps (x264 CRF 23 on 26SE frames; QSV / AMF
+  sizes differ: check the real files on the T14). DirectShow hands rt decoded images, so there are no camera JPEGs
+  to copy: `mode = "mjpeg"` and `all_frames` are refused at start with an explanation (`h264` or `off`).
+  * **Files**: a new file every 30 min, and also after a camera loss or a gap of more than 2 frame periods: the
+    file's frame rate is nominal, so a file never spans a gap. Next to each file: a `.json` sidecar (start time on
+    both clocks, camera settings read back at the last open, software version, encoder; written provisionally at
+    open, finalised at close), a `.frames.csv` (the authoritative time of every frame; flushed every 30 rows) and a
+    `.ffmpeg.log` (ffmpeg's messages: a file, because an unread pipe fills up and freezes ffmpeg).
+  * **Never slows detection**: offer() never blocks; the queue holds ~1 s (10 frames, ~60 MB at 1080p) and drops
+    the oldest frame when full (counted). A watchdog kills ffmpeg if it does not accept a frame for 10 s or exits,
+    marks recording failed on the status page and starts a new file 10 s later; after 5 failures in a row
+    recording is off for the run (detection goes on).
+  * **Disk guard**: under 20 GB free the status page warns; under 5 GB recording stops (detection goes on) until
+    space is back above 20 GB. ffmpeg reads frames from rt through a pipe, so the webcam has one handle.
 * **Status page** (`rt/status.py`, `[status]`): processing fps and dropped frames, camera state and settings read
   back, clock offset (red above 0.5 s; `clock.ntp_server` = the event router for a measured SNTP offset, else the
   Windows time service's phase offset), recording state and free disk, last 20 passes with thumbnail, number,
@@ -105,8 +113,9 @@ private networks when Windows asks).
   (after a 60 s start-up grace). It kills the whole process tree. Each run writes
   `out/lapline/<date>/lapline_<time>.jsonl` (+ csv, stats, rec/); restarts are logged in `out/lapline/launcher.log`.
 
-Replay a recording through rt like any file (`--source out/lapline/<date>/rec/rec_....mkv`): its `creation_time` tag
-is the segment's wall-clock start.
+Replay a recording through rt like any file (`--source out/lapline/<date>/rec/rec_....mkv`): when the file's
+`.frames.csv` is next to it, each frame gets its recorded time from it (the authoritative clock); otherwise the
+file's `creation_time` tag (the segment's start) + the nominal frame rate.
 
 ## Tests
 
@@ -168,8 +177,10 @@ so the program makes no network calls unless you set it.
 | camera | read_mode | auto | `retrieve_every_frame` (DirectShow) or `grab_then_retrieve` (V4L2); see "Read loop per backend" |
 | camera | lost_after_s / lost_after_failures / reopen_first_s / reopen_max_s / clock_map_every_s | 3 / 10 / 1 / 30 / 60 | camera lost after 3 s without a good frame or 10 failed reads; reopen backoff; clock_map event period |
 | camera.settings | exposure, gain, auto_exposure, auto_wb, wb_temperature, autofocus, focus, ... | (none) | OpenCV CAP_PROP_* names, backend units; applied at each open and read back |
-| recording | mode / all_frames / segment_min | h264 / false / 30 | h264, mjpeg (copy) or off; record every camera frame (mjpeg only); file length |
-| recording | warn_free_gb / stop_free_gb / h264_encoders | 20 / 5 / qsv, amf, x264 | disk guard; H.264 encoders tried in order |
+| recording | mode / segment_min / split_gap_periods | h264 / 30 / 2 | h264 or off (mjpeg copy is refused); file length; a gap of more than this many frame periods starts a new file |
+| recording | warn_free_gb / stop_free_gb / h264_encoders | 20 / 5 / qsv, amf, x264 | disk guard; H.264 encoders probed in order at start |
+| recording | queue_frames / csv_flush_rows | 10 / 30 | frames waiting for ffmpeg (oldest dropped when full); frames.csv flush period |
+| recording | write_timeout_s / retry_wait_s / max_failures | 10 / 10 / 5 | watchdog: ffmpeg stuck or dead -> kill, new file after the wait; give up after this many failures in a row |
 | status | enabled / bind / port / passes / time_check_s | true / 0.0.0.0 / 8765 / 20 / 60 | status page |
 | launch | event / source / out_dir / extra_args | "" / camera / out/lapline / [] | read by rt/supervise.py |
 | launch | restart_first_s / restart_max_s / healthy_reset_min / stall_s / startup_grace_s | 5 / 60 / 10 / 30 / 60 | restart rules |

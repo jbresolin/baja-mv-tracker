@@ -166,6 +166,8 @@ class StatusBoard:
             warnings.append("disk low: %.1f GB free" % rec["free_gb"])
         if rec.get("disk_state") == "stopped":
             warnings.append("recording STOPPED: %.1f GB free" % rec["free_gb"])
+        if str(rec.get("state", "")).startswith(("error", "failed")):
+            warnings.append("recording " + rec["state"])
         with self.lock:
             passes = [dict(p, t_enter_iso=iso(p["t_enter"]), t_cross_iso=iso(p["t_cross"]), thumb_iso=iso(p["thumb_t"]),
                            thumb_url=("/thumb/%d.jpg?v=%.3f" % (p["pass_id"], p["thumb_t"])) if p["thumb_t"] else None)
@@ -249,6 +251,8 @@ def render_html(p):
         _e(k), _e(v.get("requested")), _e(v.get("read_back")) + ("" if v.get("accepted") else " (not accepted)"))
         for k, v in (info.get("settings") or {}).items())
     rec_cls = {"ok": "ok", "low": "warn", "stopped": "bad"}.get(rec.get("disk_state"), "ok")
+    if str(rec.get("state", "")).startswith(("error", "failed")):
+        rec_cls = "bad"
     rows = []
     for x in p["passes"]:
         img = '<img src="%s" alt="">' % _e(x["thumb_url"]) if x.get("thumb_url") else ""

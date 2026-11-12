@@ -48,7 +48,7 @@ import cv2  # noqa: E402
 
 from rt import config as C  # noqa: E402
 from rt.capture import open_source, set_affinity  # noqa: E402
-from rt.recorder import Recorder, software_version  # noqa: E402
+from rt.recorder import Recorder, check_recording_config, software_version  # noqa: E402
 from rt.models import YoloOnnx  # noqa: E402
 from rt.passlogic import PassLogic  # noqa: E402
 from rt.sinks import ConsoleSink, CsvSink, Emitter, JsonlSink, LapAppSink  # noqa: E402
@@ -131,10 +131,13 @@ def main():
         if live_camera:
             timechecker = TimeChecker(cfg, board, float(st["time_check_s"]))
             timechecker.start()
+    if live_camera:
+        check_recording_config(cfg["recording"])       # a clear error for settings that cannot work
     if live_camera and cfg["recording"]["mode"] != "off":
-        rc = cfg["recording"]
-        rec_fps = float(cfg["camera"]["fps"]) if rc["all_frames"] else float(cfg["capture"]["fps"])
-        recorder = Recorder(cfg, out.parent / rc["subdir"], rec_fps, version, log=log)
+        recording_cfg = cfg["recording"]
+        recorder = Recorder(cfg, out.parent / recording_cfg["subdir"], float(cfg["capture"]["fps"]), version,
+                            log=log)
+        recorder.choose_encoder()                     # probe QSV / AMF / x264 once, now, and log the one used
         recorder.start()
         if board is not None:
             board.recorder = recorder
