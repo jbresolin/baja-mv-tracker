@@ -170,6 +170,15 @@ motorcycle; add `"person"` for a walk test) all become the tracker's single "car
 `spotter.coco_conf` (default 0.25). Everything after the detector (ROI crop, ByteTrack, progress, director,
 controller) is unchanged.
 
+* Each box is scored by its best class **among the selected ones**, so a van whose top COCO class is "train" or
+  "boat" still counts (rt's Baja detector keeps the usual best-of-all-classes rule).
+* YOLO removes duplicate boxes per class only, so one pickup can come out as both "car" and "truck". Two boxes of
+  any selected classes that overlap by more than `spotter.coco_agnostic_iou` (default 0.5, IoU) are one vehicle:
+  the weaker one is dropped. Raise it if two cars side by side get merged; lower it if one vehicle gets two tracks.
+* `spotter.detector` must be `"baja"`, `"coco"` or `"blobs"` (`"rt"` = old name of `"baja"`). Any other value, e.g.
+  a typo, now stops the program at startup with an error listing the valid ones (before, any unknown value
+  silently ran the Baja detector).
+
 **Bench only.** COCO models are unreliable on muddy Baja cars (LESSONS.md), and the Ultralytics YOLO11 weights are
 **AGPL-3.0**: don't ship it in the race setup. While it is on, the page shows an amber "DETECTOR DE BANCADA (COCO)"
 banner in the header and a red "detector" line in the health panel, and the console prints a warning at startup.
@@ -196,7 +205,8 @@ copy yolo11n.onnx <repo>\deploy\models\yolo11n_coco.onnx
   not `(1, 84, N)` (80 classes).
 
 Run it with the `bench` profile (detector only) or `bench_strict` (bench detector + the `strict` controller, since only
-one profile can be active at a time):
+one profile can be active at a time). The profiles only switch `spotter.detector`; a `coco_model` (or any other
+`coco_*` key) set in `site.toml` is kept:
 
 ```
 python -m zone.app --config zone/configs/site.toml --set profile=bench
