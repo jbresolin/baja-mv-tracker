@@ -40,11 +40,71 @@ decode_threads = 0              # ffmpeg -threads for decoding (0 = ffmpeg's def
 hwaccel = "none"                # ffmpeg -hwaccel for files/streams: none | d3d11va | qsv | dxva2 | auto (Intel laptop: try d3d11va;
                                 # decode of 1080p30 H.264 costs ~0.6 core on this 3900X in software)
 queue_size = 4                  # frames between capture and detection; live sources drop frames when it is full
-camera_backend = "auto"         # OpenCV backend for camera indices: auto | dshow | msmf | v4l2
-camera_width = 1920
-camera_height = 1080
-camera_fps = 30
 live_latency_s = 0.0            # known capture latency of a live source (subtracted from the frame time)
+
+[camera]                        # USB camera (--source camera, or a camera index); rt/livecam.py + rt/camsource.py
+backend = "auto"                # auto (= dshow on Windows, v4l2 on Linux) | dshow | msmf | v4l2
+device = 0                      # index, or (better) the device path: `python rt/run.py --list-cameras` prints it
+width = 1920
+height = 1080
+fps = 30
+fourcc = "MJPG"                 # set explicitly: without it DirectShow often falls back to YUY2 at 5 fps for 1080p
+require_fourcc = true           # fail (and retry) if the camera does not deliver this FOURCC
+raw_mjpeg = false               # ask for the camera's JPEG bytes (CONVERT_RGB = 0). DirectShow ignores it for MJPG (it
+                                # always decodes); V4L2 honours it. rt checks the first frame and falls back to images.
+read_mode = "auto"              # auto: from the backend (dshow -> retrieve_every_frame, v4l2 -> grab_then_retrieve);
+                                # see rt/camsource.py. retrieve_every_frame is always correct; grab_then_retrieve
+                                # busy-loops on a backend whose grab() does not wait (DirectShow).
+lost_after_s = 3.0              # no good frame for this long (monotonic clock) = camera lost -> status "lost", reopen
+lost_after_failures = 10        # ... or this many failed reads in a row
+reopen_first_s = 1              # reopen backoff: 1 s, doubling ...
+reopen_max_s = 30               # ... up to 30 s
+clock_map_every_s = 60          # a `clock_map` event (wall vs monotonic time of a grab) this often
+[camera.settings]               # applied at every open, then read back and logged; empty = leave the camera as it is
+                                # (see rt/configs/lapline.example.toml for the image settings)
+
+[recording]                     # rt/recorder.py: live camera only; files go to <folder of --out>/rec/
+mode = "h264"                   # h264 (~4 GB/h at 10 fps with x264 CRF 23) | off. "mjpeg" (copy) is refused: DirectShow
+                                # gives rt decoded frames, so there are no camera JPEGs to copy
+segment_min = 30                # a new file every 30 minutes (and after a camera loss or a gap in the frames)
+split_gap_periods = 2           # a gap of more than 2 frame periods (0.2 s at 10 fps) between frames starts a new file
+warn_free_gb = 20               # status page warning under this much free disk
+stop_free_gb = 5                # stop recording (never detection) under this; resumes above warn_free_gb
+disk_check_s = 10
+queue_frames = 10               # frames waiting for the writer (1 s at 10 fps; a 1080p frame is ~6 MB); when full the
+                                # oldest is dropped from the recording (counted)
+csv_flush_rows = 30             # flush the .frames.csv every this many rows
+write_timeout_s = 10            # ffmpeg not accepting a frame for this long = recording failed: kill it, new file
+retry_wait_s = 10               # wait before a new file after a failure
+max_failures = 5                # failures in a row before recording gives up for the run (detection goes on)
+h264_encoders = ["h264_qsv", "h264_amf", "libx264"]   # probed in this order at start; the one used is logged
+subdir = "rec"
+
+[status]                        # rt/status.py: read-only page, http://<laptop>:<port>/
+enabled = true
+bind = "0.0.0.0"                # all interfaces: a phone on the LAN can open it (allow Python in the Windows firewall)
+port = 8765
+passes = 20                     # last passes shown
+thumb_width = 320
+thumb_fps = 5                   # thumbnails kept per second for the pass list
+thumb_ring_s = 20               # seconds of thumbnails kept (a pass's thumbnail is the frame nearest its t_cross)
+fps_window_s = 10
+time_check_s = 60               # re-measure the clock offset this often
+required = false                # true: exit (code 3) if the port is busy. The launcher always asks for this
+                                # (--require-status), since it watches rt through the page
+
+[launch]                        # rt/supervise.py (rt\run_lapline.bat): one unattended rt
+name = "lapline"
+event = ""                      # roster code, e.g. "27SE" (required)
+source = "camera"
+out_dir = "out/lapline"         # each run: <out_dir>/<date>/lapline_<time>.jsonl (+ rec/); launcher.log here
+extra_args = []                 # more rt/run.py arguments, e.g. ["--stats", "--quiet"]
+restart_first_s = 5             # restart backoff: 5 s, doubling ...
+restart_max_s = 60              # ... up to 60 s
+healthy_reset_min = 10          # a run that lasted this long resets the backoff to restart_first_s
+stall_s = 30                    # status fps = 0 (or no answer) this long -> kill and restart
+startup_grace_s = 60            # no stall check during the first seconds of a run
+poll_s = 2
 
 [clock]
 # Frame time = wall clock of the video PC. Files: "auto" = OBS clock overlay (26SE) if present, else the container

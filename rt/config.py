@@ -8,6 +8,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT = Path(__file__).resolve().parent / "config.toml"
 ROLES = ("car_detector", "car_detector_alt", "panel_detector", "recognizer", "vote")
+# rt/run.py exits with this code when the status page's port cannot be opened and the page is required (started by
+# the launcher, which watches rt through that page). rt/supervise.py names the reason in its log.
+EXIT_STATUS_PORT_BUSY = 3
 
 
 def _parse_value(v):
@@ -34,8 +37,11 @@ def load(path=None, overrides=()):
     cfg = copy.deepcopy(base)
     for o in overrides:
         k, v = o.split("=", 1)
-        sec, key = k.split(".", 1)
-        cfg.setdefault(sec, {})[key] = _parse_value(v)
+        *path, key = k.split(".")       # section.key, or section.table.key (camera.settings.exposure=-10)
+        d = cfg
+        for part in path:
+            d = d.setdefault(part, {})
+        d[key] = _parse_value(v)
     apply_manifest(cfg)
     m = cfg["models"]
     for r in ROLES:
