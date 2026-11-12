@@ -141,6 +141,7 @@ def build(cfg, report: Report = None) -> Settings:
         max_feedback_tilt=float(c["max_feedback_tilt"]), inquiry_hz=float(inquiry_hz),
         inquiry_stale_s=float(c["inquiry_stale_s"]), dead_reckoning_trust_s=float(c["dead_reckoning_trust_s"]),
         k_quant=float(c["k_quant"]), ttl_s=float(c["ttl_s"]), zoom_enabled=bool(c["zoom_enabled"]),
+        zoom_direct_supported=bool(getattr(m, "supports_zoom_direct", True)),
         zoom_min_interval_s=float(c["zoom_min_interval_s"]), zoom_threshold=float(c["zoom_threshold"]),
         zoom_loosen=float(c["zoom_loosen"]), zoom_wide=float(zoom_wide), zoom_limits=tuple(m.zoom_limits),
         model_latency_s=float(m.command_latency_s),
@@ -166,6 +167,7 @@ def build(cfg, report: Report = None) -> Settings:
     progress = ProgressSettings(
         meas_sigma_px=float(p["meas_sigma_px"]), accel_sigma=float(p["accel_sigma"]), v_sigma0=float(p["v_sigma0"]),
         window_back_px=float(p["window_back_px"]), window_ahead_px=float(p["window_ahead_px"]),
+        window_sigmas=float(p.get("window_sigmas", 3.0)),
         corridor_factor=float(p["corridor_factor"]), finish_after_s=float(p["finish_after_s"]),
         profile_min_span=float(p["profile_min_span"]), max_prediction_s=float(p["max_prediction_s"]))
 

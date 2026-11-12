@@ -227,3 +227,36 @@ def test_normal_following_never_trips_the_divergence_guard():
         t = t0 + k * 0.1
         clock.advance(max(0.0, t + 0.05 - clock.monotonic()))
         assert not ctrl.follow(-0.05 + 0.25 * k * 0.1, 0.25, t).diverged
+
+
+# ================================================================================= quantization integral, zoom support
+def test_quantization_integral_cannot_wind_up():
+    # The quantization compensation adds up "wanted rate minus commanded rate" over time (an integral). If the camera
+    # can't give what is wanted for a long time (here: 2400 units/s wanted, the top speed is ~1070, for 20 s), that
+    # sum would grow without end, and keep pushing long after the reason was gone. It is now kept within what its
+    # output can use: max_feedback / k_quant (150 / 1.5 = 100 units of pan).
+    ctrl, sim, spy, clock, st = setup("B", sets=["controller.dead_reckoning_trust_s=0"])
+    t0 = clock.monotonic()
+    for k in range(200):
+        clock.advance(0.1)
+        # every cycle the same car: s = -0.5, v = 3 zones per second -> the camera should turn at 800 * 3 units/s
+        ctrl.follow(-0.5, 3.0, t0 + k * 0.1)
+    limit = st.controller.max_feedback_pan / st.controller.k_quant
+    assert abs(ctrl.q_pan) <= limit + 1e-9
+    assert abs(ctrl.q_pan) == pytest.approx(limit)     # it did reach the cap (so the test really tested something)
+
+
+def test_no_zoom_commands_to_a_camera_without_zoom_direct():
+    # the bench found the camera can't take an absolute zoom position: the controller must not send any (the zoom
+    # comes only from the presets, recalled at the entry)
+    model = PtzModel(inquiry_mode="never", supports_zoom_direct=False)
+    st = settings("B", model=model)
+    assert st.controller.zoom_direct_supported is False
+    clock = FakeClock(0.0)
+    sim = SimulatedPtz(model, clock)
+    sim.define_preset(10, 0, 0, 2000)
+    spy = Spy(sim)
+    ctrl = Controller(spy, clock, CURVE, st.pan_map, st.tilt_map, st.controller)
+    follow_car(ctrl, sim, clock, t_end=3.0)
+    assert spy.count("zoom_direct") == 0
+    assert spy.count("pan_tilt_velocity") > 0          # pan/tilt following is unaffected

@@ -177,6 +177,9 @@ class ProgressSettings:
     v_sigma0: float = 0.5               # initial speed uncertainty (s/s): the first speed comes from the measurements
     window_back_px: float = 40.0        # projection window behind the previous position (pixels of arc length)
     window_ahead_px: float = 400.0      # ... and ahead of it
+    window_sigmas: float = 3.0          # after a dropout the window is at least this many standard deviations of the
+                                        # predicted s wide on each side (the prediction gets less sure the longer the
+                                        # car is unseen: a car that braked out of sight is still found)
     corridor_factor: float = 1.0        # a detection farther than factor * half width from the path is ignored
     finish_after_s: float = 3.0         # a track not seen for this long is finished (fed to the speed profile)
     profile_min_span: float = 0.3       # a finished track must have covered this much s to teach the profile
@@ -253,8 +256,16 @@ class ProgressTracker:
             x1, y1, x2, y2 = [float(v) for v in box]
             gx, gy = (x1 + x2) / 2.0, y2            # ground point: bottom centre of the box
             tp = self.tracks.get(tid)
-            s_prev = tp.filt.predict(t)[0] if tp else None
-            proj = self.path.project(gx, gy, s_prev, c.window_back_px, c.window_ahead_px)
+            back, ahead = c.window_back_px, c.window_ahead_px
+            s_prev = None
+            if tp:
+                s_prev, _, var_s, _ = tp.filt.predict(t)
+                # widen the search window by the prediction's own uncertainty (in pixels of arc): right after an
+                # update it is a few pixels (the fixed window wins); after a long dropout it grows, so a car that
+                # did something else than "keep the same speed" while unseen is still within reach
+                spread_px = c.window_sigmas * math.sqrt(max(var_s, 0.0)) * self.path.scale
+                back, ahead = max(back, spread_px), max(ahead, spread_px)
+            proj = self.path.project(gx, gy, s_prev, back, ahead)
             inside = self.path.in_corridor(proj, c.corridor_factor)
             if tp is None:
                 if not inside:

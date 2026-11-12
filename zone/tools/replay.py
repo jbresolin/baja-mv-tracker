@@ -106,6 +106,15 @@ def teach_presets(ptz, clock, zone):
         ptz.preset_store(int(k.preset))
 
 
+def angular_error(pan, tilt, want_pan, want_tilt, units_per_degree=None):
+    """Distance between where the PTZ points and where it should, in degrees when the units per degree are known
+    ((pan_units, tilt_units): each axis is converted with its own factor), else in raw units."""
+    dp, dt = pan - want_pan, tilt - want_tilt
+    if units_per_degree:
+        dp, dt = dp / units_per_degree[0], dt / units_per_degree[1]
+    return math.hypot(dp, dt)
+
+
 def control(dets, settings, zone, model, truth, proc_delay=0.05, profile=None, units_per_degree=None):
     """Drive SimulatedPtz with the pipeline on a fake clock. -> (cycle rows, pass rows)."""
     from zone.clock import FakeClock
@@ -148,9 +157,7 @@ def control(dets, settings, zone, model, truth, proc_delay=0.05, profile=None, u
             s_true = s_true_at(truth, st["locked_id"], now)
             if s_true is not None:
                 want = curve.pose(s_true)
-                e = math.hypot(pan - want.pan, tilt - want.tilt)
-                if upd:
-                    e /= upd
+                e = angular_error(pan, tilt, want.pan, want.tilt, upd)
                 row.update(s_true=round(s_true, 4), target_pan=round(want.pan, 1), target_tilt=round(want.tilt, 1),
                            err=round(e, 3))
                 cur["errs"].append(e)
@@ -272,7 +279,8 @@ def main(argv=None):
     truth = truth_tracks(dets, path, settings.progress)
     profile = learn_profile(dets, path, settings) if a.warm_profile else None
     model = settings.report.model
-    upd = getattr(model, "pan_units_per_degree", None)
+    pan_upd, tilt_upd = getattr(model, "pan_units_per_degree", None), getattr(model, "tilt_units_per_degree", None)
+    upd = (pan_upd, tilt_upd or pan_upd) if pan_upd else None
     rows, passes = control(dets, settings, zone, model, truth, proc_delay, profile, upd)
     meta = dict(video=a.video, zone=a.zone, report=settings.report.summary(), branch=settings.controller.branch,
                 latency_s=settings.controller.latency_s, proc_delay_s=proc_delay, frames=len(dets),

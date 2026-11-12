@@ -177,3 +177,20 @@ def test_profile_save_and_load(tmp_path):
     assert q.n_passes == 1
     for s in (0.0, 0.33, 0.9):
         assert q.v_typ(s) == pytest.approx(p.v_typ(s))
+
+
+@pytest.mark.parametrize("sigmas, found", [(3.0, True), (0.0, False)])
+def test_a_car_that_braked_while_unseen_is_still_found(sigmas, found):
+    # The car drives at 200 px/s, then disappears for 2 s (hidden by a tree, say) and brakes while hidden: it comes
+    # back at x = 420, only 20 px further than where it was last seen. The filter, knowing nothing better, predicted
+    # it ~400 px further on (x ~ 800). The search window is centred on that prediction and normally reaches only
+    # 40 px back: the real position would be out of reach, and the car's s would be stuck at the window's edge.
+    # With the window widened by the prediction's uncertainty (3 standard deviations, the default), it is found.
+    path = PathModel(straight_zone())                       # x 100..1000, s = (x - 200) / 800
+    pt = ProgressTracker(path, ProgressSettings(finish_after_s=5.0, window_sigmas=sigmas))
+    drive(pt, 4, 200, 200, 0.0, 1.0)                        # seen until x = 400 at t = 1.0
+    views = pt.update(3.0, [(4, box_at(420), 0.9)])          # back at t = 3.0, at x = 420
+    s_raw = pt.tracks[4].samples[-1][1]                     # the projected s of that detection
+    true_s = (420 - 200) / 800
+    assert (abs(s_raw - true_s) < 0.02) is found
+    assert 4 in views

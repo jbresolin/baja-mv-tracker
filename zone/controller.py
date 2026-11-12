@@ -51,6 +51,7 @@ class ControllerSettings:
     k_quant: float = 1.5                 # quantization compensation gain (1/s), see Controller.follow
     ttl_s: float = 0.3                   # every velocity command expires after this (driver dead-man switch)
     zoom_enabled: bool = True
+    zoom_direct_supported: bool = True   # from the report: False -> no zoom command is ever sent (preset zoom only)
     zoom_min_interval_s: float = 0.5     # at most 2 zoom commands per second
     zoom_threshold: float = 150.0        # only send a zoom when it changes by more than this (raw units)
     zoom_loosen: float = 0.85            # zoom = wide + loosen * (taught - wide): < 1 frames looser than taught
@@ -324,6 +325,12 @@ class Controller:
             got_tilt = c.tilt_sign * self.tilt_map.rate_of(self.tilt_step)
             self.q_pan += (self.want[0] - got_pan) * dt
             self.q_tilt += (self.want[1] - got_tilt) * dt
+            # anti-windup: the integral itself is kept within what its output can use (the output is clipped to
+            # max_feedback anyway). Without this, a long stretch where the camera can't follow (at its top speed,
+            # or held at the minimum step) piles up a deficit that keeps pushing long after the reason is gone.
+            if c.k_quant > 0:
+                self.q_pan = _clip(self.q_pan, c.max_feedback_pan / c.k_quant)
+                self.q_tilt = _clip(self.q_tilt, c.max_feedback_tilt / c.k_quant)
         if pn.trusted:
             self.q_pan = self.q_tilt = 0.0
         q_pan = _clip(c.k_quant * self.q_pan, c.max_feedback_pan)
@@ -363,8 +370,8 @@ class Controller:
 
     def _maybe_zoom(self, taught_zoom, now):
         c = self.cfg
-        if not c.zoom_enabled:
-            return None
+        if not c.zoom_enabled or not c.zoom_direct_supported:
+            return None          # off, or the camera can't do zoom_direct: the presets' own zoom is all we get
         z = self.zoom_for(taught_zoom)
         if now - self.t_last_zoom < c.zoom_min_interval_s:
             return None

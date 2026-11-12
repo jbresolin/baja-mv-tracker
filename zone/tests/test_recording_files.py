@@ -58,3 +58,13 @@ def test_spotter_recording_is_matroska_so_a_crash_leaves_a_readable_file(tmp_pat
     assert started[0][-3:] == ["-f", "matroska", str(rec.path)]          # the container is asked for explicitly
     rec.q.put(None)                                                    # let the writer thread end
     rec.thread.join(5)
+
+
+def test_replay_error_converts_each_axis_with_its_own_units_per_degree():
+    # A camera with 20 raw units per degree in pan but 10 in tilt: an error of 60 pan units and 40 tilt units is
+    # 3 degrees and 4 degrees, so 5 degrees in total (a 3-4-5 triangle). Dividing both by the pan factor would
+    # say sqrt(3^2 + 2^2) = 3.6 degrees: the tilt error would be halved.
+    from zone.tools.replay import angular_error
+    assert angular_error(60, 40, 0, 0, (20.0, 10.0)) == 5.0
+    # without units per degree, the error stays in raw units
+    assert angular_error(3, 4, 0, 0, None) == 5.0
