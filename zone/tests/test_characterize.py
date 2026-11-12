@@ -67,6 +67,65 @@ def test_verdict_rule():
     assert ba.verdict(None, None)[0] == "B"
 
 
+# --- B1: is the feedback really live? (answers vs. updates) ------------------------------------------------------
+#
+# A camera can answer a position inquiry 50 times a second and still be useless for feedback if the number it
+# answers with is only refreshed twice a second (a "stale cache"). These tests feed made-up (time, position) samples
+# into the rule that decides whether a poll rate is "ok", so we can see exactly which camera passes and why.
+
+
+def samples_from(rate_hz, duration_s, true_position):
+    """Poll an imaginary camera at `rate_hz` for `duration_s`: a list of (time, answered position)."""
+    count = int(duration_s * rate_hz)
+    return [(k / rate_hz, true_position(k / rate_hz)) for k in range(count)]
+
+
+def test_a_live_camera_passes_at_50_hz():
+    # The camera turns at 100 units/s and every answer is the position right now, rounded to whole units.
+    samples = samples_from(50, 1.5, lambda t: round(100 * t))
+    judged = ba.judge_feedback_rate(50, sent=len(samples), samples=samples)
+    assert judged["ok"], judged["why"]
+    assert judged["answers_hz"] == pytest.approx(50, abs=0.5)
+    assert judged["updates_hz"] == pytest.approx(50, abs=0.5)  # the value changes on every answer
+
+
+def test_a_stale_cache_camera_fails_even_though_it_answers_at_50_hz():
+    # Same motion, but the camera only refreshes the number it reports every 0.5 s (2 Hz). Between refreshes it
+    # keeps repeating the old value. It answers every inquiry, so "did it answer?" alone would call this live.
+    samples = samples_from(50, 1.5, lambda t: round(100 * (int(t * 2) / 2)))
+    judged = ba.judge_feedback_rate(50, sent=len(samples), samples=samples)
+    assert not judged["ok"]
+    assert judged["answers_hz"] == pytest.approx(50, abs=0.5)  # it does answer fast...
+    assert judged["updates_hz"] == pytest.approx(2, abs=0.2)  # ...but the value changes only twice a second
+    assert "stale" in judged["why"]
+    assert judged["jumps"] > 0  # each refresh catches up 50 units at once
+
+
+def test_a_slow_but_live_camera_is_not_mistaken_for_a_stale_one():
+    # Moving only 20 units/s, polled at 50 Hz: 0.4 units per poll, so even a perfect, live camera reports the same
+    # whole number several times in a row. The rule expects that (expected change fraction 0.4), so it still passes.
+    samples = samples_from(50, 1.5, lambda t: round(20 * t))
+    judged = ba.judge_feedback_rate(50, sent=len(samples), samples=samples)
+    assert judged["expected_change_fraction"] == pytest.approx(0.4, abs=0.01)
+    assert judged["ok"], judged["why"]
+
+
+def test_unanswered_inquiries_fail_the_rate():
+    # Only every other inquiry gets an answer: 50% answered is below the 90% rule.
+    samples = samples_from(25, 1.5, lambda t: round(100 * t))
+    judged = ba.judge_feedback_rate(50, sent=2 * len(samples), samples=samples)
+    assert not judged["ok"] and "answered" in judged["why"]
+
+
+def test_verdict_needs_10_updates_per_second():
+    # Polled at 20 Hz and passing, but the value changed only 6 times a second: not enough for Branch A.
+    branch, reason = ba.verdict("yes", 20.0, update_rate_hz=6.0)
+    assert branch == "B" and "6 Hz" in reason
+    assert ba.verdict("yes", 20.0, update_rate_hz=20.0)[0] == "A"
+    assert ba.verdict("yes", 10.0, update_rate_hz=9.7)[0] == "A"  # within the 5% counting tolerance
+    assert ba.verdict("yes", None, refresh_hz=2.0)[0] == "B"
+
+
 # --- whole runs -------------------------------------------------------------------------------------------------
 
 
@@ -217,3 +276,57 @@ def test_report_is_written_after_every_section(tmp_path):
 def test_command_line_defaults():
     args = parse_args(["--ip", "10.0.0.5", "--out", "reports/a"])
     assert (args.port, args.timeout, args.home_preset, args.quick, args.yes) == (52381, 0.2, None, False, False)
+
+
+# --- B1 whole runs: stale cache vs. live ---------------------------------------------------------------------------
+
+
+def test_stale_cache_camera_gives_branch_b(tmp_path):
+    # A simulated camera that answers every inquiry at once, but refreshes the position it reports only twice a
+    # second. Before the fix the bench said "Branch A at 50 Hz" for this camera; now it must say Branch B.
+    stale = PtzModel(inquiry_refresh_hz=2.0, inquiry_poll_hz=None)
+    report, _ = run_on_sim(stale, BenchOptions(quick=True, skip=("zoom", "repeatability")), tmp_path=tmp_path)
+    feedback = report["feedback"]
+    assert report["verdict"]["branch"] == "B"
+    assert feedback["max_rate_hz"] is None  # no poll rate passed
+    assert feedback["refresh_limited"] is True
+    assert feedback["update_rate_hz"] == pytest.approx(2.0, abs=0.3)
+    fifty = feedback["rates"]["50"]
+    assert fifty["answers_hz"] >= 45 and fifty["updates_hz"] < 3 and not fifty["ok"]
+    # The simulator model learned from this report reproduces the stale cache.
+    assert report["model"]["inquiry_refresh_hz"] == pytest.approx(2.0, abs=0.3)
+    # Without live feedback, the speed table falls back to timed moves read at rest.
+    assert report["speed_table"]["method"] == "timed"
+    # The summary shows, per rate, answers/s, updates/s, cv, jumps and why it passed or failed.
+    summary = (summarize(report))
+    line_50 = next(line for line in summary.splitlines() if line.strip().startswith("50 Hz:"))
+    for word in ("answers/s", "updates/s", "cv", "jumps", "NOT ok", "stale"):
+        assert word in line_50
+    assert "refreshes" in summary.rstrip().splitlines()[-1]  # the verdict line says why
+
+
+def test_stale_cache_camera_gives_branch_b_through_the_real_driver():
+    # Same, but through the VISCA driver and the fake VISCA camera, as on the bench tomorrow.
+    report, _, _ = run_through_driver(PtzModel(inquiry_refresh_hz=2.0, inquiry_poll_hz=None),
+                                      BenchOptions(quick=True, skip=("zoom", "repeatability", "absolute")))
+    assert report["verdict"]["branch"] == "B"
+    assert report["feedback"]["rates"]["50"]["answers_hz"] >= 40
+
+
+def test_live_camera_gives_branch_a_through_the_real_driver():
+    # The control case: a camera whose every answer is fresh gets Branch A, with updates/s close to answers/s.
+    report, _, _ = run_through_driver(PtzModel(inquiry_poll_hz=None),
+                                      BenchOptions(quick=True, skip=("zoom", "repeatability", "absolute")))
+    assert report["verdict"]["branch"] == "A"
+    best = report["feedback"]["rates"][str(int(report["feedback"]["max_rate_hz"]))]
+    assert best["ok"] and best["updates_hz"] >= 0.9 * best["answers_hz"]
+
+
+def test_a_camera_refreshing_at_20_hz_passes_at_20_but_not_at_50():
+    # Refreshing 20 times a second is fast enough for Branch A, but polling it at 50 Hz is wasted: the bench must
+    # say so (50 Hz not ok) and settle on 20 Hz.
+    report, _ = run_on_sim(PtzModel(inquiry_refresh_hz=20.0, inquiry_poll_hz=None),
+                           BenchOptions(quick=True, skip=("zoom", "repeatability", "absolute")))
+    assert report["feedback"]["rates"]["50"]["ok"] is False
+    assert report["feedback"]["max_rate_hz"] == 20.0
+    assert report["verdict"]["branch"] == "A"

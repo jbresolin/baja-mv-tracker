@@ -34,15 +34,20 @@ python -m zone.tools.characterize --ip 192.168.1.50 --out reports/smtav-a/
 Dry run without a camera, in two terminals:
 
 ```
-python -m zone.ptz.fake_camera --port 52399 [--inquiry-mode at_rest]
+python -m zone.ptz.fake_camera --port 52399 [--inquiry-mode at_rest] [--refresh-hz 2]
 python -m zone.tools.characterize --ip 127.0.0.1 --port 52399 --out reports/fake --quick --yes
 ```
 
 ## How the bench measures
 
-- **Feedback.** It pans at a fixed speed and polls position at 5/10/20/50 Hz. A rate is "ok" when ≥ 90% of the
-  inquiries are answered, the answers arrive at ≥ 80% of the asked rate, and the value changes. While moving, the
-  inquiry is classified as `yes`, `frozen` (answers, but the value doesn't change until the camera stops) or `no`.
+- **Feedback.** It pans at a fixed speed and polls position at 5/10/20/50 Hz. A rate is "ok" only when all of
+  these hold: ≥ 90% of the inquiries are answered, the answers arrive at ≥ 80% of the asked rate, the value
+  *changes* on ≥ 70% of the answers where a live report would (whole-unit rounding taken into account), the
+  motion is smooth (interval-rate cv ≤ 0.35, or within 1 unit of a straight line), and there are no jumps. Per
+  rate the summary prints answers/s, updates/s (how often the value really changed), cv, jumps and the reason it
+  passed or failed. A camera that answers fast from a slowly refreshed position cache is flagged "STALE CACHE".
+  While moving, the inquiry is classified as `yes`, `frozen` (answers, but the value doesn't change until the
+  camera stops) or `no`.
 - **Speed table.** With live feedback, it moves at each step and fits the slope of the position over the second
   half of the move. Without it (position readable only at rest), it makes two timed moves of T and 2T per direction:
   (travel(2T) − travel(T)) / T is the steady rate with the latency and ramp cancelled out.
@@ -50,7 +55,8 @@ python -m zone.tools.characterize --ip 127.0.0.1 --port 52399 --out reports/fake
   of the steady rate, then the same for stop. A camera that answers only at rest goes silent when it starts moving
   and answers again once it has stopped; those two edges time the start latency and the stop. The resolution of the
   stop edge is the driver timeout (`--timeout`, 0.2 s by default).
-- **Verdict.** Branch A if pan/tilt inquiry works while moving at ≥ 10 Hz, otherwise Branch B.
+- **Verdict.** Branch A if a poll rate ≥ 10 Hz is "ok" (above) and the position really updates ≥ 10 times a
+  second at that rate (5% counting tolerance), otherwise Branch B.
 
 ## Tests
 

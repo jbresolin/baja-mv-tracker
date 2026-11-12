@@ -11,6 +11,8 @@ What it models, per axis (pan, tilt, zoom):
 - **Travel limits:** the axis stops at its limit.
 - **Inquiry behaviour:** "always" answers, "at_rest" answers only when stopped, "never", or "frozen_while_moving"
   (answers, but with the last at-rest value while moving). An optional `inquiry_latency_s` makes answers that old.
+  `inquiry_refresh_hz` makes a "stale cache" camera: it answers every inquiry at once, but the position it reports
+  is only refreshed that many times a second (between refreshes it repeats the last value).
 - **Position moves** (absolute, relative, presets, zoom direct, home): constant speed to the target, no ramp.
 - **TTL dead-man:** the same semantics as the real driver.
 
@@ -22,6 +24,7 @@ from __future__ import annotations
 
 import bisect
 import json
+import math
 from collections import deque
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
@@ -70,6 +73,9 @@ class PtzModel:
     inquiry_mode: str = "always"  # pan/tilt inquiry: one of INQUIRY_MODES
     zoom_inquiry_mode: str = "always"
     inquiry_latency_s: float = 0.0
+    # "Stale cache": the camera refreshes the position it reports only this often (None: every answer is fresh).
+    # A camera like that answers 50 inquiries a second but its value changes only a few times a second.
+    inquiry_refresh_hz: float | None = None
     inquiry_poll_hz: float | None = 20.0  # highest rate the bench found reliable (None: inquiry unusable)
     preset_move_speed: float = 1000.0  # units/s for preset recalls and home
     preset_settle_s: float = 2.0  # recall -> at rest, as measured by the bench
@@ -388,7 +394,7 @@ class SimulatedPtz:
         elif mode == "frozen_while_moving":
             value = self._frozen_pan_tilt
         else:
-            _, pan, tilt, _ = self._pose_at(self._now - self.model.inquiry_latency_s)
+            _, pan, tilt, _ = self._pose_at(self._refreshed_at(self._now) - self.model.inquiry_latency_s)
             value = self._reported_pan_tilt(pan, tilt)
         self.last_inquiry = self._inquiry_result(value)
         return value
@@ -475,6 +481,17 @@ class SimulatedPtz:
 
     def _reported_pan_tilt(self, pan: float, tilt: float) -> tuple[int, int]:
         return round(pan * self.model.pan_sign), round(tilt * self.model.tilt_sign)
+
+    def _refreshed_at(self, t: float) -> float:
+        """When the camera last refreshed the position it reports, as seen at time `t`.
+
+        A live camera refreshes all the time, so that is `t` itself. A "stale cache" camera (`inquiry_refresh_hz`)
+        refreshes on a fixed grid: with 2 Hz, at 0.0, 0.5, 1.0... so at t = 0.7 it still reports the pose of 0.5.
+        """
+        hz = self.model.inquiry_refresh_hz
+        if not hz:
+            return t
+        return math.floor(t * hz + 1e-9) / hz
 
     def _pose_at(self, t: float) -> tuple[float, float, float, float]:
         if t >= self._now or not self._history:

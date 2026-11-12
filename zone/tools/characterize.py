@@ -166,7 +166,11 @@ class Characterizer:
         # Learned along the way, used by later sections.
         self.pt_inquiry = False  # pan/tilt inquiry answers at rest
         self.while_moving: str | None = None  # "yes" / "frozen" / "no" (None: inquiry doesn't work at all)
-        self.max_rate_hz: float | None = None
+        self.max_rate_hz: float | None = None  # fastest poll rate giving live, smooth feedback (None: none)
+        self.update_rate_hz: float | None = None  # most updates/s seen while moving (the camera's refresh rate)
+        self.updates_at_max_rate_hz: float | None = None  # updates/s while polling at max_rate_hz
+        self.refresh_limited = False  # answers fast, but from a position cache refreshed more slowly
+        self.settle_stable_s = SETTLE_STABLE_S  # unchanged this long = at rest (longer for a slow-refresh camera)
         self.pan_max = 24
         self.tilt_max = 23
         self.rates: dict[str, dict[int, float]] = {}  # "pan+" -> {step: units/s (signed)}
@@ -264,7 +268,7 @@ class Characterizer:
                 stable_since = now if value is not None else None
                 last = value
                 continue
-            if stable_since is not None and now - stable_since >= SETTLE_STABLE_S:
+            if stable_since is not None and now - stable_since >= self.settle_stable_s:
                 return stable_since - t0, value
         return None, last
 
@@ -306,7 +310,8 @@ class Characterizer:
         finally:
             self.safe_stop()
         self.report["model"] = self.build_model().to_dict()
-        branch, reason = ba.verdict(self.while_moving, self.max_rate_hz)
+        branch, reason = ba.verdict(self.while_moving, self.max_rate_hz, self.updates_at_max_rate_hz,
+                                    refresh_hz=self.update_rate_hz)
         self.report["verdict"] = {"branch": branch, "reason": reason}
         self.save()
         return self.report
@@ -359,44 +364,59 @@ class Characterizer:
         all_answered = all_sent = 0
         any_change = False
         best: float | None = None
+        best_updates_hz: float | None = None
         rtts: list[float] = []
         for i, rate in enumerate(FEEDBACK_RATES_HZ):
             direction = 1 if i % 2 == 0 else -1
             self.ptz.pan_tilt_velocity(direction * step, 0, ttl=3.0)
-            self.sleep(0.4)  # past latency and ramp
+            self.sleep(0.4)  # past latency and ramp: from here on the speed is constant
             polls, _ = self.poll(rate, 1.5, self.ptz.inquire_pan_tilt)
-            self.ptz.stop()
+            self.safe_stop()
             self.sleep(0.6)
             samples = _axis_samples(polls, 0)
-            n_answered = len(samples)
-            changed = len({v for _, v in samples}) > 1
-            elapsed = (polls[-1].done - polls[0].sent) if polls else 0.0
-            answered_hz = (n_answered - 1) / elapsed if elapsed > 0 and n_answered > 1 else 0.0
-            fraction = n_answered / len(polls) if polls else 0.0
-            ok = fraction >= 0.9 and answered_hz >= 0.8 * rate and changed
-            if ok:
+            # The rules (answers, updates, smoothness, jumps) live in bench_analysis.judge_feedback_rate.
+            judged = ba.judge_feedback_rate(rate, len(polls), samples)
+            if judged["ok"]:
                 best = float(rate)
-            all_answered += n_answered
+                best_updates_hz = judged["updates_hz"]
+            all_answered += len(samples)
             all_sent += len(polls)
-            any_change = any_change or changed
+            any_change = any_change or ba.value_changes(samples) > 0
             rtts += [(p.done - p.sent) * 1000 for p in polls if p.value is not None]
-            per_rate[str(rate)] = {
-                "sent": len(polls), "answered": n_answered, "answered_fraction": _r(fraction),
-                "answered_hz": _r(answered_hz, 1), "value_changes": changed,
-                "smoothness_cv": _r(ba.smoothness_cv(samples)), "jumps": ba.count_jumps(samples), "ok": ok,
-            }
-            self.ui.info(f"  {rate:>2} Hz while panning: answered {n_answered}/{len(polls)} "
-                         f"({answered_hz:.1f} Hz), changes: {changed}, ok: {ok}")
+            per_rate[str(rate)] = {"sent": len(polls), "answered": len(samples), **judged}
+            self.ui.info(f"  {rate:>2} Hz while panning: {judged['answers_hz']} answers/s, {judged['updates_hz']} "
+                         f"updates/s, cv {judged['smoothness_cv']}, jumps {judged['jumps']}: "
+                         f"{'ok' if judged['ok'] else 'NOT ok'} ({judged['why']})")
         self.go_home()
         self.while_moving = ba.classify_feedback(all_answered / all_sent if all_sent else 0.0, any_change)
         self.max_rate_hz = best if self.while_moving == "yes" else None
+        # How often the position really changes: while polling at the best passing rate (the verdict needs it),
+        # and the most seen at any rate (for a stale-cache camera, that is its refresh rate).
+        seen_updates = [row["updates_hz"] for row in per_rate.values()]
+        self.updates_at_max_rate_hz = best_updates_hz if self.max_rate_hz is not None else None
+        self.update_rate_hz = max(seen_updates) if seen_updates and self.while_moving == "yes" else None
+        # A stale cache: the camera answers far more often than its value changes, at the fastest rate it answers.
+        fastest = per_rate.get(str(FEEDBACK_RATES_HZ[-1]), {})
+        self.refresh_limited = bool(
+            self.while_moving == "yes" and fastest and fastest["answers_hz"] > 0
+            and fastest["change_fraction"] < ba.MIN_CHANGE_FRACTION * (fastest["expected_change_fraction"] or 1.0))
+        if self.update_rate_hz:
+            # Between refreshes a moving camera's report holds still; don't mistake that for "at rest".
+            self.settle_stable_s = max(SETTLE_STABLE_S, 2.5 / self.update_rate_hz)
         result.update({
             "while_moving": self.while_moving,
             "test_step": step,
             "rates": per_rate,
             "max_rate_hz": self.max_rate_hz,
+            "update_rate_hz": self.update_rate_hz,
+            "updates_at_max_rate_hz": self.updates_at_max_rate_hz,
+            "refresh_limited": self.refresh_limited,
             "round_trip_ms_p50": _r(ba.percentile(rtts, 50), 1),
             "round_trip_ms_p95": _r(ba.percentile(rtts, 95), 1),
+            "rules": "a rate is ok when >= 90% of inquiries are answered at >= 80% of the asked rate, the value "
+                     "changes on >= 70% of the answers where a live report would, the motion is smooth (cv <= "
+                     f"{ba.SMOOTH_CV_LIMIT} or within {ba.QUANTIZATION_UNITS:g} unit of a straight line) and "
+                     "there are no jumps",
             "freshness_note": "answers are at most one round trip old as seen from here; "
                               "the camera's own encoder-read delay is not measurable from inquiries alone",
         })
@@ -410,7 +430,7 @@ class Characterizer:
     # --- 2. speed table --------------------------------------------------------------------------------------
 
     def speed_table(self) -> dict[str, Any]:
-        if self.while_moving == "yes":
+        if self.while_moving == "yes" and self.max_rate_hz is not None:
             method = "moving"
         elif self.pt_inquiry:
             method = "timed"
@@ -939,6 +959,8 @@ class Characterizer:
         elif self.while_moving == "frozen":
             m.inquiry_mode = "frozen_while_moving"
         m.inquiry_poll_hz = self.max_rate_hz
+        if self.refresh_limited and self.update_rate_hz:
+            m.inquiry_refresh_hz = self.update_rate_hz
         zoom = r.get("zoom", {})
         if zoom.get("inquiry_at_rest") is False:
             m.zoom_inquiry_mode = "never"
@@ -997,10 +1019,13 @@ def summarize(report: dict[str, Any]) -> str:
         lines.append("1. Feedback")
         lines.append(f"   pan/tilt inquiry at rest: {'yes' if at_rest.get('supported') else 'NO'} "
                      f"(answered {at_rest.get('answered')}, round trip p50 {at_rest.get('round_trip_ms_p50')} ms)")
-        lines.append(f"   while moving: {fb.get('while_moving')}; reliable up to: {fb.get('max_rate_hz')} Hz")
+        lines.append(f"   while moving: {fb.get('while_moving')}; live feedback up to: {fb.get('max_rate_hz')} Hz; "
+                     f"position updates at {fb.get('update_rate_hz')} Hz"
+                     + (" (STALE CACHE: answers faster than the position refreshes)" if fb.get("refresh_limited") else ""))
         for rate, row in (fb.get("rates") or {}).items():
-            lines.append(f"     {rate:>2} Hz: answered {row['answered']}/{row['sent']} ({row['answered_hz']} Hz), "
-                         f"changes {row['value_changes']}, jumps {row['jumps']}, cv {row['smoothness_cv']}")
+            lines.append(f"     {rate:>2} Hz: {row.get('answers_hz')} answers/s ({row['answered']}/{row['sent']}), "
+                         f"{row.get('updates_hz')} updates/s, cv {row.get('smoothness_cv')}, jumps {row.get('jumps')}: "
+                         f"{'ok' if row.get('ok') else 'NOT ok'} ({row.get('why')})")
         lines.append(f"   zoom inquiry at rest: {'yes' if fb.get('zoom_at_rest', {}).get('supported') else 'no'}")
 
     st = report.get("speed_table", {})

@@ -271,6 +271,18 @@ def test_inquiry_latency_returns_an_older_pose():
     assert sim.inquire_pan_tilt() == (50, 0)  # where it was 0.5 s ago
 
 
+def test_stale_cache_repeats_the_last_refresh():
+    # A "stale cache" camera refreshes the position it reports only 2 times a second (at 0.0, 0.5, 1.0 s...).
+    # Asked at 0.9 s, it still reports where it was at 0.5 s, even though it has moved on since.
+    clock, sim = make(inquiry_refresh_hz=2.0, ramp_s=0.0, command_latency_s=0.0)
+    sim.pan_tilt_velocity(2, 0)  # 100 units/s
+    clock.advance(0.9)
+    assert sim.true_pan_tilt()[0] == pytest.approx(90.0)
+    assert sim.inquire_pan_tilt() == (50, 0)
+    clock.advance(0.2)  # 1.1 s: the 1.0 s refresh has happened
+    assert sim.inquire_pan_tilt() == (100, 0)
+
+
 def test_invalid_inquiry_mode_is_refused():
     with pytest.raises(ValueError):
         PtzModel(inquiry_mode="sometimes")
