@@ -15,7 +15,8 @@ Three ways to use it:
 Misbehaviour on demand, per command name (see `COMMAND_NAMES`), through `camera.behaviour[name]`:
 "normal" (ACK + completion), "error" (syntax error), "silent" (no reply at all), "ack_only" (ACK, never completion).
 `camera.echo_sequence = False` makes it answer with sequence 0, like some cheap cameras. `camera.bare_replies = True`
-makes it drop the 8-byte header.
+makes it drop the 8-byte header. `camera.lose_next[payload] = N` loses the next N requests with exactly that VISCA
+payload on the way, as a flaky network would: the camera never sees them, so it neither acts nor replies.
 """
 from __future__ import annotations
 
@@ -46,6 +47,8 @@ class FakeViscaCamera:
         self.echo_sequence = True
         self.bare_replies = False
         self.received: list[tuple[str, bytes]] = []  # (command name, payload) in arrival order
+        self.lose_next: dict[bytes, int] = {}  # payload -> how many more of these get lost before arriving
+        self.lost: list[bytes] = []  # payloads that were lost, in order
         self.reset_count = 0
 
     def handle(self, datagram: bytes) -> list[bytes]:
@@ -60,6 +63,10 @@ class FakeViscaCamera:
                 return []
             return [packets.wrap(b"\x01", packets.PAYLOAD_CONTROL_REPLY, request.sequence or 0)]
         payload = request.payload
+        if self.lose_next.get(payload, 0) > 0:
+            self.lose_next[payload] -= 1
+            self.lost.append(payload)
+            return []
         name, answer = self._execute(payload)
         refused = name.endswith(":refused")
         name = name.removesuffix(":refused")
@@ -226,8 +233,10 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=packets.VISCA_PORT)
     ap.add_argument("--inquiry-mode", default="always", choices=["always", "at_rest", "never", "frozen_while_moving"])
+    ap.add_argument("--refresh-hz", type=float, default=None,
+                    help="stale position cache: refresh the reported position only this often (default: always live)")
     args = ap.parse_args(argv)
-    sim = SimulatedPtz(PtzModel(inquiry_mode=args.inquiry_mode), SystemClock())
+    sim = SimulatedPtz(PtzModel(inquiry_mode=args.inquiry_mode, inquiry_refresh_hz=args.refresh_hz), SystemClock())
     server = FakeViscaUdpServer(FakeViscaCamera(sim), args.host, args.port).start()
     print(f"fake VISCA camera on {server.address[0]}:{server.address[1]} (inquiry {args.inquiry_mode}); Ctrl+C to stop")
     try:

@@ -38,15 +38,18 @@ from typing import Any, Callable, Sequence
 from zone.clock import Clock, SystemClock
 from zone.ptz.interface import Ptz
 from zone.ptz.sim import PtzModel
+from zone.ptz.visca_packets import DEFAULT_PAN_STEP_MAX, DEFAULT_TILT_STEP_MAX
 from zone.tools import bench_analysis as ba
 
 REPORT_SCHEMA = "zone.ptz.characterization/1"
 FEEDBACK_RATES_HZ = (5, 10, 20, 50)
 QUICK_STEPS_PAN = (1, 2, 3, 4, 6, 8, 12, 16, 20, 24)
 QUICK_STEPS_TILT = (1, 2, 3, 4, 6, 8, 12, 16, 20, 23)
-SMOOTH_CV_LIMIT = 0.35  # interval-rate std/mean below this counts as smooth
 SETTLE_STABLE_S = 0.3  # position unchanged this long = at rest
+REHOME_DRIFT_FRACTION = 0.25  # speed table: go home first when this far (x the travel) from home on the axis
+ZOOM_DIRECT_WAIT_S = 4.0  # zoom can't be read: wait this long after a zoom_direct (full range takes ~3 s)
 FIXED_WAIT_S = 5.0  # wait used after a move when position can't be read
+STOP_ATTEMPTS = 3  # safe_stop sends each stop up to this many times until the camera ACKs it
 EPSILON_S = 1e-6  # times this close count as equal (float sums like 0.1 + 0.2 are never exact)
 
 
@@ -111,7 +114,7 @@ class BenchOptions:
     home_preset: int | None = None  # recall this preset as home (None: the VISCA home command)
     repeat_preset: int | None = None  # preset used for repeatability (None: same as home)
     pan_max_step: int | None = None  # None: ask the camera, else the VISCA spec (24)
-    tilt_max_step: int | None = None  # None: ask the camera, else 23
+    tilt_max_step: int | None = None  # None: ask the camera, else 20 (0x14)
     quick: bool = False
     pan_travel: float = 1200.0  # raw units one speed measurement may travel (~90 deg at 0.075 deg/unit)
     tilt_travel: float = 400.0  # ~30 deg
@@ -120,6 +123,7 @@ class BenchOptions:
     pan_units_per_degree: float | None = None
     tilt_units_per_degree: float | None = None
     skip: tuple[str, ...] = ()
+    zoom_tele_assumed: int = 0x4000  # tele end of the zoom range, used only when zoom can't be read
 
 
 @dataclass
@@ -166,10 +170,16 @@ class Characterizer:
         # Learned along the way, used by later sections.
         self.pt_inquiry = False  # pan/tilt inquiry answers at rest
         self.while_moving: str | None = None  # "yes" / "frozen" / "no" (None: inquiry doesn't work at all)
-        self.max_rate_hz: float | None = None
-        self.pan_max = 24
-        self.tilt_max = 23
+        self.max_rate_hz: float | None = None  # fastest poll rate giving live, smooth feedback (None: none)
+        self.update_rate_hz: float | None = None  # most updates/s seen while moving (the camera's refresh rate)
+        self.updates_at_max_rate_hz: float | None = None  # updates/s while polling at max_rate_hz
+        self.refresh_limited = False  # answers fast, but from a position cache refreshed more slowly
+        self.settle_stable_s = SETTLE_STABLE_S  # unchanged this long = at rest (longer for a slow-refresh camera)
+        self.pan_max = DEFAULT_PAN_STEP_MAX
+        self.tilt_max = DEFAULT_TILT_STEP_MAX
         self.rates: dict[str, dict[int, float]] = {}  # "pan+" -> {step: units/s (signed)}
+        self.home_pose: Any = None  # where go_home() last arrived (raw pan, tilt), if it could be read
+        self.rehomes = 0  # how often the speed table went home because it had drifted too far
 
     # --- plumbing --------------------------------------------------------------------------------------------
 
@@ -185,11 +195,17 @@ class Characterizer:
         (self.out_dir / "report.json").write_text(json.dumps(self.report, indent=2), encoding="utf-8")
 
     def safe_stop(self) -> None:
+        """Stop pan/tilt and zoom, trying each up to STOP_ATTEMPTS times until the camera accepts it. Never raises.
+
+        (The driver also keeps re-sending an unacknowledged stop from its dead-man thread; this is belt and braces
+        for the moments that matter most: the end of a run, a failed section, Ctrl+C.)"""
         for action in (self.ptz.stop, self.ptz.zoom_stop):
-            try:
-                action()
-            except Exception:  # noqa: BLE001 - stopping must not raise
-                pass
+            for _ in range(STOP_ATTEMPTS):
+                try:
+                    if action().ok:
+                        break
+                except Exception:  # noqa: BLE001 - stopping must not raise
+                    pass
 
     def section(self, name: str, fn: Callable[[], dict[str, Any]]) -> None:
         if name in self.o.skip:
@@ -264,9 +280,15 @@ class Characterizer:
                 stable_since = now if value is not None else None
                 last = value
                 continue
-            if stable_since is not None and now - stable_since >= SETTLE_STABLE_S:
+            if stable_since is not None and now - stable_since >= self.settle_stable_s:
                 return stable_since - t0, value
         return None, last
+
+    def home_section(self) -> dict[str, Any]:
+        """The first move of the run: go to the home position (a section, so a failure is recorded, not fatal)."""
+        self.ui.info("Going to the home position...")
+        settle, pose = self.go_home()
+        return {"settle_s": _r(settle), "position": list(pose) if pose else None}
 
     def go_home(self) -> tuple[float | None, Any]:
         start = self.ptz.inquire_pan_tilt()
@@ -280,7 +302,10 @@ class Characterizer:
                 self.ui.info(f"  !! the camera did not accept the home command ({command.status}); measuring from "
                              "where it is. Consider --home-preset.")
         self.sleep(0.2)
-        return self.wait_at_rest(start, expect_change=False)
+        settle, pose = self.wait_at_rest(start, expect_change=False)
+        if pose is not None:
+            self.home_pose = pose
+        return settle, pose
 
     # --- the run ---------------------------------------------------------------------------------------------
 
@@ -291,8 +316,7 @@ class Characterizer:
                 self.report["aborted"] = "operator did not confirm"
                 self.save()
                 return self.report
-            self.ui.info("Going to the home position...")
-            self.go_home()
+            self.section("home", self.home_section)
             self.section("feedback", self.feedback)
             self.section("speed_table", self.speed_table)
             self.section("latency", self.latency)
@@ -303,10 +327,19 @@ class Characterizer:
         except KeyboardInterrupt:
             self.report["aborted"] = "interrupted (Ctrl+C)"
             self.ui.info("\nInterrupted: stopping the camera and writing what was measured.")
+        except Exception as exc:  # noqa: BLE001 - whatever happens, the report and summary still get written
+            self.report["aborted"] = f"error outside the sections: {exc!r}"
+            self.report["abort_traceback"] = traceback.format_exc()
+            self.ui.info(f"\nUnexpected error ({exc!r}): stopping the camera and writing what was measured.")
         finally:
             self.safe_stop()
         self.report["model"] = self.build_model().to_dict()
-        branch, reason = ba.verdict(self.while_moving, self.max_rate_hz)
+        stats = getattr(self.ptz, "stats", None)  # the real driver counts timeouts, unmatched replies, retries...
+        if isinstance(stats, dict):
+            self.report["driver_stats"] = dict(stats)
+            self.report["driver_stats"]["sequence_echo"] = getattr(self.ptz, "sequence_echo", None)
+        branch, reason = ba.verdict(self.while_moving, self.max_rate_hz, self.updates_at_max_rate_hz,
+                                    refresh_hz=self.update_rate_hz)
         self.report["verdict"] = {"branch": branch, "reason": reason}
         self.save()
         return self.report
@@ -320,13 +353,18 @@ class Characterizer:
         info["max_speed_inquiry"] = list(max_speed) if max_speed else "unsupported"
         version = self.ptz.inquire_version() if hasattr(self.ptz, "inquire_version") else None
         info["version_raw"] = version.hex(" ") if version else "unsupported"
-        pan_max, tilt_max = 24, 23
+        pan_max, tilt_max, source = DEFAULT_PAN_STEP_MAX, DEFAULT_TILT_STEP_MAX, "default (no usable max-speed answer)"
         if max_speed and 1 <= max_speed[0] <= 0x18 and 1 <= max_speed[1] <= 0x18:
-            pan_max, tilt_max = max_speed
+            pan_max, tilt_max, source = max_speed[0], min(max_speed[1], 0x17), "max-speed inquiry"
+        if self.o.pan_max_step or self.o.tilt_max_step:
+            source = "command line"
         self.pan_max = self.o.pan_max_step or pan_max
         self.tilt_max = self.o.tilt_max_step or tilt_max
+        if hasattr(self.ptz, "set_step_max"):
+            self.ptz.set_step_max(self.pan_max, self.tilt_max)  # the driver clamps every speed to these
         info["pan_max_step_used"] = self.pan_max
         info["tilt_max_step_used"] = self.tilt_max
+        info["max_step_source"] = source
         rest = self.ptz.inquire_pan_tilt()
         self.pt_inquiry = rest is not None
         info["pan_tilt_at_start"] = list(rest) if rest else None
@@ -359,44 +397,59 @@ class Characterizer:
         all_answered = all_sent = 0
         any_change = False
         best: float | None = None
+        best_updates_hz: float | None = None
         rtts: list[float] = []
         for i, rate in enumerate(FEEDBACK_RATES_HZ):
             direction = 1 if i % 2 == 0 else -1
             self.ptz.pan_tilt_velocity(direction * step, 0, ttl=3.0)
-            self.sleep(0.4)  # past latency and ramp
+            self.sleep(0.4)  # past latency and ramp: from here on the speed is constant
             polls, _ = self.poll(rate, 1.5, self.ptz.inquire_pan_tilt)
-            self.ptz.stop()
+            self.safe_stop()
             self.sleep(0.6)
             samples = _axis_samples(polls, 0)
-            n_answered = len(samples)
-            changed = len({v for _, v in samples}) > 1
-            elapsed = (polls[-1].done - polls[0].sent) if polls else 0.0
-            answered_hz = (n_answered - 1) / elapsed if elapsed > 0 and n_answered > 1 else 0.0
-            fraction = n_answered / len(polls) if polls else 0.0
-            ok = fraction >= 0.9 and answered_hz >= 0.8 * rate and changed
-            if ok:
+            # The rules (answers, updates, smoothness, jumps) live in bench_analysis.judge_feedback_rate.
+            judged = ba.judge_feedback_rate(rate, len(polls), samples)
+            if judged["ok"]:
                 best = float(rate)
-            all_answered += n_answered
+                best_updates_hz = judged["updates_hz"]
+            all_answered += len(samples)
             all_sent += len(polls)
-            any_change = any_change or changed
+            any_change = any_change or ba.value_changes(samples) > 0
             rtts += [(p.done - p.sent) * 1000 for p in polls if p.value is not None]
-            per_rate[str(rate)] = {
-                "sent": len(polls), "answered": n_answered, "answered_fraction": _r(fraction),
-                "answered_hz": _r(answered_hz, 1), "value_changes": changed,
-                "smoothness_cv": _r(ba.smoothness_cv(samples)), "jumps": ba.count_jumps(samples), "ok": ok,
-            }
-            self.ui.info(f"  {rate:>2} Hz while panning: answered {n_answered}/{len(polls)} "
-                         f"({answered_hz:.1f} Hz), changes: {changed}, ok: {ok}")
+            per_rate[str(rate)] = {"sent": len(polls), "answered": len(samples), **judged}
+            self.ui.info(f"  {rate:>2} Hz while panning: {judged['answers_hz']} answers/s, {judged['updates_hz']} "
+                         f"updates/s, cv {judged['smoothness_cv']}, jumps {judged['jumps']}: "
+                         f"{'ok' if judged['ok'] else 'NOT ok'} ({judged['why']})")
         self.go_home()
         self.while_moving = ba.classify_feedback(all_answered / all_sent if all_sent else 0.0, any_change)
         self.max_rate_hz = best if self.while_moving == "yes" else None
+        # How often the position really changes: while polling at the best passing rate (the verdict needs it),
+        # and the most seen at any rate (for a stale-cache camera, that is its refresh rate).
+        seen_updates = [row["updates_hz"] for row in per_rate.values()]
+        self.updates_at_max_rate_hz = best_updates_hz if self.max_rate_hz is not None else None
+        self.update_rate_hz = max(seen_updates) if seen_updates and self.while_moving == "yes" else None
+        # A stale cache: the camera answers far more often than its value changes, at the fastest rate it answers.
+        fastest = per_rate.get(str(FEEDBACK_RATES_HZ[-1]), {})
+        self.refresh_limited = bool(
+            self.while_moving == "yes" and fastest and fastest["answers_hz"] > 0
+            and fastest["change_fraction"] < ba.MIN_CHANGE_FRACTION * (fastest["expected_change_fraction"] or 1.0))
+        if self.update_rate_hz:
+            # Between refreshes a moving camera's report holds still; don't mistake that for "at rest".
+            self.settle_stable_s = max(SETTLE_STABLE_S, 2.5 / self.update_rate_hz)
         result.update({
             "while_moving": self.while_moving,
             "test_step": step,
             "rates": per_rate,
             "max_rate_hz": self.max_rate_hz,
+            "update_rate_hz": self.update_rate_hz,
+            "updates_at_max_rate_hz": self.updates_at_max_rate_hz,
+            "refresh_limited": self.refresh_limited,
             "round_trip_ms_p50": _r(ba.percentile(rtts, 50), 1),
             "round_trip_ms_p95": _r(ba.percentile(rtts, 95), 1),
+            "rules": "a rate is ok when >= 90% of inquiries are answered at >= 80% of the asked rate, the value "
+                     "changes on >= 70% of the answers where a live report would, the motion is smooth (cv <= "
+                     f"{ba.SMOOTH_CV_LIMIT} or within {ba.QUANTIZATION_UNITS:g} unit of a straight line) and "
+                     "there are no jumps",
             "freshness_note": "answers are at most one round trip old as seen from here; "
                               "the camera's own encoder-read delay is not measurable from inquiries alone",
         })
@@ -410,7 +463,7 @@ class Characterizer:
     # --- 2. speed table --------------------------------------------------------------------------------------
 
     def speed_table(self) -> dict[str, Any]:
-        if self.while_moving == "yes":
+        if self.while_moving == "yes" and self.max_rate_hz is not None:
             method = "moving"
         elif self.pt_inquiry:
             method = "timed"
@@ -426,14 +479,19 @@ class Characterizer:
             estimate: float | None = None
             for step in steps:
                 duration = 3.0 if estimate is None else min(3.0, max(0.8, travel / estimate))
-                row = (self._rate_moving(axis, step, duration) if method == "moving"
-                       else self._rate_timed(axis, step, duration))
+                row = (self._rate_moving(axis, step, duration, travel) if method == "moving"
+                       else self._rate_timed(axis, step, duration, travel))
                 rows[str(step)] = row
                 for sign in ("+", "-"):
-                    rate = row.get(sign, {}).get("rate")
-                    if rate is not None:
-                        self.rates.setdefault(f"{axis_name}{sign}", {})[step] = rate
-                rates_here = [abs(row[s]["rate"]) for s in ("+", "-") if row.get(s, {}).get("rate")]
+                    cell = row.get(sign, {})
+                    if cell.get("hit_limit"):
+                        # It ran into the end stop during the measurement: the rate is wrong, leave it out.
+                        cell["excluded"] = "hit the travel limit"
+                        continue
+                    if cell.get("rate") is not None:
+                        self.rates.setdefault(f"{axis_name}{sign}", {})[step] = cell["rate"]
+                rates_here = [abs(row[s]["rate"]) for s in ("+", "-")
+                              if row.get(s, {}).get("rate") and not row[s].get("hit_limit")]
                 if rates_here:
                     estimate = max(rates_here) * 1.3  # the next step is faster
                 self.ui.info(f"  {axis_name} step {step:>2}: + {(row.get('+') or {}).get('rate')}, "
@@ -441,15 +499,31 @@ class Characterizer:
             result[axis_name] = rows
             result[f"{axis_name}_min_smooth_step"] = self._min_smooth_step(rows, method)
             result[f"{axis_name}_sign"] = self._sign(axis_name)
+        result["rehomes"] = self.rehomes
         self.go_home()
         return result
+
+    def _rehome_if_drifted(self, axis: int, travel: float) -> None:
+        """Go home first if the camera has drifted more than REHOME_DRIFT_FRACTION x `travel` from home on `axis`.
+
+        Called at the start of each step. A step moves + then - by about the same amount, but an asymmetric camera
+        (faster one way) drifts a bit every step. Left alone, the drift adds up until a measurement runs into the
+        end stop. Checking only when drifted keeps the run short: a symmetric camera rarely needs it."""
+        if self.home_pose is None:
+            return
+        where = self.ptz.inquire_pan_tilt()
+        if where is not None and abs(where[axis] - self.home_pose[axis]) > REHOME_DRIFT_FRACTION * travel:
+            self.rehomes += 1
+            self.go_home()
 
     def _velocity(self, axis: int, step: int, ttl: float) -> Any:
         return self.ptz.pan_tilt_velocity(step if axis == 0 else 0, step if axis == 1 else 0, ttl=ttl)
 
-    def _rate_moving(self, axis: int, step: int, duration: float) -> dict[str, Any]:
+    def _rate_moving(self, axis: int, step: int, duration: float, travel: float) -> dict[str, Any]:
         row: dict[str, Any] = {"duration_s": round(duration, 2)}
         for sign, direction in (("+", 1), ("-", -1)):
+            if sign == "+":  # + then - comes back to about where it started; check drift once per step
+                self._rehome_if_drifted(axis, travel)
             polls, actions = self.poll(self.poll_hz, duration + 0.6, self.ptz.inquire_pan_tilt, [
                 (0.0, lambda d=direction: self._velocity(axis, d * step, duration + 1.0)),
                 (duration, self.ptz.stop),
@@ -466,7 +540,11 @@ class Characterizer:
             tail_rate = ba.fit_rate(tail)
             row[sign] = {
                 "rate": _r(rate, 2),
+                # Smooth = even interval rates, or every sample within 1 unit of a straight line. The second matters
+                # at slow speeds: whole-unit positions (0, 0, 1, 1, 2...) make even a perfect move look jerky by cv.
+                "smooth": ba.is_smooth(window),
                 "smoothness_cv": _r(ba.smoothness_cv(window)),
+                "fit_residual_max": _r(ba.fit_residual_max(window), 2),
                 "travel": (samples[-1][1] - samples[0][1]) if samples else None,
                 "hit_limit": bool(rate and tail_rate is not None and abs(tail_rate) < 0.5 * abs(rate)),
                 "samples": len(window),
@@ -474,7 +552,7 @@ class Characterizer:
             self.sleep(0.3)
         return row
 
-    def _rate_timed(self, axis: int, step: int, duration: float) -> dict[str, Any]:
+    def _rate_timed(self, axis: int, step: int, duration: float, travel_budget: float) -> dict[str, Any]:
         """Position readable only at rest: two timed moves (T and 2T) per direction. The difference of the two
         travels divided by T is the steady rate, free of latency and ramp; what's left over is the effective lag."""
         short, long_ = duration / 2, duration
@@ -482,6 +560,8 @@ class Characterizer:
         rejected: dict[str, str] = {}
         for seconds in (short, long_):
             for sign, direction in (("+", 1), ("-", -1)):
+                if sign == "+":  # + then - comes back to about where it started; check drift once per pair
+                    self._rehome_if_drifted(axis, travel_budget)
                 _, before = self.wait_at_rest()
                 result = self._velocity(axis, direction * step, seconds + 1.0)
                 if not result.ok:
@@ -512,9 +592,9 @@ class Characterizer:
             for sign in ("+", "-"):
                 cell = row.get(sign) or {}
                 rate = cell.get("rate")
-                if not rate:
+                if not rate or cell.get("hit_limit"):
                     ok = False
-                elif method == "moving" and (cell.get("smoothness_cv") is None or cell["smoothness_cv"] > SMOOTH_CV_LIMIT):
+                elif method == "moving" and cell.get("smooth") is not True:
                     ok = False
             if ok:
                 return int(step)
@@ -698,7 +778,8 @@ class Characterizer:
         at_rest = self.ptz.inquire_zoom()
         result["inquiry_at_rest"] = at_rest is not None
         if at_rest is None:
-            result["note"] = "zoom inquiry unsupported: range, zoom_direct accuracy and FOV positions need a human"
+            result["note"] = ("zoom inquiry unsupported: range and zoom_direct accuracy need a human; FOV stops use "
+                              "commanded zoom_direct positions over an assumed range")
         # While zooming.
         self.ptz.zoom_velocity(-7, ttl=6.0)
         self.sleep(4.0)
@@ -711,6 +792,7 @@ class Characterizer:
         result["inquiry_while_zooming"] = (ba.classify_feedback(fraction, len({v for _, v in samples}) > 1)
                                            if at_rest is not None else "unsupported")
         if at_rest is None:
+            self._blind_fov_stops(result)
             self.ptz.zoom_velocity(-7, ttl=6.0)
             self.sleep(5.0)
             self.ptz.zoom_stop()
@@ -777,6 +859,29 @@ class Characterizer:
             self.ptz.zoom_direct(wide)
             self._zoom_wait_stable()
         return result
+
+    def _blind_fov_stops(self, result: dict[str, Any]) -> None:
+        """FOV screenshot stops for a camera whose zoom can't be read: command 9 zoom_direct positions across the
+        assumed range (`--zoom-tele`, default 0x4000, the usual VISCA tele end) and wait a fixed time at each. The
+        positions are what was commanded, not read back. If the camera refuses zoom_direct, there are no stops."""
+        tele = self.o.zoom_tele_assumed
+        positions = [int(tele * k / 8) for k in range(9)]
+        done = []
+        for pos in positions:
+            command = self.ptz.zoom_direct(pos)
+            if not command.ok:
+                result["fov_note"] = f"zoom_direct refused ({command.status}): no FOV stops possible"
+                break
+            self.sleep(ZOOM_DIRECT_WAIT_S)
+            done.append(pos)
+            if self.o.fov_pauses:
+                self.ui.pause(f"  zoom commanded to {pos} (can't be read back): take a screenshot for the FOV")
+            else:
+                self.ui.info(f"  FOV stop: zoom commanded to {pos}")
+        result["fov_positions"] = done
+        result["fov_positions_source"] = f"commanded (zoom inquiry unsupported), assumed range 0..{tele}"
+        result["zoom_direct_supported"] = bool(done)
+        result.setdefault("fov_note", "FOV per position is measured by hand from the screenshots; fill it in the report")
 
     def _zoom_to_end(self, step: int) -> int | None:
         """Zoom at full speed until the reported zoom stops changing (max 12 s); the end position."""
@@ -939,6 +1044,8 @@ class Characterizer:
         elif self.while_moving == "frozen":
             m.inquiry_mode = "frozen_while_moving"
         m.inquiry_poll_hz = self.max_rate_hz
+        if self.refresh_limited and self.update_rate_hz:
+            m.inquiry_refresh_hz = self.update_rate_hz
         zoom = r.get("zoom", {})
         if zoom.get("inquiry_at_rest") is False:
             m.zoom_inquiry_mode = "never"
@@ -959,6 +1066,7 @@ class Characterizer:
         rep = r.get("repeatability", {})
         if rep.get("settle_s_p90") is not None:
             m.preset_settle_s = rep["settle_s_p90"]
+            m.preset_settle_measured = True  # the simulator's recalls then take this long
         units = r.get("units", {})
         for axis in ("pan", "tilt"):
             if units.get(f"{axis}_units_per_degree"):
@@ -986,9 +1094,14 @@ def summarize(report: dict[str, Any]) -> str:
     home = report.get("home_command", {})
     if home and home.get("status") not in ("acked", "completed"):
         lines.append(f"!! home command not accepted ({home.get('status')}): measured from wherever the camera was")
-    for name in ("feedback", "speed_table", "latency", "absolute", "zoom", "repeatability", "units"):
+    for name in ("home", "feedback", "speed_table", "latency", "absolute", "zoom", "repeatability", "units"):
         if isinstance(report.get(name), dict) and "error" in report[name]:
             lines.append(f"!! section {name} failed: {report[name]['error']}")
+
+    conn = report.get("connection", {})
+    if conn.get("pan_max_step_used"):
+        lines.append(f"Top speed steps used: pan {conn['pan_max_step_used']}, tilt {conn['tilt_max_step_used']} "
+                     f"({conn.get('max_step_source')})")
 
     fb = report.get("feedback", {})
     if fb:
@@ -997,10 +1110,13 @@ def summarize(report: dict[str, Any]) -> str:
         lines.append("1. Feedback")
         lines.append(f"   pan/tilt inquiry at rest: {'yes' if at_rest.get('supported') else 'NO'} "
                      f"(answered {at_rest.get('answered')}, round trip p50 {at_rest.get('round_trip_ms_p50')} ms)")
-        lines.append(f"   while moving: {fb.get('while_moving')}; reliable up to: {fb.get('max_rate_hz')} Hz")
+        lines.append(f"   while moving: {fb.get('while_moving')}; live feedback up to: {fb.get('max_rate_hz')} Hz; "
+                     f"position updates at {fb.get('update_rate_hz')} Hz"
+                     + (" (STALE CACHE: answers faster than the position refreshes)" if fb.get("refresh_limited") else ""))
         for rate, row in (fb.get("rates") or {}).items():
-            lines.append(f"     {rate:>2} Hz: answered {row['answered']}/{row['sent']} ({row['answered_hz']} Hz), "
-                         f"changes {row['value_changes']}, jumps {row['jumps']}, cv {row['smoothness_cv']}")
+            lines.append(f"     {rate:>2} Hz: {row.get('answers_hz')} answers/s ({row['answered']}/{row['sent']}), "
+                         f"{row.get('updates_hz')} updates/s, cv {row.get('smoothness_cv')}, jumps {row.get('jumps')}: "
+                         f"{'ok' if row.get('ok') else 'NOT ok'} ({row.get('why')})")
         lines.append(f"   zoom inquiry at rest: {'yes' if fb.get('zoom_at_rest', {}).get('supported') else 'no'}")
 
     st = report.get("speed_table", {})
@@ -1024,7 +1140,9 @@ def summarize(report: dict[str, Any]) -> str:
     lat = report.get("latency", {})
     if lat:
         lines.append("")
-        if lat.get("method") == "polling":
+        if lat.get("skipped"):
+            lines.append("3. Latency: skipped")
+        elif lat.get("method") == "polling":
             lines.append(f"3. Latency (polled at {lat.get('poll_hz')} Hz, resolution {lat.get('resolution_s')} s): "
                          f"start {lat.get('latency_s_p50')} s, ramp {lat.get('ramp_s_p50')} s, "
                          f"stop {lat.get('stop_latency_s_p50')} s, stop ramp {lat.get('stop_ramp_s_p50')} s")
@@ -1053,7 +1171,8 @@ def summarize(report: dict[str, Any]) -> str:
             lines.append(f"   zoom_direct {d.get('target')}: {d.get('status')}, arrived {d.get('arrival_s')} s, "
                          f"error {d.get('error')}")
         if z.get("fov_positions"):
-            lines.append(f"   FOV screenshot positions: {z['fov_positions']}")
+            source = f" ({z['fov_positions_source']})" if z.get("fov_positions_source") else ""
+            lines.append(f"   FOV screenshot positions: {z['fov_positions']}{source}")
 
     rep = report.get("repeatability", {})
     if rep and "recalls" in rep:
@@ -1067,6 +1186,17 @@ def summarize(report: dict[str, Any]) -> str:
         lines.append("")
         lines.append(f"7. Units: pan {u.get('pan_units_per_degree')} units/deg ({u.get('pan_source')}), "
                      f"tilt {u.get('tilt_units_per_degree')} units/deg ({u.get('tilt_source')})")
+
+    ds = report.get("driver_stats")
+    if ds:
+        lines.append("")
+        lines.append(f"Driver: {ds.get('sent')} sent, {ds.get('timeouts')} timeouts, {ds.get('errors')} errors, "
+                     f"{ds.get('unmatched_replies')} unmatched replies, {ds.get('ttl_stops')} dead-man stops, "
+                     f"{ds.get('stop_retries')} stop retries, {ds.get('stop_failures')} stops given up; camera echoes "
+                     f"sequence numbers: {ds.get('sequence_echo')}")
+        if ds.get("unmatched_replies") and ds.get("sequence_echo") is not False:
+            lines.append("   !! replies with sequence numbers never sent were dropped: another program talking to "
+                         "the camera, or very late replies? Check visca_log.jsonl")
 
     v = report.get("verdict", {})
     lines.append("")
@@ -1086,14 +1216,16 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     ap.add_argument("--timeout", type=float, default=0.2, help="reply timeout per command, s (default 0.2)")
     ap.add_argument("--home-preset", type=int, help="preset (0-based) to use as home; default: VISCA home command")
     ap.add_argument("--repeat-preset", type=int, help="preset (0-based) for the repeatability test; default: home")
-    ap.add_argument("--pan-max-step", type=int, help="top pan speed step (default: ask the camera, else 24)")
-    ap.add_argument("--tilt-max-step", type=int, help="top tilt speed step (default: ask the camera, else 23)")
+    ap.add_argument("--pan-max-step", type=int, help="top pan speed step (default: ask the camera, else 24 = 0x18)")
+    ap.add_argument("--tilt-max-step", type=int, help="top tilt speed step (default: ask the camera, else 20 = 0x14)")
     ap.add_argument("--quick", action="store_true", help="measure ~10 speed steps per axis instead of all")
     ap.add_argument("--pan-travel", type=float, default=1200.0, help="raw units per speed measurement (pan)")
     ap.add_argument("--tilt-travel", type=float, default=400.0, help="raw units per speed measurement (tilt)")
     ap.add_argument("--no-fov-pauses", action="store_true", help="don't stop for FOV screenshots")
     ap.add_argument("--pan-units-per-degree", type=float, help="documented raw units per degree (pan)")
     ap.add_argument("--tilt-units-per-degree", type=float, help="documented raw units per degree (tilt)")
+    ap.add_argument("--zoom-tele", type=lambda text: int(text, 0), default=0x4000,
+                    help="tele end of the zoom range for the FOV stops if zoom inquiry doesn't work (default 0x4000)")
     ap.add_argument("--skip", default="", help="comma-separated sections to skip, e.g. zoom,units")
     ap.add_argument("--yes", action="store_true", help="don't ask anything: confirm the move, skip pauses and units")
     return ap.parse_args(argv)
@@ -1111,7 +1243,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         tilt_max_step=args.tilt_max_step, quick=args.quick, pan_travel=args.pan_travel, tilt_travel=args.tilt_travel,
         fov_pauses=not args.no_fov_pauses and not args.yes, pan_units_per_degree=args.pan_units_per_degree,
         tilt_units_per_degree=args.tilt_units_per_degree,
-        skip=tuple(s.strip() for s in args.skip.split(",") if s.strip()),
+        skip=tuple(s.strip() for s in args.skip.split(",") if s.strip()), zoom_tele_assumed=args.zoom_tele,
     )
     ui: Any = ScriptedUI() if args.yes else ConsoleUI()
     if args.yes:
@@ -1120,8 +1252,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         bench = Characterizer(ptz, clock, ui, options, out, camera_info={"ip": args.ip, "port": args.port})
         report = bench.run()
-        report["driver_stats"] = dict(ptz.stats)
-        bench.save()
     finally:
         ptz.close()
     text = summarize(report)

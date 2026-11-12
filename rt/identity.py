@@ -20,13 +20,15 @@ from .models import Recognizer, RosterScorer, YoloOnnx, enlarge, plain, vote_box
 
 
 class IdentityWorker(threading.Thread):
-    def __init__(self, cfg, roster, teams, emit, log=print):
+    def __init__(self, cfg, roster, teams, emit, log=print, panel=None, recognizer=None):
+        """panel / recognizer: model objects to use instead of loading the ONNX files (tests pass fakes)."""
         super().__init__(daemon=True)
         m, r, i = cfg["models"], cfg["runtime"], cfg["identity"]
         th, spin = int(r["threads_identity"]), bool(r["ort_spinning"])
-        self.panel = YoloOnnx(m["panel_detector"], int(m["panel_imgsz"]), th, rect=bool(i["panel_rect"]),
-                              spinning=spin, backend=r["id_backend"], device=r["id_device"], log=log)
-        self.rec = Recognizer(m["recognizer"], th, spin, backend=r["id_backend"], device=r["id_device"], log=log)
+        self.panel = panel or YoloOnnx(m["panel_detector"], int(m["panel_imgsz"]), th, rect=bool(i["panel_rect"]),
+                                       spinning=spin, backend=r["id_backend"], device=r["id_device"], log=log)
+        self.rec = recognizer or Recognizer(m["recognizer"], th, spin, backend=r["id_backend"], device=r["id_device"],
+                                            log=log)
         self.roster, self.teams = roster, teams
         self.scorer = RosterScorer(roster)
         self.rule = vote_rule(cfg)
