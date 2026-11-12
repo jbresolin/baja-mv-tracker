@@ -42,9 +42,9 @@ def board_running(cfg, seconds=12.0, fps=10):
     b = StatusBoard(cfg, clock)
     b.capture, b.recorder = FakeCapture(), FakeRecorder()
     img = np.zeros((90, 160, 3), np.uint8)
-    for k in range(int(seconds * fps)):
+    for frame_no in range(int(seconds * fps)):
         clock.advance(1.0 / fps)
-        b.on_frame(make_frame(clock.wall(), k, img))
+        b.on_frame(make_frame(clock.wall(), frame_no, img))
     return b, clock
 
 

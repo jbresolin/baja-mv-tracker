@@ -136,9 +136,9 @@ def test_frames_carry_wall_and_monotonic_time_of_their_grab(cfg):
     clock = FakeClock(wall=1_800_000_000.0, mono=500.0)
     cam = FakeCamera(fps=30, clock=clock, n_frames=30)
     _, frames, _ = run_capture(cfg, cam, clock)
-    for fr, grab_no in zip(frames, range(0, 30, 3)):
-        assert fr.t == pytest.approx(1_800_000_000.0 + (grab_no + 1) / 30 - 0.05)
-        assert fr.t_cap == pytest.approx(500.0 + (grab_no + 1) / 30)   # monotonic time of the same grab
+    for fr, camera_frame_no in zip(frames, range(0, 30, 3)):
+        assert fr.t == pytest.approx(1_800_000_000.0 + (camera_frame_no + 1) / 30 - 0.05)
+        assert fr.t_cap == pytest.approx(500.0 + (camera_frame_no + 1) / 30)   # monotonic time of the same grab
 
 
 def test_clock_map_is_logged_once_a_minute(cfg):

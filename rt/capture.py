@@ -74,7 +74,7 @@ def overlay_start(path, log=print):
     except Exception as e:  # noqa: BLE001
         log("clock overlay reader unavailable: %s" % e)
         return None
-    r = []
+    starts = []                       # time of day at pts 0, from each of the two readings
     for t in (0.5, 2.5):
         f = clock.grab(path, t)
         if f is None:
@@ -82,10 +82,10 @@ def overlay_start(path, log=print):
         s, mg = clock.read(f)
         if s is None or mg < 0.03:
             return None
-        r.append(s - t)
-    if abs(r[0] - r[1]) > 0.2:
+        starts.append(s - t)
+    if abs(starts[0] - starts[1]) > 0.2:
         return None
-    return r[0]
+    return starts[0]
 
 
 def file_start_epoch(path, info, mode, log=print):
@@ -150,8 +150,8 @@ def parse_start(s, base_epoch):
         return None
     if ":" not in str(s):
         return float(s)
-    p = [float(x) for x in s.split(":")]
-    tod = p[0] * 3600 + p[1] * 60 + (p[2] if len(p) > 2 else 0)
+    parts = [float(x) for x in s.split(":")]
+    tod = parts[0] * 3600 + parts[1] * 60 + (parts[2] if len(parts) > 2 else 0)
     d0 = dt.datetime.fromtimestamp(base_epoch).astimezone()
     midnight = d0.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
     return midnight + tod - base_epoch
@@ -342,20 +342,20 @@ class StreamCapture(Capture):
             cmd += ["-rtsp_transport", "tcp"]
         cmd += ["-i", str(self.url), "-vf", "fps=%g,scale=%d:%d" % (self.det_fps, self.w, self.h),
                 "-an", "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
-        n = self.w * self.h * 3
-        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=n * 2)
+        frame_bytes = self.w * self.h * 3
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=frame_bytes * 2)
         if self.cfg["runtime"].get("affinity_decoder", True):
             set_affinity(self.proc.pid, self.cfg["runtime"].get("affinity"), self.log)
         lat = float(c["live_latency_s"])
-        t_start, k = time.time(), 0
+        t_start, frame_no = time.time(), 0
         while not self.stop_ev.is_set():
-            buf = self.proc.stdout.read(n)
-            if len(buf) < n:
+            buf = self.proc.stdout.read(frame_bytes)
+            if len(buf) < frame_bytes:
                 break
             now = time.time()
             img = np.frombuffer(buf, np.uint8).reshape(self.h, self.w, 3)
-            self._push(Frame(img, now - lat + self.offset, now - t_start, k, time.monotonic()), block=False)
-            k += 1
+            self._push(Frame(img, now - lat + self.offset, now - t_start, frame_no, time.monotonic()), block=False)
+            frame_no += 1
         self.proc.stdout.close()
         self.proc.wait()
 

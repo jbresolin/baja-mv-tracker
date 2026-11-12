@@ -261,8 +261,8 @@ def list_cameras(cfg):
               "camera.device. Names are not used: identical webcams share a name.")
     else:
         by_id = Path("/dev/v4l/by-id")
-        for p in sorted(by_id.glob("*")) if by_id.exists() else []:
-            print("%s -> %s" % (p, p.resolve()))
+        for link in sorted(by_id.glob("*")) if by_id.exists() else []:
+            print("%s -> %s" % (link, link.resolve()))
         print("Linux: put a /dev/v4l/by-id/... path in camera.device (stable across replugs).")
 
 

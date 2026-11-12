@@ -145,9 +145,9 @@ class StatusBoard:
     def fps(self):
         now = self.clock.mono()
         with self.lock:
-            n = sum(1 for m in self.frame_monos if now - m <= self.window_s)
+            n_recent = sum(1 for m in self.frame_monos if now - m <= self.window_s)
         span = min(self.window_s, max(1e-9, now - self.started_mono))
-        return round(n / span, 2) if n else 0.0
+        return round(n_recent / span, 2) if n_recent else 0.0
 
     def payload(self):
         cap = self.capture
@@ -173,7 +173,7 @@ class StatusBoard:
         with self.lock:
             passes = [dict(p, t_enter_iso=iso(p["t_enter"]), t_cross_iso=iso(p["t_cross"]), thumb_iso=iso(p["thumb_t"]),
                            thumb_url=("/thumb/%d.jpg?v=%.3f" % (p["pass_id"], p["thumb_t"])) if p["thumb_t"] else None)
-                      for p in reversed(self.passes.values())]
+                      for p in reversed(self.passes.values())]   # p = one pass entry
         return dict(now=iso(self.clock.wall()), uptime_s=round(self.clock.mono() - self.started_mono, 1),
                     info=self.info,
                     processing=dict(fps=fps, target_fps=self.target_fps, frames=self.frames,

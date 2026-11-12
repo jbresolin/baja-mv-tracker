@@ -108,7 +108,7 @@ def parse_dshow_list(text):
         m = re.match(r'^\s*Alternative name\s+"(.+)"\s*$', body)
         if m and current is not None:
             current[1] = m.group(1)
-    return [(n, p) for n, p in devices]
+    return [(name, path) for name, path in devices]
 
 
 def resolve_device(spec, backend, ffmpeg="ffmpeg", lister=None):
@@ -129,7 +129,7 @@ def resolve_device(spec, backend, ffmpeg="ffmpeg", lister=None):
             return hits[0]
         if not hits:
             raise CameraError("no DirectShow camera with a device path containing %r (have: %s)" % (
-                s, "; ".join("%d %s %s" % (i, n, p) for i, (n, p) in enumerate(devs)) or "none"))
+                s, "; ".join("%d %s %s" % (i, name, path) for i, (name, path) in enumerate(devs)) or "none"))
         raise CameraError("%d DirectShow cameras match %r: use a longer part of the device path" % (len(hits), s))
     return os.path.realpath(s) if os.path.exists(s) else s
 
@@ -148,7 +148,7 @@ def apply_settings(cap, cv2, settings, log=print):
     is what counts: everything is logged. A setting the camera does not support gives a warning, never an error.
     Returns {name: {"requested", "accepted", "read_back"}}."""
     out = {}
-    order = [k for k in AUTO_FIRST if k in settings] + [k for k in settings if k not in AUTO_FIRST]
+    order = [name for name in AUTO_FIRST if name in settings] + [name for name in settings if name not in AUTO_FIRST]
     for name in order:
         want = settings[name]
         prop = getattr(cv2, "CAP_PROP_" + name.upper(), None)
