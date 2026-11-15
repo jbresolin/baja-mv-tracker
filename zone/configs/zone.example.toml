@@ -100,6 +100,8 @@ corridor_factor = 1.0             # detections farther than factor * corridor ha
 finish_after_s = 3.0              # a track unseen for this long is finished (and teaches the speed profile)
 profile_min_span = 0.3            # ... if it covered at least this much s
 max_prediction_s = 3.0            # cap on predicting a lost car ahead
+ground_window_s = 1.0             # the ground point's image speed (px/s, director.lock_px_s, "gpx" in the log) is
+                                  # measured over this
 
 [speed_profile]
 bin_width = 0.05                  # in s
@@ -142,11 +144,18 @@ zoom_wide = "auto"                # raw zoom of the widest angle ("auto" = repor
 [director]
 s_lock = -0.08                    # lock the first car that reaches this s (= -zone.ease_in: the camera starts there) ...
 lock_window = 0.15                # ... but not one already beyond s_lock + lock_window (too late to catch) ...
-v_min = 0.05                      # ... moving forward at least this fast (s/s) ...
+v_min = 0.05                      # ... moving forward at least this fast (s/s) (or see lock_px_s) ...
 min_updates = 3                   # ... with at least this many detections
 lost_timeout_s = 1.5              # drop the car after this long without a detection
-stopped_v = 0.02
-stopped_timeout_s = 3.0           # drop a car slower than stopped_v for this long
+lock_px_s = 15.0                  # ... or forward and its ground point moving >= this many px/s in the image (an
+                                  # entry the spotter sees head-on, where s grows slowly). 0 = v_min only. Still,
+                                  # don't put the entry on a head-on stretch: the approach speed feeds the camera
+stopped_timeout_s = 3.0           # drop a car that is "stopped" for this long. Stopped = BOTH:
+stopped_v = 0.02                  #  - slow along the path: |v| < stopped_ratio x the learned typical speed at its s
+stopped_ratio = 0.15              #    (zone.speed.json), or |v| < stopped_v (s/s) before the profile has learned;
+stopped_px_s = 8.0                #  - and still in the image: its ground point moved < stopped_px_s px/s over that
+                                  #    time (from where it was when it got slow). s is image arc length, so where the
+                                  #    path runs toward the camera a fast car gains little s: the pixel test keeps it
 off_corridor_frames = 3           # drop a car outside the corridor for more frames than this
 s_exit = 1.0                      # release the car here and go back to the entry
 settle_s = "auto"                 # wait after recalling the entry preset ("auto" = report preset_settle_s, default 1.5)
@@ -219,3 +228,23 @@ detector = "coco"                 # active at a time), for Sunday's default-vs-s
 [profiles.bench_strict.controller]
 dead_reckoning_trust_s = 0.0
 k_quant = 0.0
+
+# Hand-held bench test: a printed picture of a car moved through the corridor by hand. Slower, jerkier, paused and
+# tilted compared with a real car, and the detector loses it more often (blur, the hand covering it). Every drop rule
+# is loosened so the test exercises the PTZ's direction and following rather than the drop rules. NEVER at the race.
+# The detector is not changed: add --set spotter.detector=coco if the Baja detector doesn't see the picture.
+[profiles.bench_hand.director]
+lock_window = 0.3                 # the picture may enter the lock window between two detections
+v_min = 0.02                      # a slow hand still locks...
+lock_px_s = 8.0                   # ... or a hand that visibly moves it forward
+lost_timeout_s = 3.0              # the detector misses a blurred / covered picture for a while (race: 1.5)
+stopped_timeout_s = 6.0           # the hand pauses (race: 3)
+stopped_px_s = 4.0
+off_corridor_frames = 10          # the bottom edge of a hand-held picture wanders off the taught line (race: 3)
+[profiles.bench_hand.progress]
+corridor_factor = 2.0             # accept detections up to 2x the corridor half-width from the line
+window_back_px = 150.0            # the hand moves it backwards a little (race: 40)
+accel_sigma = 1.5                 # jerky: the speed filter follows starts and stops faster (race: 0.4)
+[profiles.bench_hand.controller]
+divergence_deg = 25.0             # the PTZ is close on a bench: the angles change fast (race: 15)
+divergence_cycles = 15            # 1.5 s (race: 5)

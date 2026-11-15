@@ -189,6 +189,59 @@ report too.
   recordings and the replay scores. Profiles live in `[profiles.<name>]` at the end of `zone.example.toml`; `--set`
   still wins over them.
 
+### Which way is right: the pan/tilt sign (`zone/direction.py`)
+
+The controller sends physical directions (+ pan step = turn right), but keyframe poses are the numbers the camera
+reports, and cameras disagree on which way those count. With the wrong `pan_sign` the PTZ turns **away** from the car
+from its first command (Branch B: the whole pass, its dead reckoning uses the same wrong sign and sees nothing; Branch
+A: until the car is dropped). Where the sign comes from, most trusted first, shown on the page ("sinal pan / tilt")
+and in the first line of the control log:
+
+1. `ptz.pan_sign` / `ptz.tilt_sign` in `site.toml` (+1 / -1; default `"auto"`).
+2. Measured while teaching: with the "inquiry" pose source every held jog is a measurement (a right jog after which
+   the reported pan went down = -1). Saved in `zone.json` (`ptz_signs`).
+3. The bench report, only if the bench measured its speed table (`speed_table.pan_sign`).
+4. +1, shown as "PADRÃO, não medido", in red when the keyframes depend on it (taught by inquiry or absolute nudges).
+
+Branch A also checks it live: inquiries showing the camera turning against the sign drop the car (reason
+`wrong_direction`, event `direction_mismatch` that says which key to set).
+
+### Drop rules, and the `bench_hand` profile
+
+A locked car is let go at the exit (`exit`) or dropped: `lost` (no detection for `lost_timeout_s` = 1.5 s),
+`off_corridor` (outside the corridor for more than `off_corridor_frames` = 3 frames), `stopped` (below),
+`gone` (the tracker ended the track), `diverged` (camera > `divergence_deg` from the target for more than
+`divergence_cycles` cycles), `wrong_direction` (above). The page header shows the last one ("último: ..."), the
+events list has every release in pt-BR, and the control log has `{"type": "director", "event": "release", "reason",
+"s", "held_s"}`.
+
+**Stopped** needs both, for `stopped_timeout_s` (3 s): slow along the path (|v| < `stopped_ratio` = 0.15 x the learned
+typical speed at that s, or < `stopped_v` = 0.02 s/s before the speed profile has learned) **and** still in the image
+(the box's bottom centre moved < `stopped_px_s` = 8 px/s over that time). `s` is image arc length: where the path
+runs toward the spotter a car at racing speed gains little s per second, and speed alone would call it stopped. The
+lock accepts `v >= v_min`, or a forward car whose ground point moves >= `lock_px_s` px/s in the image; still, don't
+put the entry on a head-on stretch (the approach speed is what the camera's feed-forward starts from).
+
+**Hand-held bench test** (a printed car moved by hand): with the race rules the first drop is usually `off_corridor`
+(the picture's bottom edge leaves the taught line for 0.3 s), then `lost` (1.5 s without a detection: blur, the hand
+covering it), then `stopped` (a pause over 3 s). `--set profile=bench_hand` loosens all of them (and the divergence
+guard a little) so the test is about the PTZ's direction and following. It doesn't change the detector: add
+`--set spotter.detector=coco` if the Baja detector doesn't see the picture.
+
+### Diagnosing a wrong direction from a run
+
+* Page: health line "sinal pan / tilt" (sign and where it came from; red = not measured or contradicted); events
+  `ptz_signs`, `direction_mismatch`, `divergence`, `release` with the reason.
+* Control log `out/zone/zone_<start>.jsonl`: the first `info` line (`branch`, `pose source`, `pan_sign` and its
+  source); `ptz_signs` / `warning` lines; the `director` `lock` event; then the `cycle` lines after it: `cmd.target.pan`
+  (where the camera should point, in the camera's numbers), `cmd.pan_now.pan` + `.source` (`inquiry` in Branch A,
+  `known` / `dead_reckoning` in B) + `.trusted`, `cmd.steps.pan` (the sign = the physical direction sent: + right),
+  `cmd.ff.pan` / `cmd.fb.pan` (feed-forward and feedback, in the camera's numbers), `cmd.gap.pan`, `cmd.s`, `cmd.v`.
+  Turning toward the car means: `steps.pan` has the sign of `pan_sign x ff.pan`, and (Branch A) `pan_now.pan` moves
+  toward `target.pan` cycle after cycle. If `pan_now.pan` moves away while `steps.pan` keeps its sign, the sign is
+  wrong.
+* With `ptz.command_log` set, every VISCA packet: `81 01 06 01 VV WW 01 ..` = left, `.. 02 ..` = right.
+
 ### Bench detector (COCO, home tests only)
 
 The deployed car detector was trained on Baja buggies and may barely see ordinary street cars. For a bench test with

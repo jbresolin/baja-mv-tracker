@@ -169,6 +169,8 @@ def build(cfg, report: Report = None) -> Settings:
         min_updates=int(d["min_updates"]),
         lost_timeout_s=float(d["lost_timeout_s"]), stopped_v=float(d["stopped_v"]),
         stopped_timeout_s=float(d["stopped_timeout_s"]), off_corridor_frames=int(d["off_corridor_frames"]),
+        stopped_ratio=float(d.get("stopped_ratio", 0.15)), stopped_px_s=float(d.get("stopped_px_s", 8.0)),
+        lock_px_s=float(d.get("lock_px_s", 15.0)),
         s_exit=float(d["s_exit"]), settle_s=float(settle))
 
     p = cfg["progress"]
@@ -177,7 +179,8 @@ def build(cfg, report: Report = None) -> Settings:
         window_back_px=float(p["window_back_px"]), window_ahead_px=float(p["window_ahead_px"]),
         window_sigmas=float(p.get("window_sigmas", 3.0)),
         corridor_factor=float(p["corridor_factor"]), finish_after_s=float(p["finish_after_s"]),
-        profile_min_span=float(p["profile_min_span"]), max_prediction_s=float(p["max_prediction_s"]))
+        profile_min_span=float(p["profile_min_span"]), max_prediction_s=float(p["max_prediction_s"]),
+        ground_window_s=float(p.get("ground_window_s", 1.0)))
 
     s = cfg["speedmap"]
     pan_min = _auto(s["pan_min_smooth_step"], getattr(m, "pan_min_smooth_step", 1) or 1)
