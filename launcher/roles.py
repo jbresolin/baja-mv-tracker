@@ -24,10 +24,26 @@ from launcher.procs import ManagedProcess
 ROLE_NAMES = {"lapline": "Linha de chegada (lap line)", "zone": "Zona PTZ"}
 
 
+def tool_folders(paths):
+    """The folders of the bundled ffmpeg / ffprobe when they are given by full path (installed: INSTALL\\ffmpeg\\bin),
+    else [] (repo mode: a bare "ffmpeg", already found on PATH)."""
+    folders = []
+    for tool in (paths.ffmpeg, paths.ffprobe):
+        if tool and os.path.isabs(str(tool)):
+            folder = os.path.dirname(str(tool))
+            if folder not in folders:
+                folders.append(folder)
+    return folders
+
+
 def child_env(paths, base=None):
     """Environment of every child: the data root, the build's version (rt writes it into its outputs), unbuffered
     UTF-8 output (it goes to a log file), and the NVIDIA GPU hidden (CPU / Intel iGPU only, as the .bat files do;
-    an empty value would be dropped by Windows, hence -1)."""
+    an empty value would be dropped by Windows, hence -1).
+
+    The bundled ffmpeg's folder also goes first on PATH. The roles get its full path in their configs and must use
+    that (rt/tests/test_ffmpeg_paths.py checks the code); this is the second guard, so a bare "ffmpeg" that slips
+    into some code path later still finds the bundled one instead of crashing (or running another ffmpeg)."""
     env = dict(os.environ if base is None else base)
     env.update({
         "BAJAMV_DATA": str(paths.data_root),
@@ -35,6 +51,10 @@ def child_env(paths, base=None):
         "PYTHONUNBUFFERED": "1",
         "PYTHONIOENCODING": "utf-8",
     })
+    folders = tool_folders(paths)
+    if folders:
+        current = [p for p in env.get("PATH", "").split(os.pathsep) if p]
+        env["PATH"] = os.pathsep.join(folders + [p for p in current if p not in folders])
     if paths.installed:
         env["RT_VERSION"] = paths.version
         # Like `python -P`: the current folder / script folder is not put first on the import path, so a child

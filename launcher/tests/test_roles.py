@@ -45,6 +45,24 @@ def test_children_get_the_data_root_and_no_nvidia_gpu(paths):
     assert env["PATH"] == "x"
 
 
+def test_the_bundled_ffmpeg_folder_goes_first_on_the_childrens_path(paths, tmp_path):
+    # Installed, ffmpeg.exe / ffprobe.exe sit in INSTALL\ffmpeg\bin, which is not on the Windows PATH. The roles
+    # get the full path in their configs; as a second guard the launcher also puts that folder first on the PATH
+    # of every child, so a bare "ffmpeg" anywhere still runs the bundled one.
+    import os
+    from dataclasses import replace
+    bundled = tmp_path / "BajaMV" / "ffmpeg" / "bin"
+    installed = replace(paths, installed=True, ffmpeg=str(bundled / "ffmpeg.exe"), ffprobe=str(bundled / "ffprobe.exe"))
+    env = child_env(installed, base={"PATH": os.pathsep.join(["other", str(bundled)])})
+    assert env["PATH"].split(os.pathsep) == [str(bundled), "other"]     # first, and only once
+
+
+def test_a_bare_ffmpeg_name_leaves_path_alone(paths):
+    # Repo mode: ffmpeg is a bare name (already found on PATH): nothing to add.
+    assert paths.ffmpeg == "ffmpeg"
+    assert child_env(paths, base={"PATH": "x"})["PATH"] == "x"
+
+
 def test_a_role_without_saved_settings_does_not_start(paths, fake_system, fake_clock):
     manager = make_manager(paths, fake_system, fake_clock, [])
     ok, message = manager.start("lapline")
