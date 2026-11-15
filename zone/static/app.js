@@ -196,6 +196,7 @@ function render(s) {
   $("#locked").textContent = L ? `carro ${L.id}  s=${L.s.toFixed(2)}  v=${L.v.toFixed(2)}/s${L.predicted ? " (previsto)" : ""}` : "";
   document.querySelectorAll("[data-mode]").forEach((b) => b.classList.toggle("on", b.dataset.mode === d.mode));
   document.querySelector('[data-mode="AUTO"]').disabled = !s.runtime.zone_ready;
+  renderStudio(s.agent);
 
   const z = s.zone, t = s.teach;
   if (document.activeElement !== $("#corridor")) $("#corridor").value = z.corridor;
@@ -251,6 +252,27 @@ function render(s) {
   $("#events").innerHTML = s.events.slice().reverse().map((e) =>
     `<div>${e.wall_iso} ${e.event || e.type} ${e.reason || e.why || ""} ${e.track_id !== undefined ? "carro " + e.track_id : ""}
      ${e.new ? "→ " + e.new : ""} ${e.msg || ""}</div>`).join("");
+}
+
+// the studio (baja-studio) drives this PTZ through the agent API: show what it is doing, and who
+function renderStudio(a) {
+  const el = $("#studioBadge");
+  if (!a || !a.enabled) { el.style.display = "none"; return; }
+  const who = a.holder ? a.holder.replace(/^studio:/, "") : "estúdio";
+  let text = "Estúdio: manual", bg = "#333", fg = "var(--text)";
+  if (a.mode === "auto") { text = "Estúdio: AUTO"; bg = "var(--green)"; }
+  else if (a.mode === "auto_paused") {
+    text = `PAUSADO PELO ESTÚDIO (${who})` + (a.resume_in_s !== null ? ` · volta ao AUTO em ${a.resume_in_s.toFixed(1)} s` : "");
+    bg = "var(--amber)"; fg = "#000";
+  } else if (a.mode === "hold") {
+    text = `ESTÚDIO SEGURA A CÂMERA (HOLD · ${who})`; bg = "var(--amber)"; fg = "#000";
+  } else if (a.studio_moving) { text = `Estúdio movendo a câmera (${who})`; bg = "var(--blue)"; }
+  el.textContent = text + (a.studios ? "" : " · nenhum estúdio conectado");
+  el.style.background = bg; el.style.color = fg; el.style.display = "";
+  // in HOLD only the studio may bring AUTO back (the contract): the page's AUTO is refused
+  const auto = document.querySelector('[data-mode="AUTO"]');
+  if (a.mode === "hold") { auto.disabled = true; auto.title = "O estúdio está segurando a câmera (HOLD): só o estúdio volta ao AUTO"; }
+  else auto.title = "";
 }
 
 async function poll() {
