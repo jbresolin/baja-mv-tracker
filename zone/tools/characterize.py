@@ -51,6 +51,24 @@ ZOOM_DIRECT_WAIT_S = 4.0  # zoom can't be read: wait this long after a zoom_dire
 FIXED_WAIT_S = 5.0  # wait used after a move when position can't be read
 STOP_ATTEMPTS = 3  # safe_stop sends each stop up to this many times until the camera ACKs it
 EPSILON_S = 1e-6  # times this close count as equal (float sums like 0.1 + 0.2 are never exact)
+# At rest a working position inquiry answers (nearly) every time. One that answers only some of the time (the PTZ
+# probed on 2026-11-15: ~17 %) is "unreliable": the bench then treats it as unsupported (fixed waits instead of
+# reading positions), so the run stays short and no number in the report rests on a handful of answers.
+RELIABLE_FRACTION = 0.8
+EXTRA_AT_REST_POLLS = 10  # asked when only some of the first 5 at-rest inquiries were answered...
+EXTRA_AT_REST_SPACING_S = 0.25  # ...spaced out, so a camera with a poll-rate limit isn't judged by overpolling
+ZOOM_AT_REST_POLLS = 5
+# What the operator must measure when the camera gives no position feedback (the speed table can't be read from
+# inquiries). Printed in the summary and kept in the report.
+HAND_SPEED_TABLE = (
+    "The speed table was NOT measured (the model keeps the simulator's default tables) and Branch B lives on it. "
+    "Measure it by hand: put two marks a known angle apart (e.g. 30 deg, the same marks as for units per degree); "
+    "for each speed step you will use (at least 1, 2, 4, 8, 12, 16 and the top step), start the pan a little before "
+    "mark A, time the crosshair from A to B with a stopwatch (or count frames in a PTZ recording; time >= 2 s, "
+    "widen the marks for fast steps), both directions; deg/s = angle / time. Same for tilt. Then write "
+    "model.pan_speed_table / tilt_speed_table in report.json as {step: raw units/s} = deg/s x units per degree "
+    "(the camera's documented units per degree, --pan-units-per-degree / --tilt-units-per-degree), and "
+    "pan_units_per_degree / tilt_units_per_degree too.")
 
 
 # --- talking to the operator --------------------------------------------------------------------------------------
@@ -378,14 +396,28 @@ class Characterizer:
         result: dict[str, Any] = {}
         at_rest = [self._timed(self.ptz.inquire_pan_tilt) for _ in range(5)]
         answered = [p for p in at_rest if p.value is not None]
-        self.pt_inquiry = bool(answered)
+        if len(answered) < len(at_rest):
+            # Not every one answered: ask more (spaced out) before judging whether the inquiry can be relied on.
+            for _ in range(EXTRA_AT_REST_POLLS):
+                self.sleep(EXTRA_AT_REST_SPACING_S)
+                at_rest.append(self._timed(self.ptz.inquire_pan_tilt))
+            answered = [p for p in at_rest if p.value is not None]
+        self.pt_inquiry = len(answered) >= RELIABLE_FRACTION * len(at_rest)
+        unreliable = bool(answered) and not self.pt_inquiry
         result["pan_tilt_at_rest"] = {
             "supported": self.pt_inquiry,
+            "unreliable": unreliable,
             "answered": f"{len(answered)}/{len(at_rest)}",
             "round_trip_ms_p50": _r(ba.percentile([(p.done - p.sent) * 1000 for p in answered], 50), 1),
         }
         zoom_at_rest = [self._timed(self.ptz.inquire_zoom) for _ in range(3)]
         result["zoom_at_rest"] = {"supported": any(p.value is not None for p in zoom_at_rest)}
+        if unreliable:
+            result["while_moving"] = "unreliable"
+            self.while_moving = "unreliable"
+            self.ui.info(f"  pan/tilt inquiry: answered only {len(answered)}/{len(at_rest)} at rest -> unreliable, "
+                         "treated as unsupported (fixed waits, no position readings)")
+            return result
         if not self.pt_inquiry:
             result["while_moving"] = "unsupported"
             self.while_moving = None
@@ -468,7 +500,8 @@ class Characterizer:
         elif self.pt_inquiry:
             method = "timed"
         else:
-            return {"method": "unsupported", "note": "no position inquiry: the speed table needs video analysis"}
+            return {"method": "unsupported", "note": "no position inquiry: the speed table needs video analysis",
+                    "measure_by_hand": HAND_SPEED_TABLE}
         result: dict[str, Any] = {"method": method}
         for axis_name, axis, top, travel, quick in (("pan", 0, self.pan_max, self.o.pan_travel, QUICK_STEPS_PAN),
                                                     ("tilt", 1, self.tilt_max, self.o.tilt_travel, QUICK_STEPS_TILT)):
@@ -776,6 +809,22 @@ class Characterizer:
     def zoom(self) -> dict[str, Any]:
         result: dict[str, Any] = {}
         at_rest = self.ptz.inquire_zoom()
+        if at_rest is not None:
+            # It answered once: does it answer reliably? (One that answers only sometimes would make every wait
+            # below run to its timeout, and its readings would be too few to mean anything.)
+            answers = [at_rest]
+            for _ in range(ZOOM_AT_REST_POLLS - 1):
+                self.sleep(EXTRA_AT_REST_SPACING_S)
+                answers.append(self.ptz.inquire_zoom())
+            answered = [a for a in answers if a is not None]
+            result["inquiry_answered_at_rest"] = f"{len(answered)}/{len(answers)}"
+            if len(answered) < RELIABLE_FRACTION * len(answers):
+                result["inquiry_unreliable"] = True
+                self.ui.info(f"  zoom inquiry: answered only {len(answered)}/{len(answers)} at rest -> unreliable, "
+                             "treated as unsupported")
+                at_rest = None
+            else:
+                at_rest = answered[-1]
         result["inquiry_at_rest"] = at_rest is not None
         if at_rest is None:
             result["note"] = ("zoom inquiry unsupported: range and zoom_direct accuracy need a human; FOV stops use "
@@ -1108,7 +1157,8 @@ def summarize(report: dict[str, Any]) -> str:
         at_rest = fb.get("pan_tilt_at_rest", {})
         lines.append("")
         lines.append("1. Feedback")
-        lines.append(f"   pan/tilt inquiry at rest: {'yes' if at_rest.get('supported') else 'NO'} "
+        lines.append(f"   pan/tilt inquiry at rest: "
+                     f"{'yes' if at_rest.get('supported') else 'UNRELIABLE' if at_rest.get('unreliable') else 'NO'} "
                      f"(answered {at_rest.get('answered')}, round trip p50 {at_rest.get('round_trip_ms_p50')} ms)")
         lines.append(f"   while moving: {fb.get('while_moving')}; live feedback up to: {fb.get('max_rate_hz')} Hz; "
                      f"position updates at {fb.get('update_rate_hz')} Hz"
@@ -1136,6 +1186,8 @@ def summarize(report: dict[str, Any]) -> str:
     elif st:
         lines.append("")
         lines.append(f"2. Speed table: {st.get('method', 'skipped')} {st.get('note', '')}")
+        if st.get("measure_by_hand"):
+            lines.append(f"   !! TO MEASURE BY HAND: {st['measure_by_hand']}")
 
     lat = report.get("latency", {})
     if lat:
@@ -1194,6 +1246,10 @@ def summarize(report: dict[str, Any]) -> str:
                      f"{ds.get('unmatched_replies')} unmatched replies, {ds.get('ttl_stops')} dead-man stops, "
                      f"{ds.get('stop_retries')} stop retries, {ds.get('stop_failures')} stops given up; camera echoes "
                      f"sequence numbers: {ds.get('sequence_echo')}")
+        if ds.get("sequence_echo") is False:
+            lines.append(f"   the camera doesn't number its replies with ours (sequence 0 or its own counter): only "
+                         f"replies of the right kind count; {ds.get('ignored_replies')} ignored, "
+                         f"{ds.get('dropped_waiting')} dropped as late. Many timeouts? Try a longer --timeout")
         if ds.get("unmatched_replies") and ds.get("sequence_echo") is not False:
             lines.append("   !! replies with sequence numbers never sent were dropped: another program talking to "
                          "the camera, or very late replies? Check visca_log.jsonl")

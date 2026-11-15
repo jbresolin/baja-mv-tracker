@@ -179,6 +179,22 @@ def test_ptz_reachable_from_the_probe_and_unreachable_when_it_stops_answering(tm
     assert app.health["ptz_reachable"] is False
 
 
+def test_a_camera_that_acks_inquiries_without_data_is_reachable(tmp_path):
+    # The PTZ probed on 2026-11-15 answers an inquiry with ACK + completion and sends the data only ~17 % of the
+    # time. The driver notes when anything last came from the camera (`last_reply_at`). An inquiry without data from
+    # a camera that is talking must not make it look unplugged: the studio would then see it offline.
+    app, ptz, clock = make_with(tmp_path, lambda sim: SilentPtz(sim, answers=True))
+    app.check_health()                       # it answered once...
+    ptz.answers = False                      # ...then the data stops coming,
+    ptz.last_reply_at = clock.monotonic()    # but its ACKs keep arriving
+    app.check_health()
+    assert app.health["ptz_reachable"] is True and app.health["ptz_reachable_how"] == "probe_reply"
+    # Once nothing at all has come for more than a second, it is unreachable, as before.
+    clock.advance(1.5)
+    app.check_health()
+    assert app.health["ptz_reachable"] is False
+
+
 def test_page_shows_the_three_ptz_states(tmp_path):
     # the page script has a text for each state: unknown, answering, not answering
     js = (Path(__file__).resolve().parent.parent / "static" / "app.js").read_text(encoding="utf-8")

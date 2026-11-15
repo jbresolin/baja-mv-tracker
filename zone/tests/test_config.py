@@ -56,6 +56,24 @@ def test_config_can_force_a_branch_but_not_a_impossible_one(tmp_path):
     assert C.build(C.load(None, ["ptz.report=%s" % g, "controller.branch=A"])).controller.branch == "B"
 
 
+def test_the_bench_report_of_a_camera_like_the_real_ptz_gives_branch_b(tmp_path):
+    # The whole chain for the PTZ probed on 2026-11-15: the bench (through the real driver, against the fake camera
+    # that behaves like it) writes report.json; the zone config built from it is Branch B, even when someone forces
+    # Branch A, so the controller never polls a position (Branch B reads none).
+    from zone.clock import FakeClock
+    from zone.ptz.fake_camera import FakeTransport, FakeViscaCamera
+    from zone.ptz.sim import SimulatedPtz
+    from zone.ptz.visca import ViscaPtz
+    from zone.tools.characterize import BenchOptions, Characterizer, ScriptedUI
+    clock = FakeClock()
+    camera = FakeViscaCamera(SimulatedPtz(PtzModel(), clock)).like_real_ptz(seed=1)
+    ptz = ViscaPtz("fake", clock=clock, transport=FakeTransport(camera, clock), watchdog=False)
+    Characterizer(ptz, clock, ScriptedUI(), BenchOptions(quick=True), tmp_path).run()
+    f = tmp_path / "report.json"
+    assert C.build(C.load(None, ["ptz.report=%s" % f])).controller.branch == "B"
+    assert C.build(C.load(None, ["ptz.report=%s" % f, "controller.branch=A"])).controller.branch == "B"
+
+
 # ------------------------------------------------------------------------------------------------ profiles
 def test_strict_profile_turns_off_both_branch_b_corrections():
     # the default config has both corrections on (feedback on the dead-reckoned pose for 4 s, and the quantization

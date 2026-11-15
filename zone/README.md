@@ -44,9 +44,20 @@ python -m zone.tools.characterize --ip 192.168.1.50 --out reports/smtav-a/
 Dry run without a camera, in two terminals:
 
 ```
-python -m zone.ptz.fake_camera --port 52399 [--inquiry-mode at_rest] [--refresh-hz 2]
+python -m zone.ptz.fake_camera --port 52399 [--inquiry-mode at_rest] [--refresh-hz 2] [--like-real-ptz]
 python -m zone.tools.characterize --ip 127.0.0.1 --port 52399 --out reports/fake --quick --yes
 ```
+
+`--like-real-ptz` makes the fake answer like the race PTZ probed on 2026-11-15 **with its own web page open in a
+browser** (LESSONS.md, "VISCA on the real PTZ" and its same-day correction; with the page closed the real camera
+answers every inquiry, also while moving, so the bench measures it normally; close the camera's web page before
+benching): replies numbered from its own counter, several messages per datagram, late and batched, inquiries answered
+with ACK + completion and position data only now and then (at rest, as a pan/tilt + 7-byte pair, in a later batch).
+The driver handles that camera ("no echo" mode, see `ptz/visca.py`), and the bench calls its inquiry
+**unreliable** (answered < 80% at rest), treats it as unsupported and ends with Branch B in ~3 minutes. Without
+position feedback the speed table can't be measured by the bench: the summary says what to measure by hand
+("TO MEASURE BY HAND") and where to write it in `report.json`. With such a camera, a longer `--timeout` (e.g. 0.6)
+gives fewer timeouts on the bench (its replies take 0-0.5 s).
 
 ## How the bench measures
 
@@ -355,7 +366,9 @@ studio's Cameras page; their moves pause the zone's tracking, which resumes by i
   pushes wait for a studio that doesn't read (events are always kept).
 * Not in this package: image controls (`image_controls: []`, `GET /image` is `{}`), crop (`400 not_supported`).
 * The PTZ counts as offline after 3 failed exchanges in a row (health probe, the agent's position poll, studio
-  commands); commands then answer `503 device_offline`. One answer brings it back.
+  commands); commands then answer `503 device_offline`. One answer brings it back. A timeout from a camera that
+  sent anything at all within the last second (`ViscaPtz.last_reply_at`: a late ACK) is not a failure: the race
+  PTZ replies 0-0.5 s late and sends inquiry data rarely.
 
 ### Conformance (the acceptance test) and end to end, without hardware
 
@@ -375,7 +388,11 @@ Then, from baja-studio's `server` folder (its venv):
 pytest tests/agent_contract --agent-url http://127.0.0.1:8890 --agent-token T
 ```
 
-Expected: all pass, 9 skipped: 5 crop-camera checks (the zone has no crop camera) and 4 that need the fake agent's
+The fake PTZ like the race camera: `prepare ... --like-real-ptz` (a Branch B report: no positions) and
+`camera ... --like-real-ptz`. Then 31 pass, 9 skip, and `test_manual_and_hold_never_resume_auto_by_themselves`
+fails every run: a suite race (see LESSONS.md, 2026-11-15), not the agent.
+
+Expected (the default fake): all pass, 9 skipped: 5 crop-camera checks (the zone has no crop camera) and 4 that need the fake agent's
 failure switches (offline device, tracker not ready, two restarts; the zone's tests cover those). The mode tests run
 (the rig's tracker is ready). `--driver sim` runs the same with the simulator inside the zone process. Against the
 real laptop: `--agent-url http://<laptop>:8890` while the zone runs with its taught zone and the spotter on (the PTZ

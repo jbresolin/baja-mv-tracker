@@ -30,6 +30,7 @@ from zone import config as C  # noqa: E402
 from zone import director as D  # noqa: E402
 from zone import draw  # noqa: E402
 from zone import zonefile  # noqa: E402
+from zone.controller import heard_recently  # noqa: E402
 from zone.progress import profile_path_for  # noqa: E402
 from zone.runtime import ControlLog, ZoneRuntime  # noqa: E402
 from zone.teach import TeachError, TeachSession, make_pose_source  # noqa: E402
@@ -96,7 +97,8 @@ class ZoneApp:
         self.last_frame_mono = clock.monotonic()
         self.recorder = None
         # ptz_reachable: None = unknown (nothing has answered yet), True / False; ptz_reachable_how: "probe" (an
-        # inquiry made by the health check) or "last_command" (the result of the controller's last command)
+        # inquiry made by the health check), "probe_reply" (the probe got an ACK / completion but no data) or
+        # "last_command" (the result of the controller's last command)
         self.health = dict(disk_free_gb=None, ntp_offset_s=None, ntp_server=None, clock_warnings=[],
                            ptz_reachable=None, ptz_reachable_how=None, ptz_probe_wall=None)
         self._probe_answered_once = False    # has this camera ever answered the health probe?
@@ -244,11 +246,18 @@ class ZoneApp:
         Otherwise a harmless inquiry is sent (zoom, then pan/tilt if the camera has no zoom inquiry). If neither is
         answered: when this camera has answered the probe before, it is unreachable now; when it never has (it may
         simply not support inquiries), fall back to the last command's result, which is None until something was
-        sent: "unknown", never a false "reachable"."""
+        sent: "unknown", never a false "reachable".
+
+        A camera that replied *something* during the probe (an ACK, a completion) without the data is reachable
+        ("probe_reply"): the PTZ probed on 2026-11-15 sends the data for only ~17 % of its inquiries, and a missing
+        answer must not make it look unplugged (the studio would see it offline)."""
         ctrl = self.runtime.controller
         d = self.runtime.director
+        last_command = ctrl.ptz_ok
+        if last_command is False and heard_recently(self.ptz, self.clock.monotonic()):
+            last_command = True  # it timed out, but the camera is talking (a late reply): see heard_recently
         if d.mode == D.AUTO and d.sub in (D.TRACKING, D.RETURNING):
-            return ctrl.ptz_ok, "last_command"
+            return last_command, "last_command"
         answer = None
         for inquiry in (self.ptz.inquire_zoom, self.ptz.inquire_pan_tilt):
             try:
@@ -260,9 +269,11 @@ class ZoneApp:
         if answer is not None:
             self._probe_answered_once = True
             return True, "probe"
+        if heard_recently(self.ptz, self.clock.monotonic()):
+            return True, "probe_reply"
         if self._probe_answered_once:
             return False, "probe"
-        return ctrl.ptz_ok, "last_command"
+        return last_command, "last_command"
 
     def ptz_recording_state(self):
         files = sorted(self.out_dir.glob("ptz_*.mkv"), key=lambda p: p.stat().st_mtime)

@@ -26,7 +26,7 @@ from zone.agent.contract import (
     OFFLINE, OK, PRESETS_CHANGED, SEARCHING, TRACKER_ACQUIRED, TRACKER_LOST, TRACKING, AgentError,
 )
 from zone.agent.presets import PresetBook
-from zone.controller import answered
+from zone.controller import answered, heard_recently
 from zone.ptz.sim import DEFAULT_UNITS_PER_DEGREE
 
 ZOOM_RANGE_DEFAULT = (0.0, 16384.0)     # VISCA's usual 0..0x4000, when no report says otherwise
@@ -137,8 +137,9 @@ class ZoneCamera:
             self.emit(DEVICE_ONLINE, {})
 
     def _note_result(self, result) -> bool:
-        """Note what a PTZ call's result says about the device. -> did the camera answer?"""
-        ok = answered(result)
+        """Note what a PTZ call's result says about the device. -> did the camera answer? A timeout from a camera
+        that sent something else within the last second (a late reply) counts as answered: see heard_recently."""
+        ok = answered(result) or heard_recently(self.ptz, self.clock.monotonic())
         self.note_reachable(ok)
         return ok
 
@@ -228,8 +229,9 @@ class ZoneCamera:
         result = self.ptz.preset_store(int(n))
         if not self._note_result(result):
             raise AgentError(DEVICE_OFFLINE_ERROR, "the zone's PTZ did not answer the preset store")
-        if not getattr(result, "ok", True):
-            # it answered, with an error: the camera is there, it just won't store this one
+        if getattr(result, "status", None) == "error":
+            # it answered, with an error: the camera is there, it just won't store this one. (A timeout from a camera
+            # that is talking, see _note_result, is a late reply: the store went out and is taken as done.)
             raise AgentError(BAD_REQUEST, "the zone's PTZ refused to store preset %d (VISCA error %s)"
                              % (n, getattr(result, "error_code", None)))
         preset = self.presets.stored(n)
@@ -288,7 +290,9 @@ class ZoneCamera:
             zoom = self.ptz.inquire_zoom() if pan_tilt is not None else None
         except Exception:  # noqa: BLE001 (no answer: the device status says so)
             pan_tilt = zoom = None
-        self.note_reachable(pan_tilt is not None)   # Branch A: this camera always answers inquiries
+        # Branch A: this camera answers inquiries. A reply without the data (an ACK, a late reply) still proves it
+        # is there: a missing answer is a lost inquiry, not an offline camera.
+        self.note_reachable(pan_tilt is not None or heard_recently(self.ptz, self.clock.monotonic()))
         if pan_tilt is not None:
             if zoom is None:
                 zoom = (self._position_raw or (0, 0, self.zoom_range[0]))[2]

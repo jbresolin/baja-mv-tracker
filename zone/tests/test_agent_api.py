@@ -20,7 +20,7 @@ pytest.importorskip("fastapi")
 
 from zone.agent.camera import speed_step  # noqa: E402
 from zone.ptz.sim import PtzModel, SimulatedPtz  # noqa: E402
-from zone.tests.agent_fixtures import CountingPtz, DeadPtz, RefusingPtz, make_rig  # noqa: E402
+from zone.tests.agent_fixtures import CountingPtz, DeadPtz, LateRepliesPtz, RefusingPtz, make_rig  # noqa: E402
 from zone.zonefile import Zone  # noqa: E402
 
 
@@ -280,6 +280,23 @@ def test_auto_is_refused_while_the_ptz_does_not_answer(tmp_path):
     rig.advance(0.6)                                     # the agent's position poll gets an answer again
     assert rig.agent.camera.state()["status"] == "ok" and ("device_online", {}) in rig.events()
     assert rig.studio.put("/cameras/cam1/mode", json={"mode": "auto"}).status_code == 200
+
+
+def test_a_ptz_whose_replies_come_late_is_not_offline(tmp_path):
+    # The real PTZ replies 0-0.5 s late, so with the driver's 0.2 s timeout many commands "time out" although the
+    # camera got them and keeps talking. Those must not be 503 device_offline (the studio couldn't drive it), and
+    # a stored preset is stored. Only a camera that has gone silent is offline.
+    rig0 = make_rig(tmp_path)
+    late = LateRepliesPtz(SimulatedPtz(PtzModel(), rig0.clock), rig0.clock)
+    rig = make_rig(tmp_path / "b", ptz=late, clock=rig0.clock)
+    for _ in range(5):
+        assert rig.studio.post("/cameras/cam1/move", json={"pan": 0.2}).status_code == 200
+    assert rig.studio.post("/cameras/cam1/presets/5/store").status_code == 200
+    assert rig.agent.camera.state()["status"] == "ok"
+    late.talking = False                                 # now it really is gone
+    for _ in range(3):
+        assert rig.studio.post("/cameras/cam1/move", json={"pan": 0.2}).status_code == 503
+    assert rig.agent.camera.state()["status"] == "offline"
 
 
 def test_a_studio_move_pauses_auto_and_auto_resumes_from_a_clean_state(tmp_path):

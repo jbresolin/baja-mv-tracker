@@ -27,6 +27,35 @@ that axis cancels the retries. When the Python process exits normally (including
 stop and zoom stop as a last resort. A process that is killed (Task Manager, closing the console window, a power
 cut) runs no Python code at all, so nothing can stop the camera then.
 
+Cameras that don't copy our sequence number
+-------------------------------------------
+Most cameras copy the request's sequence number into their reply. Some don't, and then a reply's number can't
+say which request it answers: cheap ones answer with 0, and the PTZ probed on 2026-11-15 numbers every reply from
+**its own counter** (about 43000 and rising, never a number we sent). Two replies in a row with numbers we never
+sent (or one numbered 0) put the driver in "no echo" mode (`sequence_echo = False`). With its own web page open
+in a browser (which talks to it constantly), that camera also did all of the below. With the page closed it only
+batches back-to-back replies, and answers every inquiry, while moving too (LESSONS.md, "Correction (same day)").
+The driver copes with both:
+
+- puts several messages in one datagram (`visca_packets.parse_replies` reads all of them, never only the first);
+- answers an inquiry with ACK + completion (`90 4y FF`, `90 5y FF`) and only sometimes (~17 %) with the data
+  (`90 50 ... FF`);
+- answers late (0-0.5 s, ~3 s at first) and in batches, so a reply may belong to an earlier request;
+- sends position data only at rest, as a pair (11-byte pan/tilt + 7-byte `90 50`, the latter also when no zoom was
+  asked), usually in the batch of a *later* request (second probe, 2026-11-15). It gives no usable position
+  feedback: the bench concludes Branch B, and in Branch B nothing in the zone reads positions.
+
+So in "no echo" mode:
+
+- an inquiry is answered only by a `90 50` answer its parser accepts (the right length: 11 bytes for pan/tilt, 7
+  for zoom). ACKs, completions, errors and answers of the wrong length are ignored (`stats["ignored_replies"]`).
+  No data within the timeout is a TIMEOUT of that inquiry, as for any other camera: not an error;
+- a command is answered by the first ACK, completion or error, whatever its number (nothing better is possible);
+- whatever is already waiting when a request is sent is read and dropped first: it can't be that request's reply.
+
+`last_reply_at` is when anything last came from the camera: a camera that ACKs an inquiry but sends no data is
+still there (the zone's health probe uses it).
+
 Logging
 -------
 With `log_path`, every datagram sent and received is appended to a JSONL file with both clocks: `mono` (monotonic,
@@ -50,6 +79,16 @@ from zone.ptz.interface import ACKED, ANSWERED, COMPLETED, ERROR, TIMEOUT, Comma
 DEFAULT_TIMEOUT = 0.2
 WATCHDOG_PERIOD = 0.01  # how often the dead-man thread checks deadlines (seconds, real time)
 RECENT_SEQUENCES = 64  # how many sent sequence numbers we remember, to recognise late replies
+RECEIVE_BUFFER = 65535  # bytes per datagram: a batch of several replies must never be cut short
+# Replies numbered with numbers we never sent, in a row, that make the driver stop trusting sequence numbers:
+# while it doesn't know yet (a camera with its own counter does this from its first reply), and after the camera
+# had echoed one (an own counter can hit one of our numbers by chance, once; an echoing camera never sends a run).
+UNKNOWN_IN_A_ROW_UNDECIDED = 2
+UNKNOWN_IN_A_ROW_AFTER_ECHO = 8
+# Lengths of position answers (zoom 7; pan/tilt 11, or 12 with a 5-nibble pan): in "no echo" mode these are never
+# taken as the answer to a raw inquiry such as the version.
+POSITION_ANSWER_LENGTHS = (7, 11, 12)
+DRAIN_LIMIT = 64  # at most this many waiting datagrams are dropped before a request (no endless loop on a flood)
 STOP_RETRY_WINDOW_S = 2.0  # keep re-sending an unacknowledged stop for this long, then give up (and log it)
 
 
@@ -89,7 +128,7 @@ class UdpTransport:
             remaining = deadline - time.monotonic()
             self._socket.settimeout(max(remaining, 1e-4))
             try:
-                datagram, sender = self._socket.recvfrom(2048)
+                datagram, sender = self._socket.recvfrom(RECEIVE_BUFFER)
             except (socket.timeout, BlockingIOError, InterruptedError):
                 return None
             except OSError:
@@ -150,7 +189,8 @@ class ViscaPtz:
         # cheap ones always answer with sequence 0 (False): for those, a reply's number can't tell which request
         # it answers, so we take whatever comes as the answer to the current one.
         self.sequence_echo: bool | None = None
-        self._unknown_sequence_seen: int | None = None  # a never-sent number seen once while sequence_echo was None
+        self._unknown_in_a_row = 0  # replies in a row carrying a number we never sent (see _camera_ignores_sequence)
+        self.last_reply_at: float | None = None  # clock.monotonic() when anything last came from the camera
         # Dead-man deadlines (clock.monotonic() values), None when nothing is armed.
         self._pan_tilt_deadline: float | None = None
         self._zoom_deadline: float | None = None
@@ -160,8 +200,10 @@ class ViscaPtz:
         self._closed = threading.Event()
         # What the driver noticed about the camera. The bench report copies these.
         # stop_retries: stops sent again because the previous one wasn't ACKed; stop_failures: gave up after 2 s.
+        # ignored_replies: "no echo" mode only, replies that can't answer the request waited for (an inquiry's ACK,
+        # an answer of the wrong length...); dropped_waiting: replies already waiting when a request went out.
         self.stats = {"sent": 0, "timeouts": 0, "errors": 0, "unmatched_replies": 0, "ttl_stops": 0,
-                      "stop_retries": 0, "stop_failures": 0}
+                      "stop_retries": 0, "stop_failures": 0, "ignored_replies": 0, "dropped_waiting": 0}
         self.last_inquiry: CommandResult | None = None
         self.sequence_reset_status: str | None = None
         # Top speed steps: speeds sent are clamped to these. `step_max_source` says where they came from.
@@ -278,7 +320,10 @@ class ViscaPtz:
         if not self._lock.acquire(timeout=self.timeout):
             return
         try:
-            while (datagram := self._transport.receive(0.0)) is not None:
+            for _ in range(DRAIN_LIMIT):
+                datagram = self._transport.receive(0.0)
+                if datagram is None:
+                    break
                 self._note_stray(datagram, self.clock.monotonic())
         finally:
             self._lock.release()
@@ -305,9 +350,9 @@ class ViscaPtz:
             reply_datagram = self._transport.receive(remaining)
             if reply_datagram is None:
                 break
-            self._log("rx", reply_datagram, self.clock.monotonic())
-            reply = packets.parse_reply(reply_datagram)
-            if reply is not None and reply.kind == packets.CONTROL:
+            self.last_reply_at = self.clock.monotonic()
+            self._log("rx", reply_datagram, self.last_reply_at)
+            if any(reply.kind == packets.CONTROL for reply in packets.parse_replies(reply_datagram)):
                 status = ACKED
                 break
         self._needs_reset = False
@@ -416,6 +461,10 @@ class ViscaPtz:
             deadline = self.clock.monotonic() + self.timeout
         if self._needs_reset:
             self._reset_sequence_locked(deadline)
+        if self.sequence_echo is False:
+            # Without sequence numbers to tell replies apart, whatever already waits is an earlier request's reply
+            # (a late batch): read it now so it can't be taken for this request's.
+            self._drop_waiting_locked()
         sequence = self._sequence
         self._sequence = ((self._sequence + 1) & 0xFFFFFFFF) or 1
         if sequence in self._recent:
@@ -440,79 +489,152 @@ class ViscaPtz:
         wait_for_completion: bool,
         deadline: float,
     ) -> CommandResult:
+        """Wait until `deadline` for the reply that decides request `sequence`. Every message of every datagram is
+        looked at (a datagram can hold several); the messages after the deciding one are noted as strays."""
         acked: CommandResult | None = None
         while (remaining := deadline - self.clock.monotonic()) > 0:
             datagram = self._transport.receive(remaining)
             if datagram is None:
                 break
             now = self.clock.monotonic()
+            self.last_reply_at = now
             self._log("rx", datagram, now)
-            reply = packets.parse_reply(datagram)
-            if reply is None:
-                continue
-            if reply.kind == packets.CONTROL:
-                # 0F 01 = the camera's sequence counter disagrees with ours: reset before the next request.
-                if reply.payload[:2] == b"\x0f\x01":
-                    self._needs_reset = True
-                    self.stats["errors"] += 1
-                    return CommandResult(ERROR, sequence, sent_at, now, error_code=0x0F01, payload=reply.payload)
-                continue
-            if reply.sequence is not None and reply.sequence != sequence:
-                if reply.sequence in self._recent:
-                    self._remember_late(reply, now)  # an answer to an earlier request
+            replies = packets.parse_replies(datagram)
+            for index, reply in enumerate(replies):
+                result = self._match_reply(reply, sequence, sent_at, now, is_inquiry, parser)
+                if result is None:
                     continue
-                # A sequence number we never sent. Counted either way; taken as the answer only from a camera
-                # known not to echo sequence numbers, otherwise dropped (it may be a late reply from before a
-                # reset, or from another program talking to the camera).
-                self.stats["unmatched_replies"] += 1
-                if not self._camera_ignores_sequence(reply.sequence):
-                    self._log_event("unmatched_reply_dropped", seq=reply.sequence, waiting_for=sequence)
+                if result.status == ACKED and wait_for_completion:
+                    acked = acked or result  # keep waiting for "done"
                     continue
-            elif reply.sequence == sequence:
-                self.sequence_echo = True
-            kind = reply.kind
-            if kind == packets.ERROR:
-                self.stats["errors"] += 1
-                return CommandResult(ERROR, sequence, sent_at, now, reply.error_code, reply.payload)
-            if is_inquiry:
-                if kind == packets.ANSWER:
-                    value = parser(reply.payload) if parser else reply.payload
-                    if parser is not None and value is None:
-                        # It answered, but not in a format we understand: report it as an error.
-                        return CommandResult(ERROR, sequence, sent_at, now, None, reply.payload)
-                    return CommandResult(ANSWERED, sequence, sent_at, now, payload=reply.payload, value=value)
-                continue
-            if kind == packets.COMPLETION:
-                return CommandResult(COMPLETED, sequence, sent_at, now, payload=reply.payload)
-            if kind == packets.ACK:
-                acked = CommandResult(ACKED, sequence, sent_at, now, payload=reply.payload)
-                if not wait_for_completion:
-                    return acked
+                for rest in replies[index + 1:]:
+                    self._note_stray_reply(rest, now)
+                return result
         if acked is not None:
             return acked
         self.stats["timeouts"] += 1
         self._log_event("timeout", sequence=sequence)
         return CommandResult(TIMEOUT, sequence, sent_at)
 
+    def _match_reply(
+        self,
+        reply: packets.Reply,
+        sequence: int,
+        sent_at: float,
+        now: float,
+        is_inquiry: bool,
+        parser: Callable[[bytes], object] | None,
+    ) -> CommandResult | None:
+        """What one reply message means for request `sequence`: the result it decides, or None (not ours, or not
+        an answer to this kind of request: keep waiting)."""
+        if reply.kind == packets.CONTROL:
+            # 0F 01 = the camera's sequence counter disagrees with ours: reset before the next request.
+            if reply.payload[:2] == b"\x0f\x01":
+                self._needs_reset = True
+                self.stats["errors"] += 1
+                return CommandResult(ERROR, sequence, sent_at, now, error_code=0x0F01, payload=reply.payload)
+            return None
+        if reply.sequence is not None and reply.sequence != sequence:
+            if self.sequence_echo is not False and reply.sequence in self._recent:
+                self._remember_late(reply, now)  # an answer to an earlier request
+                return None
+            # A sequence number we never sent. Counted either way; taken as the answer only from a camera
+            # known not to echo sequence numbers, otherwise dropped (it may be a late reply from before a
+            # reset, or from another program talking to the camera).
+            self.stats["unmatched_replies"] += 1
+            if not self._camera_ignores_sequence(reply.sequence):
+                self._log_event("unmatched_reply_dropped", seq=reply.sequence, waiting_for=sequence)
+                return None
+        elif reply.sequence == sequence and self.sequence_echo is not False:
+            # Our own number came back. (In "no echo" mode a match is a coincidence of the camera's counter.)
+            self.sequence_echo = True
+            self._unknown_in_a_row = 0
+        no_echo = self.sequence_echo is False
+        kind = reply.kind
+        if is_inquiry:
+            if kind == packets.ANSWER:
+                value = parser(reply.payload) if parser else reply.payload
+                if parser is None and no_echo and len(reply.payload) in POSITION_ANSWER_LENGTHS:
+                    # A raw inquiry (the version) can't be answered by a position: that's an earlier answer.
+                    return self._ignore(reply, sequence, "position-shaped answer to a raw inquiry")
+                if parser is not None and value is None:
+                    if no_echo:
+                        # Not the shape this inquiry's answer has (e.g. a zoom answer while asking pan/tilt): the
+                        # late answer to an earlier inquiry. Keep waiting for ours.
+                        return self._ignore(reply, sequence, "answer of another shape")
+                    # It answered, but not in a format we understand: report it as an error.
+                    return CommandResult(ERROR, sequence, sent_at, now, None, reply.payload)
+                return CommandResult(ANSWERED, sequence, sent_at, now, payload=reply.payload, value=value)
+            if no_echo:
+                # This camera ACKs and completes inquiries too, and late replies arrive in batches: only data
+                # answers an inquiry. An error can't be told apart from an earlier command's.
+                return self._ignore(reply, sequence, kind)
+            if kind == packets.ERROR:
+                self.stats["errors"] += 1
+                return CommandResult(ERROR, sequence, sent_at, now, reply.error_code, reply.payload)
+            return None
+        if kind == packets.ERROR:
+            self.stats["errors"] += 1
+            return CommandResult(ERROR, sequence, sent_at, now, reply.error_code, reply.payload)
+        if kind == packets.COMPLETION:
+            return CommandResult(COMPLETED, sequence, sent_at, now, payload=reply.payload)
+        if kind == packets.ACK:
+            return CommandResult(ACKED, sequence, sent_at, now, payload=reply.payload)
+        if no_echo and kind == packets.ANSWER:
+            return self._ignore(reply, sequence, "inquiry data while waiting for a command")
+        return None
+
+    def _ignore(self, reply: packets.Reply, sequence: int, why: str) -> None:
+        """"No echo" mode: a reply that can't be the answer to request `sequence`. Counted, logged, skipped."""
+        self.stats["ignored_replies"] += 1
+        self._log_event("reply_ignored", why=why, payload=reply.payload.hex(" "), waiting_for=sequence)
+        return None
+
+    def _drop_waiting_locked(self) -> None:
+        """Read and drop the datagrams already waiting (at most DRAIN_LIMIT). The caller holds the lock."""
+        for _ in range(DRAIN_LIMIT):
+            datagram = self._transport.receive(0.0)
+            if datagram is None:
+                return
+            now = self.clock.monotonic()
+            self.last_reply_at = now
+            self._log("rx", datagram, now, dropped="arrived before the request was sent")
+            self.stats["dropped_waiting"] += 1
+
     def _camera_ignores_sequence(self, unknown: int) -> bool:
         """Decide, from a reply carrying a number we never sent, whether this camera just doesn't echo sequence
-        numbers. Once a camera has echoed one correctly, it does (False). Before that, a reply numbered 0 (we never
-        send 0) or the same unknown number twice in a row means it doesn't (True)."""
-        if self.sequence_echo is True:
-            return False
+        numbers ("no echo" mode, `sequence_echo = False`, for good). True: take the reply anyway.
+
+        - Already in "no echo" mode: True.
+        - Not decided yet: a reply numbered 0 (we never send 0), or UNKNOWN_IN_A_ROW_UNDECIDED (2) never-sent
+          numbers in a row: a camera answering with 0, or numbering replies from its own counter (both seen).
+        - The camera had echoed our number: one stray number (0 included) changes nothing, it is dropped. Only a
+          run of UNKNOWN_IN_A_ROW_AFTER_ECHO (8) in a row means it doesn't echo after all: a camera with its own
+          counter can hit one of our numbers by chance, an echoing camera never sends a run like that.
+        """
         if self.sequence_echo is False:
             return True
-        if unknown == 0 or unknown == self._unknown_sequence_seen:
+        self._unknown_in_a_row += 1
+        if self.sequence_echo is None:
+            decided = unknown == 0 or self._unknown_in_a_row >= UNKNOWN_IN_A_ROW_UNDECIDED
+        else:
+            decided = self._unknown_in_a_row >= UNKNOWN_IN_A_ROW_AFTER_ECHO
+        if decided:
             self.sequence_echo = False
-            self._log_event("camera_does_not_echo_sequence", seq=unknown)
-            return True
-        self._unknown_sequence_seen = unknown
-        return False
+            self._log_event("camera_does_not_echo_sequence", seq=unknown, in_a_row=self._unknown_in_a_row)
+        return decided
 
     def _note_stray(self, datagram: bytes, now: float) -> None:
+        self.last_reply_at = now
         self._log("rx", datagram, now)
-        reply = packets.parse_reply(datagram)
-        if reply is not None and reply.sequence is not None and reply.sequence in self._recent:
+        for reply in packets.parse_replies(datagram):
+            self._note_stray_reply(reply, now)
+
+    def _note_stray_reply(self, reply: packets.Reply, now: float) -> None:
+        """A reply nobody is waiting for: remember a late completion for `completion_time()`. Only when the camera
+        echoes sequence numbers: otherwise a number says nothing about which request it belongs to."""
+        if (self.sequence_echo is not False and reply.sequence is not None
+                and reply.sequence in self._recent):
             self._remember_late(reply, now)
 
     def _remember_late(self, reply: packets.Reply, now: float) -> None:
@@ -590,10 +712,13 @@ class ViscaPtz:
         entry: dict[str, object] = {"mono": round(mono, 6), "wall": round(self.clock.wall(), 6), "dir": direction,
                                     "hex": datagram.hex(" ")}
         if direction == "rx":
-            reply = packets.parse_reply(datagram)
-            entry["kind"] = reply.kind if reply else "garbage"
-            if reply is not None and reply.sequence is not None:
-                entry["seq"] = reply.sequence
+            replies = packets.parse_replies(datagram)
+            entry["kind"] = replies[0].kind if replies else "garbage"
+            if replies and replies[0].sequence is not None:
+                entry["seq"] = replies[0].sequence
+            if len(replies) > 1:  # several messages in one datagram: all of them, in order
+                entry["kinds"] = [reply.kind for reply in replies]
+                entry["seqs"] = [reply.sequence for reply in replies]
         entry.update(extra)
         self._write(entry)
 

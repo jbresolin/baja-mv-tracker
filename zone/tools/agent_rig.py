@@ -2,6 +2,7 @@
 
     python -m zone.tools.agent_rig prepare --dir out/agent_rig [--driver visca|sim] [--token T]
     python -m zone.tools.agent_rig camera --dir out/agent_rig            # only with --driver visca: the fake PTZ
+    python -m zone.tools.agent_rig prepare ... --like-real-ptz; ... camera ... --like-real-ptz  # like the real PTZ
     python -m zone.app --config out/agent_rig/site.toml                   # the zone node, agent API on 8890
 
 `prepare` writes, in --dir:
@@ -17,6 +18,8 @@
 
 `camera` runs the fake VISCA camera (zone/ptz/fake_camera.py) with the zone's keyframe presets stored in it, as the
 real PTZ has them after a teach. It is also what the studio's direct fallback drives while the zone app is down.
+`--like-real-ptz` makes it answer like the PTZ probed on 2026-11-15 (its own sequence counter, late batched replies,
+inquiry data only ~17 % of the time; see zone/ptz/fake_camera.py).
 
 The baja-studio conformance suite and the end-to-end check (zone/tools/studio_e2e.py) run against this rig; the
 commands are in zone/README.md ("Agent API").
@@ -46,8 +49,15 @@ def prepare(args) -> int:
         print("writing %s (%d s, %d cars)..." % (video, args.length, len(cars)), flush=True)
         write_video(video, scene, cars, float(args.length), fps=10.0)
     zonefile.save(scene.make_zone(), out / "zone.json")
-    report = {"verdict": {"branch": "A", "reason": "agent rig: the fake PTZ answers inquiries while moving"},
-              "model": PtzModel().to_dict()}
+    if args.like_real_ptz:
+        # A camera like the real PTZ (camera --like-real-ptz) answers position inquiries only ~17 % of the time:
+        # its bench report says Branch B, so the zone reports no positions and doesn't poll them.
+        report = {"verdict": {"branch": "B", "reason": "agent rig: the fake PTZ answers like the real PTZ "
+                                                       "(unreliable position feedback)"},
+                  "model": PtzModel(inquiry_mode="never", zoom_inquiry_mode="never").to_dict()}
+    else:
+        report = {"verdict": {"branch": "A", "reason": "agent rig: the fake PTZ answers inquiries while moving"},
+                  "model": PtzModel().to_dict()}
     (out / "report.json").write_text(json.dumps(report, indent=1), encoding="utf-8")
     p = out.as_posix()
     toml = "\n".join([
@@ -73,15 +83,16 @@ def prepare(args) -> int:
 
 def camera(args) -> int:
     from zone.clock import SystemClock
-    from zone.ptz.fake_camera import FakeViscaCamera, FakeViscaUdpServer
+    from zone.ptz.fake_camera import FakeViscaUdpServer, camera_from_arguments
     from zone.ptz.sim import SimulatedPtz
     sim = SimulatedPtz(PtzModel(), SystemClock())
     zone = zonefile.load(Path(args.dir) / "zone.json")
     for k in zone.keyframes():
         sim.define_preset(k.preset, k.pan, k.tilt, k.zoom)
-    server = FakeViscaUdpServer(FakeViscaCamera(sim), args.host, args.port).start()
-    print("fake VISCA PTZ on %s:%d with presets %s; Ctrl+C to stop"
-          % (server.address[0], server.address[1], [k.preset for k in zone.keyframes()]), flush=True)
+    server = FakeViscaUdpServer(camera_from_arguments(sim, args), args.host, args.port).start()
+    print("fake VISCA PTZ on %s:%d with presets %s%s; Ctrl+C to stop"
+          % (server.address[0], server.address[1], [k.preset for k in zone.keyframes()],
+             ", answering like the real PTZ" if args.like_real_ptz else ""), flush=True)
     try:
         threading.Event().wait()
     except KeyboardInterrupt:
@@ -105,10 +116,14 @@ def main(argv=None) -> int:
     p.add_argument("--length", type=int, default=60, help="recording length (s); it loops")
     p.add_argument("--gap", type=int, default=6, help="a car every this many seconds")
     p.add_argument("--force", action="store_true", help="write the recording again even if it exists")
+    p.add_argument("--like-real-ptz", action="store_true",
+                   help="a Branch B report, for the camera's --like-real-ptz (unreliable position feedback)")
     c = sub.add_parser("camera", help="run the fake VISCA PTZ with the zone's keyframe presets")
     c.add_argument("--dir", default="out/agent_rig")
     c.add_argument("--host", default="127.0.0.1")
     c.add_argument("--port", type=int, default=52399)
+    from zone.ptz.fake_camera import add_real_ptz_arguments
+    add_real_ptz_arguments(c)
     args = ap.parse_args(argv)
     return prepare(args) if args.cmd == "prepare" else camera(args)
 

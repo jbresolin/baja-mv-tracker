@@ -515,3 +515,112 @@ def test_no_fov_stops_when_zoom_direct_is_refused_too():
 def test_zoom_tele_flag():
     args = parse_args(["--ip", "x", "--out", "y", "--zoom-tele", "0x7AC0"])
     assert args.zoom_tele == 0x7AC0
+
+
+# --- the PTZ probed on 2026-11-15: inquiry data only ~17 % of the time -------------------------------------------
+#
+# That camera answers an inquiry with ACK + completion and sends the position only now and then (43 of 259). The
+# bench must not trust a handful of answers: it calls such an inquiry "unreliable", treats it like no inquiry at all
+# (fixed waits, nothing read back), and ends with Branch B. Before, a run took ~40 minutes of mostly 15-second waits
+# that never settled, and filled the report with numbers built on two or three answers.
+
+
+class SomeInquiriesUnanswered:
+    """The simulator, except that the pan/tilt (or zoom) inquiries whose call number is in `lost` get no answer.
+
+    `lost` is a function of the call number (1, 2, 3...) -> True to lose that one."""
+
+    def __init__(self, sim: SimulatedPtz, lost_pan_tilt=lambda k: False, lost_zoom=lambda k: False) -> None:
+        self.sim, self.lost_pan_tilt, self.lost_zoom = sim, lost_pan_tilt, lost_zoom
+        self.pan_tilt_calls = self.zoom_calls = 0
+
+    def __getattr__(self, name):
+        return getattr(self.sim, name)  # everything else goes straight to the simulator
+
+    def inquire_pan_tilt(self):
+        self.pan_tilt_calls += 1
+        answer = self.sim.inquire_pan_tilt()
+        return None if self.lost_pan_tilt(self.pan_tilt_calls) else answer
+
+    def inquire_zoom(self):
+        self.zoom_calls += 1
+        answer = self.sim.inquire_zoom()
+        return None if self.lost_zoom(self.zoom_calls) else answer
+
+
+def bench_on(ptz, clock: FakeClock) -> Characterizer:
+    return Characterizer(ptz, clock, ScriptedUI(), BenchOptions(quick=True))
+
+
+def test_one_lost_inquiry_at_rest_does_not_make_the_inquiry_unreliable():
+    # A good camera on a network that loses one packet: the 2nd of the 5 at-rest inquiries gets no answer. The bench
+    # asks 10 more (spaced out) and finds 14 of 15 answered: still supported, and it goes on to measure while moving.
+    clock = FakeClock()
+    ptz = SomeInquiriesUnanswered(SimulatedPtz(PtzModel(), clock), lost_pan_tilt=lambda k: k == 2)
+    bench = bench_on(ptz, clock)
+    result = bench.feedback()
+    assert result["pan_tilt_at_rest"]["answered"] == "14/15"
+    assert result["pan_tilt_at_rest"]["supported"] is True and result["pan_tilt_at_rest"]["unreliable"] is False
+    assert result["while_moving"] == "yes"
+
+
+def test_an_inquiry_answered_one_time_in_six_is_unreliable():
+    clock = FakeClock()
+    ptz = SomeInquiriesUnanswered(SimulatedPtz(PtzModel(), clock), lost_pan_tilt=lambda k: k % 6 != 1)
+    bench = bench_on(ptz, clock)
+    result = bench.feedback()
+    assert result["pan_tilt_at_rest"]["answered"] == "3/15"
+    assert result["pan_tilt_at_rest"]["unreliable"] is True
+    assert result["while_moving"] == "unreliable"
+    assert bench.pt_inquiry is False  # from now on: fixed waits, no position readings
+    assert ba.verdict(bench.while_moving, bench.max_rate_hz)[0] == "B"
+
+
+def test_a_zoom_inquiry_answered_only_sometimes_is_treated_as_unsupported():
+    # The first zoom inquiry is answered, then only one in five: the zoom section must not try to measure the range
+    # and the speeds from that (every wait would run to its timeout); it takes the blind FOV-stop path instead.
+    clock = FakeClock()
+    ptz = SomeInquiriesUnanswered(SimulatedPtz(PtzModel(), clock), lost_zoom=lambda k: k % 5 != 1)
+    bench = Characterizer(ptz, clock, ScriptedUI(), BenchOptions(quick=True, fov_pauses=False))
+    result = bench.zoom()
+    assert result["inquiry_unreliable"] is True and result["inquiry_answered_at_rest"] == "1/5"
+    assert result["inquiry_at_rest"] is False
+    assert "range" not in result  # not measured
+    assert result["fov_positions_source"].startswith("commanded")
+
+
+def test_the_verdict_names_unreliable_feedback():
+    branch, reason = ba.verdict("unreliable", None)
+    assert branch == "B" and "only some of the time" in reason
+
+
+@pytest.mark.parametrize("seed", range(5))
+def test_a_camera_like_the_real_ptz_gets_branch_b_quickly_through_the_real_driver(seed):
+    # The whole bench, through the real VISCA driver, against the fake camera behaving like the probed PTZ (its own
+    # sequence counter, late batched replies, data ~17 % of the time). Five different random draws.
+    clock = FakeClock()
+    sim = SimulatedPtz(PtzModel(), clock)
+    camera = FakeViscaCamera(sim).like_real_ptz(seed=seed)
+    ptz = ViscaPtz("fake", clock=clock, transport=FakeTransport(camera, clock), watchdog=False)
+    report = Characterizer(ptz, clock, ScriptedUI(), BenchOptions(quick=True)).run()
+    assert report["verdict"]["branch"] == "B"
+    # Either a few answers ("unreliable") or, by chance, none at all in 15 tries ("doesn't work"): never trusted.
+    assert report["feedback"]["while_moving"] in ("unreliable", "unsupported")
+    assert report["feedback"]["pan_tilt_at_rest"]["supported"] is False
+    assert report["speed_table"]["method"] == "unsupported"
+    assert report["model"]["inquiry_mode"] == "never"
+    # No section crashed, and the run stayed short: minutes of camera time, not the ~40 it took before.
+    assert not [name for name, value in report.items() if isinstance(value, dict) and "traceback" in value]
+    assert "aborted" not in report
+    assert clock.monotonic() < 6 * 60
+    # The summary tells the operator what's going on with this camera.
+    summary = summarize(report)
+    assert "doesn't number its replies with ours" in summary
+    if report["feedback"]["while_moving"] == "unreliable":
+        assert "UNRELIABLE" in summary
+    # The speed table can't be measured without positions: the summary says what to measure by hand, and how.
+    assert "TO MEASURE BY HAND" in summary and "pan_speed_table" in summary
+    # A zone configured from this report runs Branch B (feed-forward only, no position reads), even if someone
+    # forces Branch A in the config: the model says the inquiry never answers.
+    assert report["model"]["inquiry_mode"] == "never"
+    assert report["driver_stats"]["sequence_echo"] is False
