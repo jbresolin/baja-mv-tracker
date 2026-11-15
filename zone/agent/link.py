@@ -45,6 +45,9 @@ class ZoneDirectorLink:
             return False, "the zone's PTZ is not answering (network or power)"
         return True, ""
 
+    def handover_pending(self) -> bool:
+        return self.zapp.runtime.handover_requested is not None
+
     def set_director(self, mode: str, why: str, stop_camera: Optional[bool]) -> tuple[bool, str]:
         """stop_camera None: the director's usual rules (runtime.set_mode, as the page's buttons always did).
         True / False: a hand-over to the studio (runtime.hand_over), stopping the camera now or sending it nothing."""

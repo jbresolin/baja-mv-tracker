@@ -91,6 +91,9 @@ class ZoneRuntime:
         # how long the big STOP waits for the lock before stopping the camera directly (see big_stop)
         self.stop_lock_timeout_s = float(settings.cfg.get("health", {}).get("stop_lock_timeout_s", 0.5))
         self.stop_requested = False      # set by big_stop when it couldn't get the lock: the next cycle obeys it
+        # set by hand_over when it couldn't get the lock: (mode, why, stop_camera), the next cycle obeys it
+        self.handover_requested = None
+        self.handover_lock_timeout_s = 1.0   # how long hand_over waits for the control loop before queueing instead
         self.profile_path = Path(profile_path) if profile_path else None
         self.profile = profile
         if self.profile is None and self.profile_path and self.profile_path.exists():
@@ -164,30 +167,43 @@ class ZoneRuntime:
             mode = str(mode).upper()
             if mode == D.AUTO and (self.path is None or self.zone.entry_preset is None):
                 return False, "zona incompleta: ensine pelo menos 2 keyframes antes do AUTO"
+            self.handover_requested = None  # this newer choice replaces a hand-over the loop hasn't obeyed yet
             self.director.set_mode(mode, self.clock.monotonic(), why)
             if mode == D.STOPPED:
                 self.controller.stop()      # immediately, not at the next frame
             return True, mode
 
-    def hand_over(self, mode, why, stop_camera, lock_timeout_s=1.0):
+    def hand_over(self, mode, why, stop_camera, lock_timeout_s=None):
         """For the studio (zone/agent): switch the director to PASSIVE or STOPPED *without* its usual one-shot stop at
         the next cycle. The studio's own command (a move, a preset recall) goes out right after this, and a stop from
         the director ~0.1 s later would cut it. `stop_camera=True` stops the PTZ now instead (leaving AUTO for manual
         or hold: the zone's own motion must end). -> (ok, message); not ok only if the control loop held its lock for
-        longer than `lock_timeout_s` (a hung PTZ call)."""
+        longer than `lock_timeout_s` (a hung PTZ call). Then the hand-over is not lost: `handover_requested` is set,
+        and the next cycle obeys it before it decides anything (like the big STOP's `stop_requested`)."""
         mode = str(mode).upper()
         if mode not in (D.PASSIVE, D.STOPPED):
             raise ValueError("hand_over is for PASSIVE or STOPPED, not %r" % mode)
-        if not self.lock.acquire(timeout=lock_timeout_s):
-            return False, "the zone's control loop is busy (a PTZ call is hanging)"
+        self.handover_requested = (mode, why, bool(stop_camera))     # first: a cycle about to start sees it
+        timeout = self.handover_lock_timeout_s if lock_timeout_s is None else float(lock_timeout_s)
+        if not self.lock.acquire(timeout=timeout):
+            return False, ("the zone's control loop is busy (a PTZ call is hanging); the zone goes quiet as soon as "
+                           "it answers")
         try:
-            self.director.set_mode(mode, self.clock.monotonic(), why)
-            self.director.discard_pending()
-            if stop_camera:
-                self.controller.stop()
+            self._apply_handover()
             return True, mode
         finally:
             self.lock.release()
+
+    def _apply_handover(self):
+        """Caller holds self.lock: obey `handover_requested` (director to PASSIVE / STOPPED, no queued action)."""
+        request, self.handover_requested = self.handover_requested, None
+        if request is None:
+            return
+        mode, why, stop_camera = request
+        self.director.set_mode(mode, self.clock.monotonic(), why)
+        self.director.discard_pending()
+        if stop_camera:
+            self.controller.stop()
 
     def big_stop(self, lock_timeout_s=None):
         """The big red button: a stop command right now, then STOPPED.
@@ -228,6 +244,7 @@ class ZoneRuntime:
         self.controller.stop()
         self.director._pending = None   # already stopped
         self.stop_requested = False
+        self.handover_requested = None
 
     # ------------------------------------------------------------------------------------------- one cycle
     def cycle(self, frame, tracker_out=None) -> CycleResult:
@@ -247,6 +264,8 @@ class ZoneRuntime:
             views = self.progress.update(frame.t, tracker_out) if self.progress else {}
         # ---- control: short, under the lock the big STOP takes
         with self.lock:
+            if self.handover_requested is not None:
+                self._apply_handover()               # the studio took the camera while this loop was busy
             if self.stop_requested:
                 self._apply_stop("big_stop (delayed: the loop was busy)")
             if hasattr(self.ptz, "tick"):

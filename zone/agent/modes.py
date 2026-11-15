@@ -32,8 +32,8 @@ import threading
 from typing import Any, Callable, Optional, Protocol
 
 from zone.agent.contract import (
-    AUTO, AUTO_PAUSED, HOLD, MANUAL, MANUAL_OVERRIDE_ENDED, MANUAL_OVERRIDE_STARTED, MODE_CHANGED,
-    RESTORE_REASON_TRACKER_NOT_READY, TRACKER_NOT_READY, AgentError, checked_profile,
+    AUTO, AUTO_PAUSED, DEVICE_OFFLINE_ERROR, HOLD, MANUAL, MANUAL_OVERRIDE_ENDED, MANUAL_OVERRIDE_STARTED,
+    MODE_CHANGED, RESTORE_REASON_TRACKER_NOT_READY, TRACKER_NOT_READY, AgentError, checked_profile,
 )
 
 # the director's modes (zone/director.py), repeated here to keep this module free of the runtime's imports
@@ -54,7 +54,12 @@ class DirectorLink(Protocol):
 
     def set_director(self, mode: str, why: str, stop_camera: Optional[bool]) -> tuple[bool, str]:
         """Switch the director. `stop_camera`: True = stop the PTZ right now, False = send it nothing at all (the
-        studio is about to command it), None = the director's usual rules (the laptop page's buttons)."""
+        studio is about to command it), None = the director's usual rules (the laptop page's buttons).
+        -> (ok, message). Not ok for PASSIVE / STOPPED means the control loop was busy: the switch is then queued
+        and the loop obeys it at its next cycle (`handover_pending()` is True until it has)."""
+
+    def handover_pending(self) -> bool:
+        """Is a switch to PASSIVE / STOPPED queued, waiting for a busy control loop?"""
 
 
 class ModeArbiter:
@@ -115,15 +120,22 @@ class ModeArbiter:
 
         In auto, the director is silenced first (PASSIVE, nothing sent: the studio's command follows at once) and
         the mode becomes auto_paused. In auto_paused, the countdown restarts from the end of this motion (its
-        velocity's ttl, or now for a stop or a recall): contract decision 5. Other modes: nothing changes."""
+        velocity's ttl, or now for a stop or a recall): contract decision 5. Other modes: nothing changes.
+
+        Raises AgentError device_offline (503) when the zone's control loop was too busy to be silenced at once (a
+        hanging PTZ call): the pause is recorded and the loop obeys it at its next cycle, but the caller must not
+        send its motion on top of a director that may still be driving."""
         with self.lock:
             self.holder = source
+            ok, why = True, ""
             if self.mode == AUTO:
-                self.link.set_director(D_PASSIVE, "studio motion (%s)" % source, stop_camera=False)
+                ok, why = self.link.set_director(D_PASSIVE, "studio motion (%s)" % source, stop_camera=False)
                 self._change(AUTO_PAUSED, "studio motion command")
                 self.emit(MANUAL_OVERRIDE_STARTED, {"source": source})
             if self.mode == AUTO_PAUSED:
                 self.resume_at = motion_ends_at + self.resume_after_ms() / 1000.0
+            if not ok:
+                raise AgentError(DEVICE_OFFLINE_ERROR, why)
 
     def studio_set_mode(self, mode: str, profile: Optional[dict], source: str) -> dict:
         """PUT /mode: manual, auto or hold (auto_paused is refused before it gets here). -> the reply.
@@ -150,20 +162,25 @@ class ModeArbiter:
                 if old == AUTO_PAUSED:
                     self.emit(MANUAL_OVERRIDE_ENDED, {"reason": "auto requested"})
             else:
-                self._quiet_director("studio: %s (%s)" % (mode, source))
+                ok, why = self._quiet_director("studio: %s (%s)" % (mode, source))
                 self.resume_at = None
                 if mode == HOLD:
                     self.holder = source
                 self._change(mode, "requested by the studio")
+                if not ok:
+                    # recorded, and the loop obeys it at its next cycle; the studio still hears that it's late
+                    raise AgentError(DEVICE_OFFLINE_ERROR, why)
             return self.reply()
 
-    def _quiet_director(self, why: str) -> None:
+    def _quiet_director(self, why: str, paused: bool = False) -> tuple[bool, str]:
         """manual / hold: the director estimates (PASSIVE) when there are frames, else STOPPED; never drives. Leaving
-        AUTO stops the camera at once (the zone's own motion must end; nothing more is sent after that)."""
-        target = D_PASSIVE if self.link.frames_ok() else D_STOPPED
+        AUTO stops the camera at once (the zone's own motion must end; nothing more is sent after that), except for a
+        pause (`paused`: the studio is driving, so PASSIVE and nothing sent). -> set_director's (ok, message)."""
+        target = D_PASSIVE if (paused or self.link.frames_ok()) else D_STOPPED
         current = self.link.director_mode()
-        if current != target:
-            self.link.set_director(target, why, stop_camera=current == D_AUTO)
+        if current == target:
+            return True, target
+        return self.link.set_director(target, why, stop_camera=current == D_AUTO and not paused)
 
     # ------------------------------------------------------------------------------------------- time
     def tick(self) -> None:
@@ -185,6 +202,12 @@ class ModeArbiter:
                     self.emit(MANUAL_OVERRIDE_ENDED, {"reason": RESTORE_REASON_TRACKER_NOT_READY})
             elif self.mode == AUTO and self.link.director_mode() != D_AUTO:
                 self._change(MANUAL, "the zone tracker left AUTO")
+            elif (self.mode != AUTO and self.link.director_mode() == D_AUTO
+                  and not self.link.handover_pending()):
+                # the other way round: the studio has the camera (manual, hold, a pause) but the director is still in
+                # AUTO (a hand-over that was lost): silence it now
+                self._quiet_director("the studio's %s: the zone must not drive" % self.mode,
+                                     paused=self.mode == AUTO_PAUSED)
 
     # ------------------------------------------------------------------------------------------- the laptop page
     def local_mode(self, director_mode: str) -> tuple[bool, str]:
@@ -206,6 +229,18 @@ class ModeArbiter:
             if old == AUTO_PAUSED and self.mode != AUTO_PAUSED:
                 self.emit(MANUAL_OVERRIDE_ENDED, {"reason": "laptop page"})
             return ok, msg
+
+    def local_release_hold(self) -> tuple[bool, str]:
+        """The laptop page's "liberar HOLD" (after a confirmation on the page): the person at the laptop takes the
+        camera back from a studio that holds it (a studio that is gone, or a hold remembered across a restart).
+        The mode becomes manual, with a mode_changed for the studios; the director is left as it is (it doesn't
+        drive in hold)."""
+        with self.lock:
+            if self.mode != HOLD:
+                return False, "a câmera não está em HOLD"
+            self.holder = None
+            self._change(MANUAL, "HOLD released on the laptop page")
+            return True, MANUAL
 
     def local_stop(self) -> None:
         """The laptop page's PARAR (the caller has already stopped the camera and put the director in STOPPED): auto

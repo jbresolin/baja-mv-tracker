@@ -28,6 +28,11 @@ class FakeLink:
         self.ready = (True, "")
         self.frames = True
         self.calls = []
+        self.busy = False        # True: the zone's control loop is stuck, a switch to PASSIVE / STOPPED gets queued
+        self.queued = None       # ... the switch waiting for the loop
+
+    def handover_pending(self):
+        return self.queued is not None
 
     def director_mode(self):
         return self.director
@@ -40,8 +45,17 @@ class FakeLink:
 
     def set_director(self, mode, why, stop_camera):
         self.calls.append((mode, stop_camera))
+        if self.busy and mode != "AUTO" and stop_camera is not None:
+            self.queued = mode
+            return False, "the zone's control loop is busy"
         self.director = mode
         return True, mode
+
+    def loop_wakes_up(self):
+        """The stuck control loop runs its next cycle: it obeys the queued switch."""
+        self.busy = False
+        if self.queued:
+            self.director, self.queued = self.queued, None
 
 
 def make(resume_after_ms=1000, mode="manual"):
@@ -290,3 +304,78 @@ def test_every_mode_change_is_remembered_for_the_next_restart():
     arbiter.studio_motion("studio:s1", 0.0)
     arbiter.studio_set_mode("hold", None, "studio:s1")
     assert remembered == ["auto", "auto_paused", "hold"]
+
+
+# ------------------------------------------------------------------------------------------- a busy control loop
+# The zone's control loop can hold its lock for a while (a PTZ call waiting for a camera that doesn't answer). Then
+# the studio's switch can't happen at once: it is queued for the loop's next cycle, and the studio hears about it
+# (error 503) instead of a silent "ok" while the zone keeps tracking.
+def test_a_pause_that_cannot_happen_at_once_is_queued_and_answered_503():
+    arbiter, link, clock, _ = make()
+    arbiter.studio_set_mode("auto", None, "studio:s1")
+    link.busy = True
+    with pytest.raises(AgentError) as refused:
+        arbiter.studio_motion("studio:s1", clock.monotonic())
+    assert refused.value.code == "device_offline" and refused.value.status == 503
+    assert arbiter.mode == "auto_paused"           # recorded: the studio has the camera
+    assert link.director == "AUTO" and link.queued == "PASSIVE"
+    link.loop_wakes_up()
+    assert link.director == "PASSIVE"
+
+
+def test_manual_or_hold_that_cannot_happen_at_once_is_queued_and_answered_503():
+    for mode in ("manual", "hold"):
+        arbiter, link, _, _ = make()
+        arbiter.studio_set_mode("auto", None, "studio:s1")
+        link.busy = True
+        with pytest.raises(AgentError) as refused:
+            arbiter.studio_set_mode(mode, None, "studio:s1")
+        assert refused.value.status == 503 and arbiter.mode == mode
+        assert link.queued == "PASSIVE"
+
+
+def test_a_lost_hand_over_is_repaired_by_the_tick():
+    # The studio has the camera (manual, hold, or a pause) but the director is still in AUTO (a hand-over that was
+    # lost): the next tick silences it. Manual / hold: PASSIVE and a stop. A pause: PASSIVE and nothing sent (the
+    # studio is moving the camera).
+    for mode, stop in (("manual", True), ("hold", True), ("auto_paused", False)):
+        arbiter, link, clock, _ = make(resume_after_ms=60_000)
+        if mode == "auto_paused":
+            arbiter.studio_set_mode("auto", None, "studio:s1")
+            arbiter.studio_motion("studio:s1", clock.monotonic())
+        else:
+            arbiter.studio_set_mode(mode, None, "studio:s1")
+        link.director = "AUTO"                      # the director never got the message
+        arbiter.tick()
+        assert link.director == "PASSIVE" and link.calls[-1] == ("PASSIVE", stop) and arbiter.mode == mode
+
+
+def test_the_tick_leaves_a_queued_hand_over_alone():
+    # A switch is already queued for the stuck loop: asking again would only wait for the lock again.
+    arbiter, link, _, _ = make()
+    arbiter.studio_set_mode("auto", None, "studio:s1")
+    link.busy = True
+    with pytest.raises(AgentError):
+        arbiter.studio_set_mode("manual", None, "studio:s1")
+    calls = len(link.calls)
+    arbiter.tick()
+    assert len(link.calls) == calls
+
+
+# ------------------------------------------------------------------------------------------- liberar HOLD
+def test_the_page_can_release_a_hold_deliberately():
+    # A studio holds the camera, then disappears (or the hold came back after a restart): the person at the laptop
+    # can take it back with "liberar HOLD". The mode becomes manual (the studios are told), and the page's AUTO works
+    # again.
+    arbiter, link, _, emitted = make()
+    arbiter.studio_set_mode("hold", None, "studio:s1")
+    assert arbiter.local_release_hold() == (True, "manual")
+    assert arbiter.mode == "manual" and arbiter.holder is None
+    assert emitted[-1] == ("mode_changed", {"from": "hold", "to": "manual", "reason": "HOLD released on the laptop page"})
+    assert arbiter.local_mode("AUTO")[0] and link.director == "AUTO"
+
+
+def test_releasing_a_hold_that_isnt_there_is_refused():
+    arbiter, _, _, emitted = make()
+    assert arbiter.local_release_hold() == (False, "a câmera não está em HOLD")
+    assert emitted == []
