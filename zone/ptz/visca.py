@@ -32,7 +32,10 @@ Cameras that don't copy our sequence number
 Most cameras copy the request's sequence number into their reply. Some don't, and then a reply's number can't
 say which request it answers: cheap ones answer with 0, and the PTZ probed on 2026-11-15 numbers every reply from
 **its own counter** (about 43000 and rising, never a number we sent). Two replies in a row with numbers we never
-sent (or one numbered 0) put the driver in "no echo" mode (`sequence_echo = False`). That camera also:
+sent (or one numbered 0) put the driver in "no echo" mode (`sequence_echo = False`). With its own web page open
+in a browser (which talks to it constantly), that camera also did all of the below. With the page closed it only
+batches back-to-back replies, and answers every inquiry, while moving too (LESSONS.md, "Correction (same day)").
+The driver copes with both:
 
 - puts several messages in one datagram (`visca_packets.parse_replies` reads all of them, never only the first);
 - answers an inquiry with ACK + completion (`90 4y FF`, `90 5y FF`) and only sometimes (~17 %) with the data

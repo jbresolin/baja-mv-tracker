@@ -1968,3 +1968,32 @@ inquiries, inquiries sent as commands, a 3 s pan). What it does, and what the zo
   9 skip). Fix belongs in the suite (skip pushes older than the PUT's reply). Mutation check: 26 one-line mutations of
   the new rules (parsing, detection, inquiry/command matching, drain, stop cap, bench reliability, heard_recently,
   the fake's pairs / no data while moving) each make a test fail.
+
+### Correction (same day, 15:13-15:28): most of the above was the camera's web page, not the camera
+
+**Correction of the section above.** During both probes João had the camera's own web page open in a browser tab,
+and that page talks to the camera all the time. Rerun with every tab closed (`visca_probe_20261115_151507.json`,
+`ptz_position_probe_20261115_151634.json`, `ptz_speed_changes_20261115_151719.json`,
+`ptz_moving_position_20261115_152827.json`, in the studio session's scratchpad):
+
+* **Still true (the camera itself):** replies carry the camera's own counter, never our number (it now rises by
+  exactly one per reply, and stays still when nothing is sent: the ~40/s climb was the web page); every reply is sent
+  to our port and to port 52381; two requests sent back to back are answered in one datagram (78 of 81 datagrams
+  carried two messages in the studio-rate phase). The "no echo" mode and `parse_replies` stay needed.
+* **Wrong above:** inquiries are answered **every time** (255 of 255, in order, p50 0.05 s, max 0.11 s), with the
+  data only (no ACK + completion for an inquiry; move commands get ACK + completion, `90 4y`/`90 5y`), and **while
+  moving too**: pan/tilt polled at 5 Hz during 2 s pans changed on every answer, at speed steps 4, 8 and 12, both
+  directions. No 3 s first-reply delay, no pairs, no batching beyond back-to-back requests.
+* **Motion is smooth** over VISCA with one command, with repeats every 1 / 0.3 / 0.1 s, and with the speed changed
+  every 1 / 0.5 / 0.2 s. The "5 units in 2 s at speed 1" above was with the page open.
+* **Measured pan rates** (raw units/s, steady part of a 2 s move, right / left): step 4: 63 / 63; step 8: 191 / 188;
+  step 12: 382 / 387. Not linear in the step (x3 from 4 to 8, x2 from 8 to 12). After the stop it coasts and is
+  still within ~0.3 s; back at the start after steps 4 and 8 to the unit (1070), 23 units short after step 12.
+  Units per degree not known yet.
+* **ONVIF (port 2000):** `GetStatus` says 0/0, IDLE always, even while panning: useless for position.
+  `ContinuousMove` (with `Timeout`) is smooth too, but not needed.
+* **Consequence for the zone:** nothing in the code changes for the race. The bench should now find the inquiry
+  reliable and measure the speed table itself (Branch A if updates keep up at >= 10 Hz while moving, else the timed
+  moves): no "TO MEASURE BY HAND". `--like-real-ptz` in the fake camera reproduces the page-open camera: keep it as a
+  stress test, not as a model of the race PTZ. Bench rule from now on: **close the camera's web page** (and any other
+  controller) before benching or racing.

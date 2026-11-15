@@ -19,7 +19,9 @@ makes it drop the 8-byte header. `camera.lose_next[payload] = N` loses the next 
 payload on the way, as a flaky network would: the camera never sees them, so it neither acts nor replies.
 
 **Like the real PTZ** (`camera.like_real_ptz()`, or `--like-real-ptz` on the command line): what the probe of
-2026-11-15 measured on the PTZ the zone drives at the race (see LESSONS.md):
+2026-11-15 measured on the PTZ the zone drives at the race **while its own web page was open in a browser** (see
+LESSONS.md and its same-day correction: with the page closed the camera answers every inquiry, also while moving).
+Keep it as a stress test of a busy camera, not as a model of the race PTZ:
 
 - replies are numbered from the camera's own counter (~43000, rising ~40/s), never the request's number;
 - the sequence reset is answered to port 52381 only, so the sender never sees the answer;

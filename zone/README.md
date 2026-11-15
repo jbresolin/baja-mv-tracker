@@ -48,8 +48,10 @@ python -m zone.ptz.fake_camera --port 52399 [--inquiry-mode at_rest] [--refresh-
 python -m zone.tools.characterize --ip 127.0.0.1 --port 52399 --out reports/fake --quick --yes
 ```
 
-`--like-real-ptz` makes the fake answer like the race PTZ probed on 2026-11-15 (LESSONS.md, "VISCA on the real
-PTZ"): replies numbered from its own counter, several messages per datagram, late and batched, inquiries answered
+`--like-real-ptz` makes the fake answer like the race PTZ probed on 2026-11-15 **with its own web page open in a
+browser** (LESSONS.md, "VISCA on the real PTZ" and its same-day correction; with the page closed the real camera
+answers every inquiry, also while moving, so the bench measures it normally; close the camera's web page before
+benching): replies numbered from its own counter, several messages per datagram, late and batched, inquiries answered
 with ACK + completion and position data only now and then (at rest, as a pan/tilt + 7-byte pair, in a later batch).
 The driver handles that camera ("no echo" mode, see `ptz/visca.py`), and the bench calls its inquiry
 **unreliable** (answered < 80% at rest), treats it as unsupported and ends with Branch B in ~3 minutes. Without
