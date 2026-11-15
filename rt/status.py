@@ -398,6 +398,18 @@ class StatusHTTPServer(ThreadingHTTPServer):
     fail instead, as it does on Linux."""
 
     daemon_threads = True
+
+    # A phone that locks its screen or leaves the page drops its connection mid-request. The stdlib server then
+    # prints a full traceback for each one, which floods the console and hides the messages that matter. Those
+    # dropped connections are normal, so they are ignored; any other error is still printed.
+    QUIET_ERRORS = (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, TimeoutError)
+
+    def handle_error(self, request, client_address):
+        error = sys.exc_info()[1]
+        if isinstance(error, self.QUIET_ERRORS):
+            return
+        super().handle_error(request, client_address)
+
     if sys.platform == "win32":
         allow_reuse_address = False
 
