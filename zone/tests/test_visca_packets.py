@@ -126,6 +126,37 @@ def test_garbage_is_rejected():
     assert packets.parse_reply(b"") is None
 
 
+def test_several_messages_in_one_datagram_are_all_read():
+    # A datagram from the real PTZ (probe of 2026-11-15): ACK, completion and the pan/tilt data, each message with
+    # its own 8-byte header (type 01 11, its length, the camera's own sequence number), back to back.
+    datagram = hx("01 11 00 03 00 00 a8 e2 90 48 ff"
+                  "01 11 00 03 00 00 a8 e3 90 58 ff"
+                  "01 11 00 0b 00 00 a8 e4 90 50 00 01 0a 05 0f 0f 0f 0f ff")
+    replies = packets.parse_replies(datagram)
+    assert [r.kind for r in replies] == [packets.ACK, packets.COMPLETION, packets.ANSWER]
+    assert [r.sequence for r in replies] == [0xA8E2, 0xA8E3, 0xA8E4]
+    assert packets.parse_pan_tilt_position(replies[2].payload) == (0x01A5, -1)
+    # parse_reply (one message) gives the first of them; it used to give None for such a datagram.
+    assert packets.parse_reply(datagram).kind == packets.ACK
+
+
+def test_a_single_message_datagram_is_one_reply():
+    assert len(packets.parse_replies(hx("01 11 00 03 00 00 00 2A 90 41 FF"))) == 1
+
+
+def test_a_cut_off_last_message_is_ignored():
+    # The second message says it has 11 payload bytes, but only 3 arrived: keep the first, drop the broken one.
+    datagram = hx("01 11 00 03 00 00 00 01 90 48 ff 01 11 00 0b 00 00 00 02 90 50 00")
+    assert [r.kind for r in packets.parse_replies(datagram)] == [packets.ACK]
+
+
+def test_several_bare_payloads_are_split_at_their_terminators():
+    replies = packets.parse_replies(hx("90 41 FF 90 51 FF"))
+    assert [r.kind for r in replies] == [packets.ACK, packets.COMPLETION]
+    assert all(r.sequence is None for r in replies)
+    assert packets.parse_replies(hx("90 41 FF 12 34")) == []  # a non-VISCA tail: none of it is trusted
+
+
 def test_control_reply():
     reply = packets.parse_reply(hx("02 01 00 01 00 00 00 00 01"))
     assert reply.kind == packets.CONTROL

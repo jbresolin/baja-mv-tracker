@@ -1897,3 +1897,74 @@ the real `ViscaPtz` against the fake VISCA camera; the end-to-end script with a 
 * Mutation check: removing `discard_pending()` from the hand-over, the zoom TTL, the /stop's zoom stop, the queued
   hand-over, the reverse reconciliation, the 400 for a refused store or the "only for a studio" poll rule each makes
   a test fail now (before, the first three left the suite green).
+
+## Session 3: VISCA on the real race PTZ (two probes, 2026-11-15)
+
+João probed the PTZ the zone drives at the race (same model, 192.168.10.245) twice: `ptz_probe_2026-11-15.json`
+(gentle/studio-rate/spaced inquiries, a slow pan) and `ptz_probe_round2_2026-11-15.json` (other transports, block
+inquiries, inquiries sent as commands, a 3 s pan). What it does, and what the zone now does about it:
+
+* **Only VISCA over IP on UDP 52381.** Raw VISCA on TCP 5678: no connection; raw VISCA on UDP 1259: port
+  unreachable; ONVIF `/onvif/device_service`: HTTP 404.
+* **Replies carry the camera's own sequence counter** (~43000, rising ~40/s even with nothing sent; never 0, never
+  ours). The sequence-reset control message is answered (`02 01 ... 01`) on port 52381 only and changes nothing.
+  Every reply came both to the sender's port and to port 52381 of the sender's host (the driver listens on its own
+  port; nothing needs 52381). The driver's old detector only knew cameras answering 0 (or the same unknown number
+  twice), so with this camera it dropped almost every reply. **Now:** two never-sent numbers in a row (or a 0) ->
+  "no echo" mode (`sequence_echo = False`, for good); after a real echo, a run of 8 is needed (an own counter can hit
+  one of our numbers by chance). In that mode a reply's number is ignored entirely.
+* **Several VISCA/IP messages in one datagram**, each with its own header and length (up to 6 seen). The old
+  `parse_reply` returned None for such a datagram (length mismatch, not bare VISCA): the ACK + completion + data
+  batch was thrown away whole. **Now:** `parse_replies` reads every message; the driver looks at each; messages after
+  the deciding one are noted as strays (in echo mode a late completion is remembered for `completion_time`). The
+  receive buffer is 65535 bytes (a 2048-byte buffer would cut a large batch).
+* **Inquiries get ACK + completion** (`90 4y FF`, `90 5y FF`, y = 7/8/9) and only rarely data: 43 of 259 (17 %) in
+  probe 1, 5 of 20 in probe 2, **none at all during a 3 s pan**, none for block inquiries (`81 09 7E 7E 0x FF`).
+  Data comes as a **pair** whatever was asked: the 11-byte pan/tilt answer then a 7-byte `90 50 00 00 00 00 FF`
+  (also when no zoom was asked: a 7-byte `90 50` is not reliably a zoom answer), usually in the batch answering a
+  *later* request, always the same values at rest. Inquiries sent as payload type 0x0100 behave the same.
+  **Now, in "no echo" mode:** an inquiry is answered only by a `90 50` its parser accepts (11/12 bytes pan/tilt, 7
+  zoom; a position-sized answer is never taken as the version); ACKs, completions, errors and wrong-sized answers
+  are skipped (`stats["ignored_replies"]`); no data = TIMEOUT of that inquiry, never an error. Whatever is already
+  waiting when a request goes out is dropped first (`stats["dropped_waiting"]`): it can't be that request's answer.
+  Commands take the first ACK / completion / error whatever its number (a stale ACK can't be told apart: accepted).
+* **Late and batched:** first replies ~3 s after the first request, then 0-0.5 s, on a ~47 ms tick. With the zone's
+  0.2 s timeout many single requests time out while the camera is fine. **Now:** `ViscaPtz.last_reply_at` (anything
+  heard) and `controller.heard_recently()` (within 1 s): the health probe ("probe_reply"), the agent's command results
+  and position poll count a timeout from a talking camera as answered. Before, the studio saw it `device_offline`
+  and moves/recalls answered 503 (master against the fake below: 6 conformance failures, mode tests skipped). A
+  preset store that timed out from a talking camera is taken as stored (only an ERROR reply refuses it).
+* **Commands work:** speed-1 pan for 2 s moved pan 0x01A5 -> 0x01AA (5 units).
+* **The studio froze the camera's video** with an endless stop resend (its stop was never "confirmed") plus 4
+  inquiries/s; the probe's gentler traffic didn't. Our stop retries stay capped: 2 s after the first try, about 5 a
+  second (each waits its 0.2 s timeout), then give up (`stop_failures`); checked in this mode too
+  (`test_visca_real_ptz.py`). The zone's own inquiry traffic in Branch B: only the health probe (every 5 s, zoom then
+  pan/tilt), no position poll.
+* **No usable position feedback -> Branch B.** The bench now asks 10 more spaced at-rest inquiries when not all of
+  the first 5 are answered and calls the inquiry **unreliable** below 80 % (`feedback.pan_tilt_at_rest.unreliable`,
+  `while_moving = "unreliable"`, verdict B "answers only some of the time, even at rest"); zoom likewise (5 at rest).
+  It then runs the no-inquiry path (fixed waits): ~3 minutes of camera time against the fake, Branch B every time
+  (before: ~40 minutes of 15 s waits that never settled, Branch B by luck, and a report full of numbers built on two
+  or three answers). The model gets `inquiry_mode = "never"`, so a zone config built from it is Branch B even if
+  Branch A is forced, the controller never polls, and the agent reports `has_position_feedback: false` /
+  `position: null` and doesn't poll.
+* **The speed table must be measured another way.** Without positions the bench can't measure deg/s per step; the
+  model keeps the simulator's default tables, and Branch B's feed-forward lives on them. The summary now prints
+  "TO MEASURE BY HAND": two marks a known angle apart, per step (at least 1, 2, 4, 8, 12, 16, top) and direction,
+  time the crosshair from A to B (stopwatch, or frames of a PTZ recording; >= 2 s, wider marks for fast steps), deg/s
+  = angle / time, then write `model.pan_speed_table` / `tilt_speed_table` in report.json as raw units/s = deg/s x
+  the documented units per degree (and `pan_units_per_degree` / `tilt_units_per_degree`). Not automated: an
+  operator-timed "press Enter at A and at B" section would be the next step if hand timing is too slow.
+* **Fake camera:** `FakeViscaCamera.like_real_ptz()` / `--like-real-ptz` (also `agent_rig camera`, and
+  `agent_rig prepare --like-real-ptz` for a Branch B report) reproduces all of the above: own counter, reset answer
+  not seen, ACK + completion for inquiries, data with probability 0.17 only at rest as a pair in the next request's
+  batch, first replies after 3 s then 0-0.5 s on a 50 ms tick, up to 4 messages per datagram. The default fake is
+  unchanged.
+* **Conformance (baja-studio suite) against the rig in that mode:** 31 pass, 9 skip, 1 fail every run:
+  `test_manual_and_hold_never_resume_auto_by_themselves`. Cause (suite side): it opens the WebSocket before
+  `PUT auto`, so the greeting state (`manual`, from the previous test) is still queued; its "skip to the first push
+  in the new mode" matches that stale greeting, then reads the `auto` pushes sent while our `PUT manual` was still
+  waiting for the slow camera's stop ACK (0.2-0.4 s). With the default fake the PUT is fast and it passes (32 pass,
+  9 skip). Fix belongs in the suite (skip pushes older than the PUT's reply). Mutation check: 26 one-line mutations of
+  the new rules (parsing, detection, inquiry/command matching, drain, stop cap, bench reliability, heard_recently,
+  the fake's pairs / no data while moving) each make a test fail.

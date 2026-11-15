@@ -309,6 +309,8 @@ def verdict(while_moving: str | None, max_rate_hz: float | None, update_rate_hz:
         why = "pan/tilt inquiry answers while moving, but the value doesn't change until the camera stops"
     elif while_moving == "no":
         why = "pan/tilt inquiry doesn't answer while moving"
+    elif while_moving == "unreliable":
+        why = "pan/tilt inquiry answers only some of the time, even at rest (unreliable position feedback)"
     else:
         why = "pan/tilt inquiry doesn't work"
     return "B", why + ", so use feed-forward from the speed table and reset to the entry preset after each car"

@@ -259,21 +259,58 @@ class Reply:
         return None
 
 
-def parse_reply(datagram: bytes) -> Reply | None:
-    """Split a datagram into header fields and VISCA payload, or None if it is not VISCA at all.
+_KNOWN_PAYLOAD_TYPES = (PAYLOAD_REPLY, PAYLOAD_CONTROL_REPLY, PAYLOAD_COMMAND, PAYLOAD_INQUIRY, PAYLOAD_CONTROL)
+
+
+def parse_replies(datagram: bytes) -> list[Reply]:
+    """Every VISCA/IP message in one datagram, in order (an empty list if it is not VISCA at all).
+
+    A datagram usually holds one message: the 8-byte header, then `length` payload bytes. But some cameras (the
+    PTZ probed on 2026-11-15) put several messages in one datagram, each with its own header and length, e.g.
+    ACK + completion + inquiry answer:
+
+        01 11 00 03 <seq> 90 48 FF | 01 11 00 03 <seq> 90 58 FF | 01 11 00 0B <seq> 90 50 <8 nibbles> FF
+
+    Reading only the first message would lose the answer behind the ACK. Bytes that don't form a whole message
+    at the end (a truncated datagram) are ignored.
 
     Some cheap cameras answer with the bare VISCA payload (no 8-byte header). That is accepted too, with
-    `payload_type` and `sequence` set to None, so the driver can still use the answer.
+    `payload_type` and `sequence` set to None; several bare payloads in a row are split at their 0xFF terminators.
     """
-    if len(datagram) >= HEADER_LENGTH + 1:
-        payload_type = int.from_bytes(datagram[0:2], "big")
-        length = int.from_bytes(datagram[2:4], "big")
-        if payload_type in (PAYLOAD_REPLY, PAYLOAD_CONTROL_REPLY, PAYLOAD_COMMAND, PAYLOAD_INQUIRY, PAYLOAD_CONTROL):
-            if length == len(datagram) - HEADER_LENGTH:
-                return Reply(payload_type, int.from_bytes(datagram[4:8], "big"), bytes(datagram[HEADER_LENGTH:]))
-    if len(datagram) >= 3 and datagram[0] & 0xF0 == REPLY_HEADER and datagram[-1] == TERMINATOR:
-        return Reply(None, None, bytes(datagram))
-    return None
+    replies: list[Reply] = []
+    offset = 0
+    while len(datagram) - offset >= HEADER_LENGTH + 1:
+        payload_type = int.from_bytes(datagram[offset:offset + 2], "big")
+        length = int.from_bytes(datagram[offset + 2:offset + 4], "big")
+        end = offset + HEADER_LENGTH + length
+        if payload_type not in _KNOWN_PAYLOAD_TYPES or length == 0 or end > len(datagram):
+            break
+        sequence = int.from_bytes(datagram[offset + 4:offset + 8], "big")
+        replies.append(Reply(payload_type, sequence, bytes(datagram[offset + HEADER_LENGTH:end])))
+        offset = end
+    if replies:
+        return replies
+    # No header: bare VISCA payloads, each one 9x ... FF.
+    start = 0
+    for index, byte in enumerate(datagram):
+        if byte == TERMINATOR:
+            chunk = bytes(datagram[start:index + 1])
+            if len(chunk) >= 3 and chunk[0] & 0xF0 == REPLY_HEADER:
+                replies.append(Reply(None, None, chunk))
+            else:
+                return []  # not VISCA: don't guess at the rest
+            start = index + 1
+    return replies if start == len(datagram) else []
+
+
+def parse_reply(datagram: bytes) -> Reply | None:
+    """The first VISCA/IP message of a datagram (see `parse_replies`), or None if it is not VISCA at all.
+
+    Fine for requests (one message each). For what a camera sends back, use `parse_replies`: a reply datagram
+    can hold several messages.
+    """
+    replies = parse_replies(datagram)
+    return replies[0] if replies else None
 
 
 def parse_pan_tilt_position(payload: bytes) -> tuple[int, int] | None:

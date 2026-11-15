@@ -424,5 +424,19 @@ def answered(result):
     return getattr(result, "status", None) != "timeout"
 
 
+REPLY_RECENT_S = 1.0  # a camera that sent anything this recently is there, even if one request went unanswered
+
+
+def heard_recently(ptz, now, within=REPLY_RECENT_S):
+    """Did the camera send anything at all (an ACK, a late reply...) in the last `within` seconds? Uses
+    `ViscaPtz.last_reply_at` (the same clock as `now`); False for a PTZ without it (the simulator).
+
+    The PTZ probed on 2026-11-15 replies 0-0.5 s late and sends inquiry data only ~17 % of the time, so with the
+    zone's 0.2 s timeout many single requests time out while the camera is perfectly there. A timeout alone must
+    not make it look unplugged; a camera that has gone silent for `within` seconds still does."""
+    heard_at = getattr(ptz, "last_reply_at", None)
+    return isinstance(heard_at, (int, float)) and now - heard_at <= within
+
+
 def _clip(x, lim):
     return max(-lim, min(lim, x))

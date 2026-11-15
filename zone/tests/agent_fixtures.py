@@ -131,6 +131,21 @@ class DeadPtz:
         return call
 
 
+class LateRepliesPtz(DeadPtz):
+    """A PTZ like the one probed on 2026-11-15, seen through the driver: its replies come too late for the driver's
+    timeout, so every command "times out" and every inquiry is None, but it IS talking: `last_reply_at` (when
+    anything last came from it) is kept at "just now" by `talking = True`. With `talking = False` it is dead."""
+
+    def __init__(self, sim, clock):
+        super().__init__(sim)
+        self.clock = clock
+        self.talking = True
+
+    @property
+    def last_reply_at(self):
+        return self.clock.monotonic() if self.talking else None
+
+
 class CountingPtz:
     """The simulator, counting the position inquiries it is asked (to check who sends what to the camera)."""
 
