@@ -91,11 +91,15 @@ Python 3.12 with every package, the code, the models, ffmpeg with x264 / QuickSy
 
 **Install**: copy the .exe to the laptop and run it (admin). It asks for the **data folder** (default `C:\BajaMV`:
 configs, recordings, logs; put it on the disk with the most space) and offers two options: firewall rules for the
-app's ports on private networks (8765, 8090, 8890, 8780; leave it on) and "open Baja MV at login". It installs to
-`C:\Program Files\BajaMV` and adds Start-menu entries: **Baja MV**, **Baja MV (autoteste)**, **Pasta de dados**.
+app's ports (8765, 8090, 8890, 8780) on every network type, private and public (a race LAN without internet is
+usually "Public" for Windows; leave it on), and "open Baja MV at login". It installs to `C:\Program Files\BajaMV`,
+installs Microsoft's Visual C++ runtime when the laptop's is older than the bundled one, and adds Start-menu entries:
+**Baja MV**, **Baja MV (autoteste)**, **Pasta de dados**.
 
 **First run, on each laptop**: run "Baja MV (autoteste)" once (all lines OK; a WARN about no Intel GPU is fine on the
-XPS). Then start **Baja MV**: a red "MV" icon appears in the tray and the page opens (`http://localhost:8780/`; from
+XPS; a WARN "network profile" means the race network is marked Public: if a phone or the other laptop cannot open
+the pages, run the `Set-NetConnectionProfile ... -NetworkCategory Private` command it prints in an admin PowerShell;
+the page shows the same warning). Then start **Baja MV**: a red "MV" icon appears in the tray and the page opens (`http://localhost:8780/`; from
 a phone on the same network: `http://<laptop IP>:8780/`). On the page:
 
 * *Este computador*: tick the role (Linha de chegada on the T14, Zona PTZ on the XPS; both only on a bench laptop),
@@ -107,7 +111,7 @@ a phone on the same network: `http://<laptop IP>:8780/`). On the page:
   the last log lines are on the card. The beam is still set up from the status page (Beam setup), as before.
 * **Zone PTZ (XPS)**: spotter camera + preview, resolution, NTP, PTZ IP, characterization report, profile (a bench
   profile shows a loud warning: never at the race), page / studio API ports and the **studio token** (set one at the
-  event). Save, then **Iniciar**; teach and operate on the zone page (:8090) as before. **Parar** first asks the zone
+  event; the page never shows it back: leave the field empty to keep it, type a single space to remove it). Save, then **Iniciar**; teach and operate on the zone page (:8090) as before. **Parar** first asks the zone
   for PARAR, then stops the process, then sends the PTZ a VISCA stop itself, so the camera never keeps moving.
 * **Caracterização do PTZ** (zone laptop, zone stopped): IP + folder name -> the bench tool opens in a console window
   on the laptop; confirm the move and answer its questions **there**; the page shows its output. The report lands in
@@ -133,7 +137,8 @@ reports\   PTZ characterization reports
 exports\   zips from "Exportar logs"
 ```
 
-**Upgrade**: run a newer installer on top. It stops a running Baja MV (and both roles), replaces the program, and keeps
+**Upgrade**: run a newer installer on top. It stops a running Baja MV and both roles (also roles left running after
+"Fechar o painel": the zone still gets its safe PTZ stop), replaces the program, and keeps
 the data folder and everything in it (the data-folder question is skipped). Start Baja MV again.
 
 **Uninstall**: Settings > Apps > Baja MV. The program and the firewall rules go; the data folder stays (delete it by

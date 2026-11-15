@@ -6,8 +6,9 @@
   Run on a Windows PC that has the real models in deploy\models (they are not in git). Steps:
     1. download (or take from build\cache) the pinned Python runtime and ffmpeg, checking their sha256 (pins.json)
     2. unpack the runtime into build\stage\python and install the locked, hashed packages into it
-       (requirements-runtime.txt), plus the Visual C++ runtime DLLs next to python.exe (ONNX Runtime and OpenVINO
-       need them; a fresh Windows may not have them)
+       (requirements-runtime.txt); download Microsoft's Visual C++ runtime installer (vc_redist.x64.exe, checked by
+       its Microsoft signature and version >= 14.40), which the installer runs when the PC's copy is older
+       (ONNX Runtime and OpenVINO need it; no DLLs are copied next to python.exe, they could shadow a newer system copy)
     3. put ffmpeg.exe / ffprobe.exe into build\stage\ffmpeg\bin
     4. stage the code + models (stage_app.py: checks every model against deploy\models\manifest.json)
     5. compile BajaMV.iss with Inno Setup (winget install JRSoftware.InnoSetup)
@@ -22,6 +23,10 @@
 
 .PARAMETER FfmpegZip
   Use this local ffmpeg zip (or a folder with bin\ffmpeg.exe) instead of the pinned download.
+
+.PARAMETER VcRedist
+  Use this local vc_redist.x64.exe (Visual C++ 2015-2022 x64 runtime installer) instead of downloading the current
+  one from https://aka.ms/vs/17/release/vc_redist.x64.exe
 
 .PARAMETER Iscc
   Path to ISCC.exe if Inno Setup is not in its usual place.
@@ -38,10 +43,13 @@ param(
     [switch]$AllowDummyModels,
     [string]$FfmpegZip = "",
     [string]$Iscc = "",
+    [string]$VcRedist = "",
     [switch]$SkipCompile
 )
 
 $ErrorActionPreference = "Stop"
+# Windows PowerShell 5.1 may still offer only TLS 1.0/1.1, which GitHub and Microsoft's download servers refuse
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 $ProgressPreference = "SilentlyContinue"      # Invoke-WebRequest is many times faster without the progress bar
 
 $Repo = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
@@ -63,6 +71,9 @@ function Write-Step([string]$Text) {
 
 function Invoke-Native([string]$Exe, [string[]]$Arguments) {
     # Run a program and stop the build if it fails (PowerShell does not do that by itself for .exe files).
+    # The exit code decides, not stderr: Windows PowerShell 5.1 without a console (CI) turns every stderr line of a
+    # program (pip's notices, stage_app's warnings) into an error record, which "Stop" would make fatal.
+    $ErrorActionPreference = "Continue"
     & $Exe @Arguments
     if ($LASTEXITCODE -ne 0) { throw "$Exe $($Arguments -join ' ') failed with exit code $LASTEXITCODE" }
 }
@@ -114,7 +125,7 @@ $pyArchive = Get-VerifiedDownload $Pins.python.url $Pins.python.sha256 $Pins.pyt
 Invoke-Native $Tar @("-xzf", $pyArchive, "-C", $Stage)          # the archive's top folder is python\
 $Py = Join-Path $Stage "python\python.exe"
 if (-not (Test-Path $Py)) { throw "python.exe not found after unpacking $pyArchive" }
-& $Py -m pip --version
+$ErrorActionPreference = "Continue"; & $Py -m pip --version; $ErrorActionPreference = "Stop"
 if ($LASTEXITCODE -ne 0) { Invoke-Native $Py @("-m", "ensurepip", "--default-pip") }
 
 Write-Step "Runtime packages (requirements-runtime.txt, hashes required)"
@@ -122,15 +133,44 @@ Invoke-Native $Py @("-m", "pip", "install", "--disable-pip-version-check", "--no
     "--require-hashes", "--only-binary=:all:", "--cache-dir", (Join-Path $Cache "pip"),
     "-r", (Join-Path $PSScriptRoot "requirements-runtime.txt"))
 
-Write-Step "Visual C++ runtime DLLs next to python.exe (app-local)"
-$vcDlls = @("msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll", "msvcp140_atomic_wait.dll",
-            "msvcp140_codecvt_ids.dll", "concrt140.dll", "vcruntime140.dll", "vcruntime140_1.dll")
-foreach ($dll in $vcDlls) {
-    $source = Join-Path $env:SystemRoot "System32\$dll"
-    $target = Join-Path $Stage "python\$dll"
-    if (Test-Path $target) { continue }                    # python's own copy wins
-    if (Test-Path $source) { Copy-Item $source $target; Write-Host "copied $dll" }
-    else { Write-Warning "$dll not found in System32: install the VC++ 2015-2022 x64 redistributable on this PC" }
+Write-Step "Visual C++ runtime installer (vc_redist.x64.exe)"
+# ONNX Runtime and OpenVINO need the Visual C++ 2015-2022 runtime, 14.40 or newer (an older msvcp140.dll crashes them
+# in std::mutex). Copying the DLLs next to python.exe is not safe: an old app-local copy wins over a newer system one.
+# So the installer carries Microsoft's own vc_redist and runs it when the PC's runtime is older than this one.
+# Microsoft's link always serves the current version, so it cannot be pinned by sha256: the file is checked by its
+# Authenticode signature (Microsoft) and its version instead, and the version is recorded in build_info.json.
+$MinVcRuntime = [version]"14.40"
+$vcCached = Join-Path $Cache "vc_redist.x64.exe"
+if ($VcRedist) {
+    $vcSource = (Resolve-Path $VcRedist).Path
+} else {
+    New-Item -ItemType Directory -Force $Cache | Out-Null
+    try {
+        Write-Host "downloading https://aka.ms/vs/17/release/vc_redist.x64.exe"
+        Invoke-WebRequest -Uri "https://aka.ms/vs/17/release/vc_redist.x64.exe" -OutFile "$vcCached.part" -UseBasicParsing
+        Move-Item -Force "$vcCached.part" $vcCached
+    } catch {
+        if (-not (Test-Path $vcCached)) { throw "vc_redist.x64.exe download failed and none cached: $_" }
+        Write-Warning "vc_redist.x64.exe download failed ($_); using the cached copy"
+    }
+    $vcSource = $vcCached
+}
+$signature = Get-AuthenticodeSignature $vcSource
+if ($signature.Status -ne "Valid" -or $signature.SignerCertificate.Subject -notmatch "O=Microsoft Corporation") {
+    throw "$vcSource is not validly signed by Microsoft (status $($signature.Status), $($signature.SignerCertificate.Subject))"
+}
+$vcVersion = [version]((Get-Item $vcSource).VersionInfo.FileVersion -replace "[^0-9.].*$", "")
+if ($vcVersion -lt $MinVcRuntime) { throw "$vcSource is version $vcVersion; 14.40 or newer is needed" }
+$RedistDir = Join-Path $Build "redist"
+if (Test-Path $RedistDir) { Remove-Item -Recurse -Force $RedistDir }
+New-Item -ItemType Directory -Force $RedistDir | Out-Null
+$VcRedistExe = Join-Path $RedistDir "vc_redist.x64.exe"
+Copy-Item $vcSource $VcRedistExe
+Write-Host "vc_redist.x64.exe $vcVersion (signed: $($signature.SignerCertificate.Subject))"
+# a runtime DLL that came with the Python download must not be older either (it would win over the system one)
+foreach ($dll in Get-ChildItem (Join-Path $Stage "python") -Filter "msvcp140*.dll" -ErrorAction SilentlyContinue) {
+    $dllVersion = [version]($dll.VersionInfo.FileVersion -replace "[^0-9.].*$", "")
+    if ($dllVersion -lt $MinVcRuntime) { throw "$($dll.FullName) is version $dllVersion (< 14.40): remove it" }
 }
 
 # ------------------------------------------------------------------------------------------------ 3. ffmpeg
@@ -167,9 +207,12 @@ Invoke-Native (Join-Path $ffmpegBin "ffmpeg.exe") @("-hide_banner", "-version")
 # ------------------------------------------------------------------------------------------------ 4. app + models
 Write-Step "App code and models (models from $ModelsDir)"
 $stageArgs = @((Join-Path $PSScriptRoot "stage_app.py"), "--repo", $Repo, "--stage", $Stage, "--models", $ModelsDir,
-               "--python-dir", (Join-Path $Stage "python"), "--ffmpeg-version", $ffmpegVersion)
+               "--python-dir", (Join-Path $Stage "python"), "--ffmpeg-version", $ffmpegVersion,
+               "--vcredist-version", "$vcVersion")
 if ($AllowDummyModels) { $stageArgs += "--allow-dummy-models" }
+$ErrorActionPreference = "Continue"       # stage_app's warnings go to stderr (see Invoke-Native)
 $stageOutput = & $Py @stageArgs
+$ErrorActionPreference = "Stop"
 $stageCode = $LASTEXITCODE
 $stageOutput | ForEach-Object { Write-Host $_ }
 if ($stageCode -ne 0) { throw "staging failed (see above)" }
@@ -188,6 +231,8 @@ Write-Step "Inno Setup"
 $isccExe = Find-Iscc
 New-Item -ItemType Directory -Force $Dist | Out-Null
 Invoke-Native $isccExe @("/Q", "/DAppVersion=$Version", "/DStageDir=$Stage", "/DOutputDir=$Dist",
+                          "/DVcRedist=$VcRedistExe", "/DVcRedistMajor=$($vcVersion.Major)",
+                          "/DVcRedistMinor=$($vcVersion.Minor)", "/DVcRedistBld=$($vcVersion.Build)",
                           (Join-Path $PSScriptRoot "BajaMV.iss"))
 $setup = Join-Path $Dist "BajaMV-Setup-$Version.exe"
 if (-not (Test-Path $setup)) { throw "Inno Setup did not produce $setup" }

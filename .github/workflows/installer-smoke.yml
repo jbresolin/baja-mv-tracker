@@ -38,8 +38,9 @@ jobs:
           }
 
       - name: Build the installer
-        shell: pwsh
-        run: tools/installer/build_installer.ps1 -ModelsDir build/dummy-models -AllowDummyModels
+        # Windows PowerShell 5.1 (powershell.exe), the shell the owner builds with, not PowerShell 7 (pwsh)
+        shell: powershell
+        run: '& .\tools\installer\build_installer.ps1 -ModelsDir build\dummy-models -AllowDummyModels'
 
       - name: Silent install
         shell: pwsh
@@ -58,6 +59,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "firewall rule missing" }
 
       - name: Self-test of the installed app
+        # deliberately run from the checkout folder (it has its own launcher\): BajaMV.cmd must still run the
+        # installed code (python -P), and the self-test's "code location" check fails if it does not
         shell: cmd
         run: '"%INSTALL%\BajaMV.cmd" --self-test'
 
@@ -82,15 +85,23 @@ jobs:
           if (-not (Test-Path "$env:DATA\config\keep-me.txt")) { throw "the upgrade lost the data folder" }
           $ini = Get-Content "$env:INSTALL\app\install.ini" -Raw
           if ($ini -notmatch [regex]::Escape($env:DATA)) { throw "the upgrade changed the data folder: $ini" }
-          & "$env:INSTALL\python\python.exe" -c "import launcher.paths as p; print(p.resolve_paths().data_root)"
+          # -P: not the checkout's launcher\ (the current folder), the installed one
+          $out = & "$env:INSTALL\python\python.exe" -P -c "import launcher.paths as p; r = p.resolve_paths(); print(r.code_root); print(r.data_root)"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host ($out -join "`n")
+          if ($out[0] -ne "$env:INSTALL\app") { throw "the installed Python imported the code from $($out[0])" }
+          if ($out[1] -ne $env:DATA) { throw "data root after the upgrade: $($out[1])" }
 
       - name: Uninstall keeps the data folder
         shell: pwsh
         run: |
           $p = Start-Process "$env:INSTALL\unins000.exe" -Wait -PassThru -ArgumentList @(
             "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/LOG=$PWD\uninstall.log")
-          Start-Sleep -Seconds 5      # the uninstaller finishes from a temporary copy of itself
-          if (Test-Path "$env:INSTALL\app\rt") { throw "program files still there after uninstall" }
+          # unins000.exe hands over to a temporary copy of itself and returns at once: wait (up to 60 s) until the
+          # program files are really gone
+          $deadline = (Get-Date).AddSeconds(60)
+          while ((Test-Path "$env:INSTALL\app") -and ((Get-Date) -lt $deadline)) { Start-Sleep -Seconds 1 }
+          if (Test-Path "$env:INSTALL\app") { throw "program files still there 60 s after the uninstall started" }
           if (-not (Test-Path "$env:DATA\config\keep-me.txt")) { throw "uninstall removed the data folder" }
           cmd /c 'netsh advfirewall firewall show rule name="Baja MV (portas)"'
           if ($LASTEXITCODE -eq 0) { throw "firewall rule still there after uninstall" }

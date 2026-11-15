@@ -1,7 +1,7 @@
 """Stage the app's own files for the installer (called by build_installer.ps1; stdlib only, runs on any OS).
 
 usage: python tools/installer/stage_app.py --repo <repo> --stage <stage dir> --models <folder with the .onnx files>
-           [--allow-dummy-models] [--ffmpeg-version TEXT] [--python-dir <stage>/python]
+           [--allow-dummy-models] [--ffmpeg-version TEXT] [--vcredist-version TEXT] [--python-dir <stage>/python]
 
 What it does:
   1. Copies the runtime code into <stage>/app: rt/, zone/, launcher/ (tests left out), rt/config.toml and the
@@ -45,13 +45,34 @@ def sha256_of(path):
     return digest.hexdigest()
 
 
-def git_files(repo):
-    """Files git tracks (relative posix paths), or None when git is not available / not a checkout."""
+def warn_loudly(lines, stream=None):
+    """A warning that cannot be missed in a long build log."""
+    stream = stream or sys.stderr
+    bar = "!" * 100
+    print(bar, file=stream)
+    for line in lines:
+        print("!! WARNING: " + line, file=stream)
+    print(bar, file=stream)
+
+
+def git_files(repo, run=subprocess.run, warn=warn_loudly):
+    """Files git tracks (relative posix paths), or None when git is not available / not a checkout. A None makes
+    list_app_files() walk the folders instead, which may pick up local, untracked files (a site.toml, outputs): so
+    that fallback is announced loudly, with the reason (git missing, "dubious ownership" of the folder...)."""
     try:
-        result = subprocess.run(["git", "-C", str(repo), "ls-files", "-z"], capture_output=True, timeout=60)
-    except (OSError, subprocess.SubprocessError):
+        result = run(["git", "-C", str(repo), "ls-files", "-z"], capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as e:
+        warn(["git could not run (%s: %s)." % (type(e).__name__, e),
+              "Staging walks the folders instead: untracked local files may end up in the installer."])
         return None
     if result.returncode != 0:
+        stderr = (result.stderr or b"").decode("utf-8", errors="replace").strip()
+        lines = ["git ls-files failed in %s: %s" % (repo, stderr or "exit code %s" % result.returncode),
+                 "Staging walks the folders instead: untracked local files may end up in the installer."]
+        if "dubious ownership" in stderr:
+            lines.append("Fix: git config --global --add safe.directory \"%s\" (the folder belongs to another "
+                         "Windows user), then build again." % Path(repo).resolve().as_posix())
+        warn(lines)
         return None
     return {name for name in result.stdout.decode("utf-8").split("\0") if name}
 
@@ -143,7 +164,7 @@ def write_icon(app_dir):
 
 
 def stage(repo, stage_dir, models_dir, allow_dummy=False, ffmpeg_version="", python_dir=None, version=None,
-          now=None):
+          now=None, vcredist_version=""):
     repo, stage_dir = Path(repo), Path(stage_dir)
     app = stage_dir / "app"
     if app.exists():
@@ -164,6 +185,7 @@ def stage(repo, stage_dir, models_dir, allow_dummy=False, ffmpeg_version="", pyt
                 built=(now or dt.datetime.now()).astimezone().isoformat(timespec="seconds"),
                 models_note=manifest.get("note", ""), dummy_models=bool(allow_dummy),
                 models={name: digest for name, digest in models}, ffmpeg=ffmpeg_version,
+                vc_redist=vcredist_version,
                 python="%d.%d.%d" % sys.version_info[:3], files=len(files))
     (app / "build_info.json").write_text(json.dumps(info, indent=1), encoding="utf-8")
     if python_dir:
@@ -180,11 +202,12 @@ def main(argv=None):
     ap.add_argument("--allow-dummy-models", action="store_true")
     ap.add_argument("--ffmpeg-version", default="")
     ap.add_argument("--python-dir", default=None)
+    ap.add_argument("--vcredist-version", default="", help="version of the bundled vc_redist.x64.exe (recorded only)")
     ap.add_argument("--version", default=None, help="override the version (default: git commit date + hash)")
     args = ap.parse_args(argv)
     try:
         info = stage(args.repo, args.stage, args.models, args.allow_dummy_models, args.ffmpeg_version,
-                     args.python_dir, args.version)
+                     args.python_dir, args.version, vcredist_version=args.vcredist_version)
     except StageError as e:
         print("STAGING FAILED: %s" % e, file=sys.stderr)
         return 1

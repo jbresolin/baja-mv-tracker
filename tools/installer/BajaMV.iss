@@ -1,9 +1,14 @@
-; Baja MV installer (Inno Setup 6). Compiled by build_installer.ps1, which stages everything first:
-;   iscc /DAppVersion=<version> /DStageDir=<repo>\build\stage /DOutputDir=<repo>\dist BajaMV.iss
+﻿; Baja MV installer (Inno Setup 6). Compiled by build_installer.ps1, which stages everything first:
+;   iscc /DAppVersion=<version> /DStageDir=<repo>\build\stage /DOutputDir=<repo>\dist
+;        /DVcRedist=<repo>\build\redist\vc_redist.x64.exe /DVcRedistMajor=14 /DVcRedistMinor=44 /DVcRedistBld=35211
+;        BajaMV.iss
 ;
 ; Installs, per machine, into Program Files\BajaMV: python\ (private Python 3.12 + packages), ffmpeg\bin\,
 ; app\ (the code + models), BajaMV.cmd. Writable data goes to a data folder chosen here (default C:\BajaMV), kept on
 ; uninstall and on upgrade. Silent install: BajaMV-Setup-x.exe /VERYSILENT /DATADIR=D:\BajaMV /TASKS=firewall
+; Every python.exe / pythonw.exe started here gets -P: the current folder is never put on the import path, so the
+; installed code (app\, through the .pth file) is what runs.
+; This file is UTF-8 with a BOM (Inno Setup needs the BOM to read the accents of the pt-BR texts correctly).
 
 #ifndef AppVersion
   #define AppVersion "0.0.0-dev"
@@ -13,6 +18,17 @@
 #endif
 #ifndef OutputDir
   #define OutputDir "..\..\dist"
+#endif
+; Microsoft's Visual C++ 2015-2022 x64 runtime (vc_redist.x64.exe), downloaded by build_installer.ps1; its version
+; decides whether the PC's copy is too old. Without /DVcRedist (a quick local compile) it is not bundled.
+#ifndef VcRedistMajor
+  #define VcRedistMajor "14"
+#endif
+#ifndef VcRedistMinor
+  #define VcRedistMinor "40"
+#endif
+#ifndef VcRedistBld
+  #define VcRedistBld "0"
 #endif
 
 [Setup]
@@ -39,13 +55,14 @@ CloseApplications=yes
 RestartApplications=no
 SetupLogging=yes
 UsePreviousAppDir=yes
+ShowLanguageDialog=no
 
 [Languages]
 Name: "ptbr"; MessagesFile: "compiler:Languages\BrazilianPortuguese.isl"
 Name: "en"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
-Name: "firewall"; Description: "Liberar as portas do Baja MV no firewall (redes privadas: 8765, 8090, 8890, 8780)"
+Name: "firewall"; Description: "Liberar as portas do Baja MV no firewall (8765, 8090, 8890, 8780; redes privadas e públicas)"
 Name: "startatlogin"; Description: "Abrir o Baja MV ao entrar no Windows"; Flags: unchecked
 
 [Dirs]
@@ -60,29 +77,38 @@ Type: filesandordirs; Name: "{app}\ffmpeg"
 
 [Files]
 Source: "{#StageDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+#ifdef VcRedist
+Source: "{#VcRedist}"; DestDir: "{tmp}"; DestName: "vc_redist.x64.exe"; Flags: ignoreversion deleteafterinstall
+#endif
 
 [INI]
 ; tells the launcher where the data folder is (launcher/paths.py)
 Filename: "{app}\app\install.ini"; Section: "paths"; Key: "data_root"; String: "{code:GetDataDir}"
 
 [Icons]
-Name: "{group}\Baja MV"; Filename: "{app}\python\pythonw.exe"; Parameters: "-m launcher"; WorkingDir: "{app}\app"; IconFilename: "{app}\app\bajamv.ico"
+Name: "{group}\Baja MV"; Filename: "{app}\python\pythonw.exe"; Parameters: "-P -m launcher"; WorkingDir: "{app}\app"; IconFilename: "{app}\app\bajamv.ico"
 Name: "{group}\Baja MV (autoteste)"; Filename: "{app}\BajaMV.cmd"; Parameters: "--self-test"; WorkingDir: "{app}\app"
 Name: "{group}\Pasta de dados do Baja MV"; Filename: "{code:GetDataDir}"
-Name: "{commonstartup}\Baja MV"; Filename: "{app}\python\pythonw.exe"; Parameters: "-m launcher --no-browser"; WorkingDir: "{app}\app"; IconFilename: "{app}\app\bajamv.ico"; Tasks: startatlogin
+Name: "{commonstartup}\Baja MV"; Filename: "{app}\python\pythonw.exe"; Parameters: "-P -m launcher --no-browser"; WorkingDir: "{app}\app"; IconFilename: "{app}\app\bajamv.ico"; Tasks: startatlogin
 
 [Run]
-; firewall: delete first, so an upgrade never doubles the rules
+#ifdef VcRedist
+; the Visual C++ runtime first (ONNX Runtime / OpenVINO crash with one older than 14.40); skipped when the PC already
+; has this version or a newer one. Exit codes 3010 (restart later) and 1638 (newer present) are fine.
+Filename: "{tmp}\vc_redist.x64.exe"; Parameters: "/install /quiet /norestart"; StatusMsg: "Instalando o Visual C++ Runtime..."; Flags: waituntilterminated; Check: VcRedistNeeded
+#endif
+; firewall: delete first, so an upgrade never doubles the rules. Every profile (domain, private AND public): a race
+; LAN without internet is usually classified as Public by Windows.
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""Baja MV (portas)"""; Flags: runhidden; Tasks: firewall
-Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""Baja MV (portas)"" dir=in action=allow protocol=TCP localport=8765,8090,8890,8780 profile=private"; Flags: runhidden; Tasks: firewall
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""Baja MV (portas)"" dir=in action=allow protocol=TCP localport=8765,8090,8890,8780 profile=any"; Flags: runhidden; Tasks: firewall
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""Baja MV (python)"""; Flags: runhidden; Tasks: firewall
-Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""Baja MV (python)"" dir=in action=allow program=""{app}\python\python.exe"" profile=private"; Flags: runhidden; Tasks: firewall
-Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""Baja MV (python)"" dir=in action=allow program=""{app}\python\pythonw.exe"" profile=private"; Flags: runhidden; Tasks: firewall
-Filename: "{app}\python\pythonw.exe"; Parameters: "-m launcher"; WorkingDir: "{app}\app"; Description: "Abrir o Baja MV agora"; Flags: postinstall nowait skipifsilent runasoriginaluser
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""Baja MV (python)"" dir=in action=allow program=""{app}\python\python.exe"" profile=any"; Flags: runhidden; Tasks: firewall
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""Baja MV (python)"" dir=in action=allow program=""{app}\python\pythonw.exe"" profile=any"; Flags: runhidden; Tasks: firewall
+Filename: "{app}\python\pythonw.exe"; Parameters: "-P -m launcher"; WorkingDir: "{app}\app"; Description: "Abrir o Baja MV agora"; Flags: postinstall nowait skipifsilent runasoriginaluser
 
 [UninstallRun]
 ; stop a running launcher and both roles first (they hold files of the program)
-Filename: "{app}\python\python.exe"; Parameters: "-m launcher --shutdown"; WorkingDir: "{app}\app"; Flags: runhidden waituntilterminated; RunOnceId: "StopBajaMV"
+Filename: "{app}\python\python.exe"; Parameters: "-P -m launcher --shutdown"; WorkingDir: "{app}\app"; Flags: runhidden waituntilterminated; RunOnceId: "StopBajaMV"
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""Baja MV (portas)"""; Flags: runhidden; RunOnceId: "FirewallPorts"
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""Baja MV (python)"""; Flags: runhidden; RunOnceId: "FirewallPython"
 
@@ -123,6 +149,34 @@ begin
   SetPreviousData(PreviousDataKey, 'DataDir', DataDirPage.Values[0]);
 end;
 
+function VcRuntimeAtLeast(RootKey: Integer): Boolean;
+var
+  Key: String;
+  Installed, Major, Minor, Bld: Cardinal;
+begin
+  Key := 'SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64';
+  Result := False;
+  if RegQueryDWordValue(RootKey, Key, 'Installed', Installed) and (Installed = 1) and
+     RegQueryDWordValue(RootKey, Key, 'Major', Major) and RegQueryDWordValue(RootKey, Key, 'Minor', Minor) and
+     RegQueryDWordValue(RootKey, Key, 'Bld', Bld) then
+  begin
+    Log(Format('VC++ runtime x64 on this PC: %d.%d.%d', [Major, Minor, Bld]));
+    if Major <> {#VcRedistMajor} then
+      Result := Major > {#VcRedistMajor}
+    else if Minor <> {#VcRedistMinor} then
+      Result := Minor > {#VcRedistMinor}
+    else
+      Result := Bld >= {#VcRedistBld};
+  end;
+end;
+
+function VcRedistNeeded: Boolean;
+begin
+  { the x64 runtime registers itself in the 32-bit registry view on most PCs, in the 64-bit one on some }
+  Result := not (VcRuntimeAtLeast(HKLM32) or VcRuntimeAtLeast(HKLM64));
+  Log(Format('VC++ runtime %s.%s.%s needed: %d', ['{#VcRedistMajor}', '{#VcRedistMinor}', '{#VcRedistBld}', Ord(Result)]));
+end;
+
 function GetDataDir(Param: String): String;
 begin
   Result := DataDirPage.Values[0];
@@ -133,9 +187,10 @@ var
   ResultCode: Integer;
   OldPython: String;
 begin
-  { upgrade: ask the running launcher (if any) to stop both roles and exit, so no file is in use }
+  { upgrade: ask the running launcher (if any) to stop both roles and exit, so no file is in use; with no launcher
+    answering, --shutdown itself stops roles left running (the zone with its safe PTZ stop) }
   OldPython := ExpandConstant('{app}\python\python.exe');
   if FileExists(OldPython) then
-    Exec(OldPython, '-m launcher --shutdown', ExpandConstant('{app}\app'), SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Exec(OldPython, '-P -m launcher --shutdown', ExpandConstant('{app}\app'), SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Result := '';
 end;
