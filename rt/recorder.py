@@ -67,23 +67,58 @@ def check_recording_config(recording_cfg):
                          "Delete the line from your config.")
 
 
+class FfmpegNotFound(Exception):
+    """The configured ffmpeg program cannot be started at all (not installed, not on PATH, wrong path). Different
+    from an encoder failing: then ffmpeg runs but cannot use that encoder on this machine."""
+
+
+def ffmpeg_missing_message(ffmpeg):
+    return ("ffmpeg not found at '%s': recording is off; install ffmpeg (e.g. `winget install Gyan.FFmpeg`, then "
+            "open a new terminal so PATH is updated) or set capture.ffmpeg in the config to the full path of "
+            "ffmpeg.exe, then restart rt" % ffmpeg)
+
+
+def find_ffmpeg(ffmpeg):
+    """The full path of the ffmpeg program, or None if it cannot be found. `ffmpeg` is the configured value
+    (capture.ffmpeg): a bare name ("ffmpeg") is looked up on PATH, a path is checked as it is."""
+    return shutil.which(ffmpeg)
+
+
+def first_useful_line(stderr):
+    """The first non-empty line of ffmpeg's error output (bytes or str), shortened; "" if there is none."""
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode("utf-8", "replace")
+    for line in (stderr or "").splitlines():
+        line = line.strip()
+        if line:
+            return line[:200]
+    return ""
+
+
 def probe_encoder(ffmpeg, name, runner=subprocess.run):
-    """True if ffmpeg can encode one small frame with this encoder on this machine (hardware encoders are listed
-    by ffmpeg even when the GPU or its driver is missing, so listing is not enough)."""
+    """(worked, detail): can ffmpeg encode one small frame with this encoder on this machine? (Hardware encoders are
+    listed by ffmpeg even when the GPU or its driver is missing, so listing is not enough.) `detail` is the first
+    line of ffmpeg's error output when it failed. Raises FfmpegNotFound when ffmpeg itself cannot be started."""
     try:
         result = runner([ffmpeg, "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=320x240:d=0.2", "-frames:v",
                          "1", "-c:v", name, "-f", "null", "-"], capture_output=True, timeout=30)
-        return result.returncode == 0
-    except Exception:  # noqa: BLE001
-        return False
+    except (FileNotFoundError, NotADirectoryError, PermissionError) as e:
+        raise FfmpegNotFound(str(e)) from e
+    except Exception as e:  # noqa: BLE001 (a timeout, anything else: this encoder is not usable)
+        return False, "%s: %s" % (type(e).__name__, e)
+    if result.returncode == 0:
+        return True, ""
+    detail = first_useful_line(getattr(result, "stderr", b"")) or "exit code %s" % result.returncode
+    return False, detail
 
 
 def pick_h264_encoder(ffmpeg, candidates, runner=subprocess.run, tried=None):
-    """The first encoder of `candidates` that works here, or None. `tried` (a list) receives (name, worked)."""
+    """The first encoder of `candidates` that works here, or None. `tried` (a list) receives (name, worked, detail).
+    Raises FfmpegNotFound when ffmpeg itself cannot be started."""
     for name in candidates:
-        worked = probe_encoder(ffmpeg, name, runner)
+        worked, detail = probe_encoder(ffmpeg, name, runner)
         if tried is not None:
-            tried.append((name, worked))
+            tried.append((name, worked, detail))
         if worked:
             return name
     return None
@@ -198,7 +233,8 @@ class Recorder(threading.Thread):
         self.disk_free_gb = disk_free_gb or (lambda folder: shutil.disk_usage(folder).free / 1e9)
         self.popen = popen or subprocess.Popen
         self.encoder = encoder
-        self.encoder_probe = []                  # (encoder, worked) from choose_encoder()
+        self.encoder_probe = []                  # (encoder, worked, ffmpeg's error line) from choose_encoder()
+        self.unavailable = None                  # set by choose_encoder() when ffmpeg is missing: why recording is off
         self.q = queue.Queue(maxsize=max(1, int(recording_cfg["queue_frames"])))
         self.camera_info = {}
         self.seg = None
@@ -223,10 +259,26 @@ class Recorder(threading.Thread):
 
     # ------------------------------------------------------------------ set-up (main thread)
     def choose_encoder(self):
-        """Probe the H.264 encoders once (at start, before any frame) and log which one is used."""
+        """Probe the H.264 encoders once (at start, before any frame) and log which one is used.
+
+        If ffmpeg itself is missing, recording cannot work at all: `self.unavailable` gets the message (for the log
+        and the status page), the recorder gives up (offer() ignores frames) and this returns None. run.py then runs
+        without recording; detection never depends on it."""
+        if self.unavailable:
+            return None
         if self.encoder is None:
-            self.encoder = pick_h264_encoder(self.ffmpeg, self.encoders, tried=self.encoder_probe)
-            tried = ", ".join("%s %s" % (name, "ok" if worked else "failed") for name, worked in self.encoder_probe)
+            try:
+                if find_ffmpeg(self.ffmpeg) is None:
+                    raise FfmpegNotFound("not on PATH")
+                self.encoder = pick_h264_encoder(self.ffmpeg, self.encoders, tried=self.encoder_probe)
+            except FfmpegNotFound:
+                self.unavailable = ffmpeg_missing_message(self.ffmpeg)
+                self.gave_up = True
+                self.last_error = self.unavailable
+                self.log("WARNING recording: " + self.unavailable)
+                return None
+            tried = ", ".join("%s %s" % (name, "ok" if worked else "failed (%s)" % detail if detail else "failed")
+                              for name, worked, detail in self.encoder_probe)
             if self.encoder is None:
                 self.encoder = "libx264"
                 self.log("WARNING recording: no H.264 encoder passed the probe (%s); trying libx264 anyway" % tried)
@@ -486,7 +538,9 @@ class Recorder(threading.Thread):
     # ------------------------------------------------------------------ status page
     def status(self):
         seg = self.seg
-        if self.gave_up:
+        if self.unavailable:
+            state = "off: " + self.unavailable
+        elif self.gave_up:
             state = "failed: gave up after %d ffmpeg failures (last: %s)" % (self.failures_in_a_row, self.last_error)
         elif self.disk_state == "stopped":
             state = "stopped: low disk"

@@ -20,8 +20,11 @@ from .models import Recognizer, RosterScorer, YoloOnnx, enlarge, plain, vote_box
 
 
 class IdentityWorker(threading.Thread):
-    def __init__(self, cfg, roster, teams, emit, log=print, panel=None, recognizer=None):
-        """panel / recognizer: model objects to use instead of loading the ONNX files (tests pass fakes)."""
+    def __init__(self, cfg, roster, teams, emit, log=print, panel=None, recognizer=None, open_set=False):
+        """panel / recognizer: model objects to use instead of loading the ONNX files (tests pass fakes).
+        open_set: True when there is no roster for the event and `roster` is just every plausible number
+        (config.load_roster). Reads are then not checked against an entry list, so auto-confirm is always off and
+        no pass_provisional is sent (its precision was measured with a real roster)."""
         super().__init__(daemon=True)
         m, r, i = cfg["models"], cfg["runtime"], cfg["identity"]
         th, spin = int(r["threads_identity"]), bool(r["ort_spinning"])
@@ -30,6 +33,7 @@ class IdentityWorker(threading.Thread):
         self.rec = recognizer or Recognizer(m["recognizer"], th, spin, backend=r["id_backend"], device=r["id_device"],
                                             log=log)
         self.roster, self.teams = roster, teams
+        self.open_set = bool(open_set)
         self.scorer = RosterScorer(roster)
         self.rule = vote_rule(cfg)
         self.conf, self.pad = float(i["panel_conf"]), float(i["panel_pad"])
@@ -110,7 +114,7 @@ class IdentityWorker(threading.Thread):
             return dict(out, number=None, confidence=0.0, auto_confirm=False, top3=[])
         o = np.argsort(-s, kind="stable")[:3]
         top3 = [dict(number=self.roster[k], share=round(float(s[k]), 4)) for k in o if s[k] > 0]
-        auto = bool(score >= self.rule["tau"] and sup >= self.rule["min_support"])
+        auto = bool(score >= self.rule["tau"] and sup >= self.rule["min_support"]) and not self.open_set
         return dict(out, number=self.roster[j], team=self.teams.get(self.roster[j], ""), confidence=round(score, 4),
                     auto_confirm=auto, top3=top3)
 
@@ -144,7 +148,7 @@ class IdentityWorker(threading.Thread):
         rec = dict(type="pass_identity", pass_id=p.pid, t_video=self.now_fn(),
                    **{k: end_ev[k] for k in ("t_enter", "t_cross", "t_exit", "dwell_s", "n_frames", "n_tracks",
                                              "exited", "hmax")},
-                   n_crops=len(cands), **v,
+                   n_crops=len(cands), **v, roster_checked=not self.open_set,
                    provisional_number=p.prov["number"] if p.prov else None,
                    identity_latency_s=round(lat, 3))
         p.done = True

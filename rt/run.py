@@ -145,13 +145,25 @@ def main():
         recorder = Recorder(cfg, out.parent / recording_cfg["subdir"], float(cfg["capture"]["fps"]), version,
                             log=log)
         recorder.choose_encoder()                     # probe QSV / AMF / x264 once, now, and log the one used
-        recorder.start()
-        if board is not None:
-            board.recorder = recorder
+        if recorder.unavailable:                      # ffmpeg missing: run without recording, detection unaffected
+            warn("RECORDING: " + recorder.unavailable)
+            if board is not None:
+                board.notices.append(recorder.unavailable)
+            recorder = None
+        else:
+            recorder.start()
+            if board is not None:
+                board.recorder = recorder
 
     beam = start_beam(cfg, em, board, live_camera, log, warn, config_path=a.config or C.DEFAULT)
 
-    roster, teams = C.read_roster(a.event)
+    # A missing roster never stops rt (the launcher would restart it forever): run in open-set mode instead.
+    roster_info = C.load_roster(a.event, int(cfg["identity"].get("open_set_max", C.OPEN_SET_MAX)))
+    roster, teams = roster_info["numbers"], roster_info["teams"]
+    if roster_info["open_set"]:
+        warn("ROSTER: " + roster_info["warning"])
+        if board is not None:
+            board.notices.append(roster_info["warning"])
     m = cfg["models"]
     det = YoloOnnx(m["car_detector"], m["car_imgsz"], int(runtime_cfg["threads_detector"]),
                    spinning=bool(runtime_cfg["ort_spinning"]), backend=runtime_cfg["car_backend"],
@@ -162,14 +174,16 @@ def main():
     idw = None
     if not a.no_identity:
         from rt.identity import IdentityWorker
-        idw = IdentityWorker(cfg, roster, teams, em.emit, log=warn)
+        idw = IdentityWorker(cfg, roster, teams, em.emit, log=warn, open_set=roster_info["open_set"])
         idw.start()
     pl = PassLogic(cfg, em.emit, idw, log=log)
     if idw:
         idw.now_fn = lambda: pl.now
     vr = C.vote_rule(cfg)
-    log("rt start (%s): event %s (%d roster numbers), car detector %s [%s], panel %s [%s], recognizer %s [%s], "
-        "vote %s" % (version, a.event, len(roster), Path(m["car_detector"]).parent.parent.name + "/" + Path(m["car_detector"]).name, det.desc,
+    roster_desc = ("NO ROSTER, open set 1-%d" % len(roster)) if roster_info["open_set"] else (
+        "%d roster numbers" % len(roster))
+    log("rt start (%s): event %s (%s), car detector %s [%s], panel %s [%s], recognizer %s [%s], "
+        "vote %s" % (version, a.event, roster_desc, Path(m["car_detector"]).parent.parent.name + "/" + Path(m["car_detector"]).name, det.desc,
         Path(m["panel_detector"]).parent.parent.name, idw.panel.desc if idw else "-",
         Path(m["recognizer"]).parent.name, idw.rec.desc if idw else "-", vr))
 

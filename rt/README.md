@@ -265,7 +265,8 @@ python rt/run.py --source <file | camera | camera index | rtsp/http url> --event
                  [--out passes.jsonl] [--set section.key=value ...] [--threads N] [--affinity 2,4] [--stats]
 ```
 
-* `--event 26SE` selects `rosters/26SE.csv` (numbers that the reader snaps to).
+* `--event 26SE` selects `rosters/26SE.csv` (numbers that the reader snaps to). If that file is missing or empty,
+  rt still runs, in open-set mode (see Troubleshooting).
 * Files are processed as fast as possible. With `--realtime` they are paced at real speed and frames are dropped when
   detection falls behind, exactly like a live source. `--start 11:38` (wall clock, or seconds into the file) and
   `--duration 600` select a segment. `--as-live` sends a file through the live-stream code path.
@@ -361,7 +362,7 @@ the frame being processed). Times are epoch seconds of the video PC's clock, eac
 | `pass_start` | a track becomes foreground (box > 0.2 H, bottom > 0.4 H, 6 frames: ~0.6 s after the car appears) and joins no open pass | `pass_id`, `t_enter`, `box` (first box, normalised x1 y1 x2 y2), `hmax` |
 | `pass_provisional` | first confident read while the pass is open (same rule as auto-confirm) | `pass_id`, `number`, `confidence`, `support`, `n_read`, `top3` |
 | `pass_end` | the pass closed: all its tracks gone and 10 s without a box (the re-attach windows expired) | `pass_id`, `t_enter`, `t_cross`, `t_exit`, `dwell_s`, `n_frames`, `n_tracks`, `tracks`, `exited`, `hmax`, `n_crops` |
-| `pass_identity` | identity of the closed pass is done (async) | everything in `pass_end` plus `number` (null = no panel box in any crop), `team`, `confidence` (vote share), `auto_confirm`, `support`, `n_read`, `n_boxed`, `n_boxes`, `top3` [{number, share}], `provisional_number`, `identity_latency_s` |
+| `pass_identity` | identity of the closed pass is done (async) | everything in `pass_end` plus `number` (null = no panel box in any crop), `team`, `confidence` (vote share), `auto_confirm`, `support`, `n_read`, `n_boxed`, `n_boxes`, `top3` [{number, share}], `provisional_number`, `identity_latency_s`, `roster_checked` (false = no roster, open-set mode) |
 | `beam` | beam port state change (open, retrying, lost, stopped) | `state`, `detail`, `driver`, `port` |
 | `beam_edge` | every raw beam edge (at most `max_edge_events_per_s`) | `edge_no`, `line`, `level` (1 blocked, 0 clear), `raw` (line state / bytes hex), `t_edge` (wall + offset_s), `t_wall`, `t_mono`, `poll_gap_ms` |
 | `beam_break` | one car: edges grouped by `group_gap_s` | `break_id`, `t_beam` (first edge = crossing), `t_beam_mono`, `t_last`, `t_last_mono`, `n_edges`, `n_pulses`, `duration_s`, `started_blocked`, `interrupted` |
@@ -380,6 +381,30 @@ the frame being processed). Times are epoch seconds of the video PC's clock, eac
   `top3` as suggestions.
 * A pass is final only at `pass_end`. Later tracks can still join a pass before that. `pass_start` is a fast signal
   for the PTZ, not a count.
+
+## Troubleshooting
+
+Both problems below leave rt running; each shows a yellow notice at the top of the status page and a `warning` line in
+the log. Both are read once at start: after fixing them, **restart rt** (close it; the launcher starts it again).
+
+* **"no roster for 26SU ... numbers are not checked against the entry list"**: `rosters/26SU.csv` is missing or empty
+  (or unreadable). The results site lists the teams only shortly before the event, so the roster cannot be fetched
+  earlier. rt then runs in *open-set mode*: it reads any number from 1 to `identity.open_set_max` (999) instead of
+  snapping to the entry list, `team` is empty, `roster_checked` is false, `auto_confirm` is always false (its ~99%
+  precision was measured with a real roster) and no `pass_provisional` is sent. Every pass goes to a human.
+  Fix: once the event's results page lists the teams, run `python teacher/rosters.py 26SU` (writes
+  `rosters/26SU.csv`; check it has rows), then restart rt. Open-set snapping costs ~6x more CPU per crop than a
+  100-car roster; on a slow laptop `--set identity.open_set_max=99` (every event so far used 1-99) makes it cheaper.
+* **"ffmpeg not found at 'ffmpeg': recording is off"**: the ffmpeg program is not installed or not on PATH (this used
+  to show up as "no H.264 encoder passed the probe (h264_qsv failed, h264_amf failed, libx264 failed)"). Detection
+  and identity run normally; only the recording is off. Fix: `winget install Gyan.FFmpeg`, then open a **new**
+  terminal (PATH is read when it opens) and check `ffmpeg -version`; or set `capture.ffmpeg` in your config to the
+  full path of `ffmpeg.exe`. Then restart rt. Note: a `camera.device` given as a DirectShow device path (not an
+  index) also needs ffmpeg to find the camera.
+* **"no H.264 encoder passed the probe (h264_qsv failed (...), ...)"** with ffmpeg installed: each encoder's
+  reason is in brackets (the first line of ffmpeg's error output). rt still tries libx264; if that fails too,
+  recording errors show on the status page. Usual causes: no Intel/AMD GPU driver for QSV/AMF (normal, x264 is used),
+  or an ffmpeg build without libx264 (install the Gyan "full" or "essentials" build).
 
 ## What is stubbed / not done
 

@@ -123,13 +123,51 @@ def vote_rule(cfg):
     return dict(tau=float(d["tau"]), min_support=int(d.get("min_support", 1)), score=d.get("score", "share"))
 
 
-def read_roster(event):
-    """rosters/<EV>.csv (numero,equipe) -> (sorted numbers, {numero: equipe})"""
+# Open-set mode (no roster for the event yet): the numbers the reader may answer. Every roster scraped so far
+# (03SU-26SE, 60 events) used numbers 1-99; 999 leaves room for 3-digit numbers. The recognizer reads any digit
+# string, so this is only a limit of the snapping step. Snapping to 999 numbers costs ~6x more CPU per crop than a
+# ~100-number roster (numpy CTC, ~25 ms per crop on a desktop), which the identity thread absorbs (it never blocks
+# detection). Set identity.open_set_max = 99 to make it cheaper.
+OPEN_SET_MAX = 999
+
+
+def roster_path(event, rosters_dir=None):
+    return Path(rosters_dir or (ROOT / "rosters")) / ("%s.csv" % event)
+
+
+def read_roster(event, rosters_dir=None):
+    """rosters/<EV>.csv (numero,equipe) -> (sorted numbers, {numero: equipe}). Raises FileNotFoundError when the
+    file is missing; an existing file with no rows gives ([], {})."""
     import csv
-    p = ROOT / "rosters" / ("%s.csv" % event)
-    if not p.exists():
-        raise SystemExit("no roster %s (rosters/<EV>.csv)" % p)
+    p = roster_path(event, rosters_dir)
     with open(p, encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
-    teams = {int(r["numero"]): r.get("equipe", "") for r in rows}
+    teams = {int(r["numero"]): r.get("equipe", "") for r in rows if str(r.get("numero") or "").strip()}
     return sorted(teams), teams
+
+
+def load_roster(event, open_set_max=OPEN_SET_MAX, rosters_dir=None):
+    """The event roster for rt, or an "open set" when it cannot be used. Never stops rt.
+
+    Returns dict(numbers, teams, open_set, warning):
+      * roster found: numbers/teams from the file, open_set False, warning None.
+      * file missing, empty or unreadable: numbers 1..open_set_max, no team names, open_set True, and a warning to
+        log and to show on the status page. In open-set mode auto-confirm is off: its ~99% precision was measured
+        with the real roster, which also throws away misreads that are not entry numbers."""
+    p = roster_path(event, rosters_dir)
+    problem = None
+    try:
+        numbers, teams = read_roster(event, rosters_dir)
+        if not numbers:
+            problem = "%s is empty" % p
+    except FileNotFoundError:
+        problem = "%s not found" % p
+    except (OSError, ValueError, KeyError) as e:      # unreadable file, a bad number, no "numero" column
+        problem = "%s unreadable (%s: %s)" % (p, type(e).__name__, e)
+    if problem is None:
+        return dict(numbers=numbers, teams=teams, open_set=False, warning=None, path=str(p))
+    warning = ("no roster for %s (%s): numbers are not checked against the entry list (any number 1-%d can be "
+               "read, auto-confirm is off); run `python teacher/rosters.py %s` once the event's results page lists "
+               "the teams, then restart rt" % (event, problem, int(open_set_max), event))
+    return dict(numbers=list(range(1, int(open_set_max) + 1)), teams={}, open_set=True, warning=warning,
+                path=str(p))
