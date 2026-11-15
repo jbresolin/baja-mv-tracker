@@ -68,6 +68,14 @@ Name: "startatlogin"; Description: "Abrir o Baja MV ao entrar no Windows"; Flags
 [Dirs]
 ; the data folder: everyone on this PC may write to it; never removed by the uninstaller
 Name: "{code:GetDataDir}"; Permissions: users-modify; Flags: uninsneveruninstall
+; its sub-folders exist from the start, so the operator (and anything copied in by hand) finds them before the first run
+Name: "{code:GetDataDir}\config"; Flags: uninsneveruninstall
+Name: "{code:GetDataDir}\out"; Flags: uninsneveruninstall
+Name: "{code:GetDataDir}\logs"; Flags: uninsneveruninstall
+Name: "{code:GetDataDir}\rosters"; Flags: uninsneveruninstall
+Name: "{code:GetDataDir}\zones"; Flags: uninsneveruninstall
+Name: "{code:GetDataDir}\reports"; Flags: uninsneveruninstall
+Name: "{code:GetDataDir}\exports"; Flags: uninsneveruninstall
 
 [InstallDelete]
 ; an upgrade replaces the program completely (no stale files from an older version); the data folder is not touched
