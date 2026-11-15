@@ -54,6 +54,21 @@ def read_build_info(code_root):
         return {"version": "unknown", "error": "build_info.json unreadable"}
 
 
+def decode_ini_bytes(raw):
+    """Text of install.ini. Inno Setup writes INI files with the Windows API, which uses the PC's ANSI code page
+    (cp1252 on a Brazilian Windows), not UTF-8: a data folder like C:\\Gravações arrives as cp1252 bytes. Try
+    UTF-8 first (a file we or a test wrote), then the ANSI code page ("mbcs", Windows only), then cp1252, which can
+    decode any byte, so this never raises."""
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
+    for encoding in ("utf-8", "mbcs", "cp1252"):
+        try:
+            return raw.decode(encoding)
+        except (UnicodeDecodeError, LookupError):       # LookupError: "mbcs" exists only on Windows
+            continue
+    return raw.decode("latin-1")
+
+
 def read_install_ini(code_root):
     """The data root the installer wrote to install.ini ([paths] data_root = ...), or None."""
     path = Path(code_root) / "install.ini"
@@ -61,11 +76,28 @@ def read_install_ini(code_root):
         return None
     parser = configparser.ConfigParser()
     try:
-        parser.read(path, encoding="utf-8")
+        parser.read_string(decode_ini_bytes(path.read_bytes()))
     except (OSError, configparser.Error):
         return None
     value = parser.get("paths", "data_root", fallback="").strip()
     return value or None
+
+
+def installed_app_of_python(executable=None):
+    """INSTALL\\app when this Python is an installed one (INSTALL\\python\\python.exe with INSTALL\\app\\install.ini or
+    build_info.json next to it), else None. The self-test uses it to catch an installed Python that imported some
+    other copy of the code (e.g. a repo checkout in the current folder, which `python -m` puts first on sys.path)."""
+    exe = Path(executable or sys.executable).resolve()
+    app = exe.parent.parent / "app"
+    if (app / "install.ini").exists() or (app / "build_info.json").exists():
+        return app
+    return None
+
+
+def same_folder(a, b):
+    """Do two paths name the same folder? (resolved; case-insensitive on Windows)"""
+    a, b = os.path.normcase(str(Path(a).resolve())), os.path.normcase(str(Path(b).resolve()))
+    return a == b
 
 
 def console_python(executable=None):

@@ -113,3 +113,11 @@ def test_restart_is_stop_then_start(paths, fake_system, fake_clock):
     assert len(fake_system.started) == 2
     assert fake_system.killed == [fake_system.started[0].pid]
     assert manager.running_roles() == ["lapline"]
+
+
+def test_installed_children_never_import_code_from_their_current_folder(paths):
+    # PYTHONSAFEPATH=1 is "python -P" for every child: an installed role always imports the installed code. In repo
+    # mode it must NOT be set (there the repo folder on the import path is how `python -m zone.app` is found).
+    from dataclasses import replace
+    assert "PYTHONSAFEPATH" not in child_env(paths, base={})
+    assert child_env(replace(paths, installed=True), base={})["PYTHONSAFEPATH"] == "1"

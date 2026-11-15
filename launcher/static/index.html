@@ -17,6 +17,7 @@
   <!-- ===================================================== this laptop -->
   <section class="card">
     <h2>Este computador</h2>
+    <div class="bench-warning hidden" id="network-warning"></div>
     <p class="small">Escolha o papel deste notebook. Os dois juntos só numa bancada de testes.</p>
     <label class="check"><input type="checkbox" id="role-lapline"> Linha de chegada (contagem de voltas)</label>
     <label class="check"><input type="checkbox" id="role-zone"> Zona PTZ (câmera que segue os carros)</label>
@@ -117,7 +118,7 @@
       <div class="field-error" data-for="web_port"></div>
       <label>Porta da API do estúdio <input name="agent_port" inputmode="numeric"></label>
       <div class="field-error" data-for="agent_port"></div>
-      <label>Token do estúdio (X-Agent-Token; defina um no evento) <input name="agent_token"></label>
+      <label>Token do estúdio (X-Agent-Token; defina um no evento) <input name="agent_token" type="password" autocomplete="new-password" placeholder="sem token"></label>
       <div class="field-error" data-for="agent_token"></div>
       <button type="submit">Salvar configurações</button>
       <p class="small">Reinicie a zona para aplicar. Arquivo: <span class="config-path"></span></p>

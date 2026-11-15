@@ -30,24 +30,64 @@ def ping(port, timeout=1.0):
         return None
 
 
-def request_shutdown(port, timeout=30.0):
-    """--shutdown: ask the running launcher to stop the roles and exit. 0 = done or nothing was running."""
-    if ping(port) is None:
-        print("nenhum Baja MV rodando na porta %d" % port)
-        return 0
-    request = urllib.request.Request("http://127.0.0.1:%d/api/shutdown" % port, data=b"", method="POST")
-    try:
-        urllib.request.urlopen(request, timeout=timeout).read()
-    except Exception as e:  # noqa: BLE001
-        print("pedido de parada falhou: %s" % e)
-        return 1
-    # wait until it is gone (it stops the roles first)
+def stop_leftover_roles(paths, make_roles=None, log=print):
+    """Stop role processes that run with no launcher in charge (the launcher was closed with "Fechar o painel",
+    crashed, or never answered). They are found through their pid files (procs.ManagedProcess.adopt) and stopped like
+    the page's Parar does: the zone with its safe stop (PARAR on its page, kill, VISCA stop to the PTZ).
+    Without this the installer's Restart Manager would kill them hard, leaving a moving PTZ moving.
+    -> the names of the roles that were stopped."""
+    from launcher.roles import RoleManager
+    roles = (make_roles or (lambda: RoleManager(paths, log=log)))()
+    roles.adopt_running()
+    running = [name for name, process in roles.processes.items() if process.running()]
+    if not running:
+        return []
+    log("parando processos sem painel: %s" % ", ".join(running))
+    roles.stop_all()
+    # stop_all() covers the two roles (and the zone's PTZ recorder); anything else adopted is stopped plainly
+    for name, process in roles.processes.items():
+        if process.running():
+            process.stop()
+    return running
+
+
+def request_shutdown(port, timeout=30.0, paths=None, ping_fn=None, post=None, make_roles=None, sleep=None,
+                     log=print):
+    """--shutdown (the installer, before an upgrade and before an uninstall): stop both roles and the launcher.
+    1. A launcher answers on the port: ask it to stop the roles and exit, and wait until it is gone.
+    2. In every case, then: roles still running with no launcher (see stop_leftover_roles) are stopped here.
+    Returns 0 when nothing of Baja MV is left running, 1 otherwise. Network calls are injectable for the tests."""
     import time
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline and ping(port, timeout=0.5) is not None:
-        time.sleep(0.5)
-    print("Baja MV parado")
-    return 0
+    ping_fn = ping_fn or ping
+    sleep = sleep or time.sleep
+    if post is None:
+        def post(url):
+            urllib.request.urlopen(urllib.request.Request(url, data=b"", method="POST"), timeout=timeout).read()
+    code = 0
+    if ping_fn(port) is None:
+        log("nenhum painel do Baja MV respondendo na porta %d" % port)
+    else:
+        try:
+            post("http://127.0.0.1:%d/api/shutdown" % port)
+        except Exception as e:  # noqa: BLE001
+            log("pedido de parada ao painel falhou: %s" % e)
+            code = 1
+        # wait until it is gone (it stops the roles first)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and ping_fn(port, timeout=0.5) is not None:
+            sleep(0.5)
+        if ping_fn(port, timeout=0.5) is not None:
+            log("o painel ainda responde depois de %d s" % timeout)
+            code = 1
+    try:
+        stopped = stop_leftover_roles(paths or resolve_paths(), make_roles=make_roles, log=log)
+        if stopped:
+            log("parados sem painel: %s" % ", ".join(stopped))
+    except Exception as e:  # noqa: BLE001
+        log("parar processos sem painel falhou: %s: %s" % (type(e).__name__, e))
+        code = 1
+    log("Baja MV parado" if code == 0 else "Baja MV: parada incompleta")
+    return code
 
 
 def redirect_output_to_log(paths):
@@ -88,7 +128,7 @@ def main(argv=None):
         from launcher.selftest import run_self_test
         return run_self_test(keep=args.keep)
     if args.shutdown:
-        return request_shutdown(args.port)
+        return request_shutdown(args.port, paths=resolve_paths(args.data_root))
 
     paths = resolve_paths(args.data_root)
     paths.make_folders()
@@ -109,7 +149,7 @@ def main(argv=None):
 
     shown = False
     if not args.no_tray:
-        shown = run_tray_or_false(launcher, url)
+        shown = run_tray_or_false(launcher, url, server_alive=thread.is_alive)
     if not shown:
         if not args.no_browser:
             webbrowser.open(url)
@@ -126,9 +166,9 @@ def main(argv=None):
     return 0
 
 
-def run_tray_or_false(launcher, url):
+def run_tray_or_false(launcher, url, server_alive=None):
     from launcher.tray import run_tray
-    return run_tray(launcher, url, webbrowser.open, log=log)
+    return run_tray(launcher, url, webbrowser.open, log=log, server_alive=server_alive)
 
 
 if __name__ == "__main__":

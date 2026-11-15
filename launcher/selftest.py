@@ -2,7 +2,9 @@
 good. The CI smoke test runs it right after a silent install; run it on a laptop after installing, too.
 
 Checks, in order (each prints [ OK ], [WARN] or [FAIL] with a detail):
-  1. Python: version and where it runs from.
+  1. Python: version and where it runs from; an installed Python must run the installed code (not, say, a repo
+     checkout that happens to be the current folder). Windows: the Visual C++ runtime is new enough, and whether
+     a network is marked Public (a warning).
   2. Imports: every module of rt/, zone/ and launcher/ (tests excluded).
   3. Models: each model of deploy/models/manifest.json loads in ONNX Runtime; the car detector runs once.
   4. OpenVINO: imports, lists its devices, compiles the car detector on CPU (and says whether a GPU is there).
@@ -10,7 +12,8 @@ Checks, in order (each prints [ OK ], [WARN] or [FAIL] with a detail):
   6. ffmpeg / ffprobe: run, and the build has libx264, h264_qsv and h264_amf (rt probes them in that order).
   7. Tray: pystray + Pillow import and the icon can be drawn.
   8. Lap line role: started through the launcher's own RoleManager (rt/supervise.py -> rt/run.py) on a synthetic
-     video instead of a camera; its status page must answer; then stopped (the process tree must be gone).
+     video instead of a camera; its status page must answer; then stopped (the supervisor and every process it
+     started must be gone: checked with psutil, not only with the launcher's own bookkeeping).
   9. Zone PTZ role: the same, with the synthetic video as spotter and a fake VISCA camera (zone/ptz/fake_camera.py)
      on 127.0.0.1 as PTZ; its page and the studio API must answer; then the safe stop.
  10. The launcher's own page answers.
@@ -34,7 +37,8 @@ from dataclasses import replace
 from pathlib import Path
 
 from launcher import settings as S
-from launcher.paths import resolve_paths
+from launcher.paths import installed_app_of_python, resolve_paths, same_folder
+from launcher.procs import find_process
 
 PACKAGES = ("rt", "zone", "launcher")
 DEV_ONLY_MODULES = {"rt.eval_26se"}         # needs pandas + the 26SE data: not installed, not needed at the race
@@ -118,7 +122,110 @@ def make_test_video(ffmpeg, path, seconds=60):
     raise RuntimeError("ffmpeg could not write a test video")
 
 
+def process_tree(pid):
+    """[(pid, create_time)] of a process and all of its children, grandchildren... ([] when psutil cannot see it).
+    The create time tells a later check apart from a new process that got the same pid."""
+    try:
+        import psutil
+        parent = psutil.Process(int(pid))
+        return [(p.pid, p.create_time()) for p in [parent] + parent.children(recursive=True)]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def still_alive(tree, find=find_process, timeout_s=15.0, poll_s=0.5, clock=time.monotonic, sleep=time.sleep):
+    """The pids of `tree` (from process_tree) that still run after up to timeout_s seconds ([] = all gone)."""
+    deadline = clock() + timeout_s
+    while True:
+        alive = [pid for pid, created in tree if find(pid, created) is not None]
+        if not alive or clock() >= deadline:
+            return alive
+        sleep(poll_s)
+
+
+def stop_verdict(tree, find=find_process, **kwargs):
+    """(ok, text) for a role's stop: ok only when the supervisor and every process under it are gone."""
+    if not tree:
+        return False, "DID NOT STOP? (its processes could not be listed before stopping)"
+    alive = still_alive(tree, find=find, **kwargs)
+    if alive:
+        return False, "DID NOT STOP: pid %s still running" % ", ".join(str(pid) for pid in alive)
+    return True, "stopped (%d processes gone)" % len(tree)
+
+
 # ============================================================================================== the checks
+def check_code_location(results, code_root, executable=None):
+    """An installed Python must import the installed code. `python -m launcher` puts the current folder first on
+    the import path, so started from a repo checkout it would test the checkout instead (the first CI run did:
+    every installed file "missing"). BajaMV.cmd and the shortcuts use `python -P`, which this check guards."""
+    app = installed_app_of_python(executable)
+    if app is None:
+        results.add("ok", "code location", "%s (not an installed Python)" % code_root)
+    elif same_folder(app, code_root):
+        results.add("ok", "code location", "installed code %s" % code_root)
+    else:
+        results.add("fail", "code location", "this installed Python runs the code in %s, not the installed %s "
+                    "(started from a folder with its own launcher\\? use BajaMV.cmd, or python -P -m launcher)" % (
+                        code_root, app))
+
+
+def file_version(path):
+    """(major, minor, build, revision) of a Windows DLL / EXE, or None (needs Windows' version.dll)."""
+    import ctypes
+    from ctypes import wintypes
+    version = ctypes.WinDLL("version")
+    size = version.GetFileVersionInfoSizeW(str(path), None)
+    if not size:
+        return None
+    buffer = ctypes.create_string_buffer(size)
+    if not version.GetFileVersionInfoW(str(path), 0, size, buffer):
+        return None
+    pointer, length = ctypes.c_void_p(), wintypes.UINT()
+    if not version.VerQueryValueW(buffer, "\\", ctypes.byref(pointer), ctypes.byref(length)):
+        return None
+    # VS_FIXEDFILEINFO: signature, struct version, then FileVersionMS and FileVersionLS
+    words = ctypes.cast(pointer, ctypes.POINTER(wintypes.DWORD * 4)).contents
+    ms, ls = words[2], words[3]
+    return (ms >> 16, ms & 0xFFFF, ls >> 16, ls & 0xFFFF)
+
+
+MIN_VC_RUNTIME = (14, 40)       # older msvcp140.dll + newer ONNX Runtime / OpenVINO = crash in std::mutex
+
+
+def check_vc_runtime(results, python_dir, version_of=None, system_dir=None):
+    """Windows: the Visual C++ runtime that ONNX Runtime / OpenVINO load (msvcp140.dll) must be 14.40 or newer. The
+    installer runs Microsoft's vc_redist when the PC's copy is older; a msvcp140.dll next to python.exe would win
+    over the system one, so an old one there is a failure too."""
+    import os
+    version_of = version_of or file_version
+    system_dir = Path(system_dir or Path(os.environ.get("SystemRoot", "C:/Windows")) / "System32")
+    problems, seen = [], []
+    for where in (Path(python_dir), system_dir):
+        dll = where / "msvcp140.dll"
+        if not dll.exists():
+            continue
+        found = version_of(dll)
+        seen.append("%s %s" % (dll, ".".join(map(str, found)) if found else "?"))
+        if found is not None and tuple(found[:2]) < MIN_VC_RUNTIME:
+            problems.append("%s is %s (needs %d.%d or newer)" % (dll, ".".join(map(str, found)), *MIN_VC_RUNTIME))
+    if not seen:
+        results.add("fail", "vc runtime", "msvcp140.dll not found (install the VC++ 2015-2022 x64 redistributable)")
+    elif problems:
+        results.add("fail", "vc runtime", "; ".join(problems))
+    else:
+        results.add("ok", "vc runtime", "; ".join(seen))
+
+
+def check_network_profile(results, lookup=None):
+    """Windows: warn when a connection is marked Public (see launcher/netprofile.py)."""
+    from launcher.netprofile import public_network_warning, public_networks
+    warning = public_network_warning((lookup or public_networks)())
+    if warning:
+        results.add("warn", "network profile", warning)
+    else:
+        results.add("ok", "network profile", "no network marked Public")
+
+
 def check_imports(results, code_root):
     bad = []
     names = module_names(code_root)
@@ -215,8 +322,9 @@ def check_lapline_role(results, paths, video, timeout_s=180):
         return
     process = roles.processes["lapline"]
     body = wait_for_http("http://127.0.0.1:%d/status.json" % port, timeout_s, is_alive=process.running)
+    tree = process_tree(process.proc.pid) if process.running() else []
     roles.stop("lapline")
-    stopped = not process.running()
+    stopped, stop_text = stop_verdict(tree)
     if body is None:
         results.add("fail", "lap line role", "status page never answered; log: %s" % " | ".join(
             process.status(15)["log"]))
@@ -224,7 +332,7 @@ def check_lapline_role(results, paths, video, timeout_s=180):
     status = json.loads(body.decode("utf-8"))
     results.add("ok" if stopped else "fail", "lap line role", "status page answered (event %s, fps %s); %s" % (
         (status.get("info") or {}).get("event"), (status.get("processing") or {}).get("fps"),
-        "stopped" if stopped else "DID NOT STOP"))
+        stop_text))
 
 
 def check_zone_role(results, paths, video, timeout_s=180):
@@ -250,14 +358,15 @@ def check_zone_role(results, paths, video, timeout_s=180):
         page = wait_for_http("http://127.0.0.1:%d/api/state" % web_port, timeout_s, is_alive=process.running)
         agent = wait_for_http("http://127.0.0.1:%d/agent/info" % agent_port, 30, is_alive=process.running) \
             if page is not None else None
+        tree = process_tree(process.proc.pid) if process.running() else []
         ok, message = roles.stop("zone")
-        stopped = not process.running()
+        stopped, stop_text = stop_verdict(tree)
         if page is None or agent is None:
             results.add("fail", "zone role", "%s did not answer; log: %s" % (
                 "page" if page is None else "studio API", " | ".join(process.status(15)["log"])))
             return
         results.add("ok" if stopped else "fail", "zone role", "page and studio API answered; %s (%s)" % (
-            "stopped" if stopped else "DID NOT STOP", message))
+            stop_text, message))
     finally:
         camera.stop()
 
@@ -289,6 +398,12 @@ def run_self_test(keep=False, out=print):
     paths.make_folders()
     out("Baja MV self-test: version %s, code %s, temporary data %s" % (real.version, real.code_root, temp_root))
     results.add("ok", "python", "%s %s (%s)" % (platform.python_version(), sys.executable, platform.platform()))
+    check_code_location(results, real.code_root)
+    if sys.platform == "win32":
+        with step(results, "vc runtime"):
+            check_vc_runtime(results, Path(sys.executable).parent)
+        with step(results, "network profile"):
+            check_network_profile(results)
     with step(results, "imports"):
         check_imports(results, real.code_root)
     models = {}

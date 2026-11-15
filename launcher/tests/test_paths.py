@@ -81,3 +81,38 @@ def test_children_are_started_with_python_exe_not_pythonw(tmp_path):
     (tmp_path / "python.exe").write_text("")
     assert console_python(str(tmp_path / "pythonw.exe")) == str(tmp_path / "python.exe")
     assert console_python(str(tmp_path / "python3")) == str(tmp_path / "python3")
+
+
+# ---------------------------------------------------------------------------- install.ini written by Inno Setup
+def test_install_ini_in_the_windows_ansi_code_page_is_read(tmp_path):
+    # Inno Setup writes install.ini through a Windows function that uses the PC's "ANSI" code page (cp1252 on a
+    # Brazilian Windows), not UTF-8. A data folder with an accent ("Gravações") then arrives as bytes that are not
+    # valid UTF-8. Reading it must neither crash nor mangle the accent.
+    app = make_installed_code_root(tmp_path)
+    (app / "install.ini").write_bytes("[paths]\r\ndata_root=D:\\Gravações\\BajaMV\r\n".encode("cp1252"))
+    paths = resolve_paths(code_root=app, env={})
+    assert "Gravações" in str(paths.data_root)
+
+
+def test_install_ini_in_utf8_with_or_without_bom_is_read(tmp_path):
+    from launcher.paths import read_install_ini
+    app = make_installed_code_root(tmp_path)
+    (app / "install.ini").write_bytes("\ufeff[paths]\ndata_root = E:\\Ação\n".encode("utf-8"))
+    assert read_install_ini(app) == "E:\\Ação"
+    (app / "install.ini").write_bytes("[paths]\ndata_root = E:\\Ação\n".encode("utf-8"))
+    assert read_install_ini(app) == "E:\\Ação"
+
+
+# ---------------------------------------------------------------------------- which code an installed Python runs
+def test_an_installed_python_knows_its_own_app_folder(tmp_path):
+    # INSTALL/python/python.exe belongs to INSTALL/app (it has install.ini / build_info.json). The self-test uses
+    # this to notice when the installed Python imported some other copy of the code.
+    from launcher.paths import installed_app_of_python, same_folder
+    app = make_installed_code_root(tmp_path, data_root=tmp_path / "Data")
+    (app.parent / "python").mkdir()
+    (app.parent / "python" / "python.exe").write_text("")
+    found = installed_app_of_python(str(app.parent / "python" / "python.exe"))
+    assert found is not None and same_folder(found, app)
+    # a Python somewhere else (a developer's venv) is not an installed one
+    (tmp_path / "venv" / "bin").mkdir(parents=True)
+    assert installed_app_of_python(str(tmp_path / "venv" / "bin" / "python")) is None

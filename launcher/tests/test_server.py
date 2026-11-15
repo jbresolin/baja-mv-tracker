@@ -178,3 +178,50 @@ def test_shutdown_only_from_this_pc(setup):
     # TestClient's requests come from the host "testclient", which is not this PC's loopback address
     assert client.post("/api/shutdown").status_code == 403
     assert not launcher.exit_requested.is_set()
+
+
+# ---------------------------------------------------------------------------- the studio token is a secret
+def test_state_never_shows_the_studio_token_only_whether_one_is_set(setup, paths):
+    # Reading /api/state needs no PIN (anyone on the LAN can open the page), so the zone's X-Agent-Token must not
+    # be in it: only "token_set" (true / false), like the launcher's own PIN.
+    _, client, _ = setup
+    S.write_zone(paths, S.validate_zone(dict(camera_device="1", ptz_host="192.168.0.100",
+                                             agent_token="segredo-do-estudio"))[0])
+    response = client.get("/api/state")
+    assert "segredo-do-estudio" not in response.text
+    state = response.json()
+    assert state["zone"]["token_set"] is True
+    assert "agent_token" not in state["zone"]["settings"]
+
+
+def test_saving_the_zone_with_an_empty_token_field_keeps_the_token(setup, paths):
+    # The page never receives the token, so its token field is empty: saving must keep the saved token. A single
+    # space (stripped to "") is how the operator removes it on purpose.
+    _, client, _ = setup
+    S.write_zone(paths, S.validate_zone(dict(camera_device="1", ptz_host="192.168.0.100",
+                                             agent_token="segredo"))[0])
+    form = dict(camera_device="1", ptz_host="192.168.0.100", agent_token="")
+    assert client.post("/api/settings/zone", json=form).json()["ok"] is True
+    assert S.read_zone(paths).agent_token == "segredo"
+    form["agent_token"] = " "
+    assert client.post("/api/settings/zone", json=form).json()["ok"] is True
+    assert S.read_zone(paths).agent_token == ""
+
+
+def test_the_page_gets_the_public_network_warning(paths):
+    launcher = Launcher(paths, 8780, network_warning=lambda: "Rede marcada como Pública", log=lambda m: None)
+    assert launcher.state()["network_warning"] == "Rede marcada como Pública"
+
+
+# ---------------------------------------------------------------------------- camera in use: index vs device path
+def test_a_camera_is_in_use_whether_it_is_named_by_index_or_by_device_path(setup, paths):
+    # The lap line's config names its camera "0" (an index); the page asks for a preview of the same camera by its
+    # device path "usb#vid_1" (or the other way round). Both are camera 0 of the list, so the preview is refused.
+    launcher, client, snapshots = setup
+    S.write_lapline(paths, S.validate_lapline(dict(event="27SE", camera_device="0"))[0])
+    assert launcher.roles.start("lapline")[0]
+    assert launcher.camera_in_use("USB#VID_1") == "lapline"            # device path, any letter case
+    assert client.get("/api/cameras/snapshot", params=dict(device="usb#vid_1")).status_code == 409
+    assert snapshots == []
+    # another camera is free
+    assert launcher.camera_in_use("usb#vid_2") is None

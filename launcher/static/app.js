@@ -73,6 +73,8 @@ function render() {
   }
   $("card-characterize").classList.toggle("hidden", !state.launcher.roles.includes("zone"));
   $("bench-warning").classList.toggle("hidden", !state.zone.bench);
+  $("network-warning").textContent = state.network_warning || "";
+  $("network-warning").classList.toggle("hidden", !state.network_warning);
   renderRoster(state.lapline.roster);
   $("char-log").textContent = (state.characterization.log || []).join("\n");
   if (!formsFilled) fillForms();
@@ -147,6 +149,10 @@ function fillForms() {
     ["nenhum (Branch B, valores padrão)"].concat(reports));
   $("form-zone").elements.ptz_report.value = current;
   $("char-ip").value = state.zone.settings.ptz_host;
+  // the token itself never comes to the page: an empty field keeps it, a single space removes it
+  $("form-zone").elements.agent_token.value = "";
+  $("form-zone").elements.agent_token.placeholder = state.zone.token_set ?
+    "token definido (deixe vazio para manter; um espaço remove)" : "sem token";
   updateBenchWarning();
   fillCameraSelects();
 }

@@ -18,6 +18,7 @@ from pathlib import Path
 from launcher import settings as S
 from launcher.cameras import list_cameras, snapshot_jpeg
 from launcher.exportlogs import export_logs
+from launcher.netprofile import CachedNetworkWarning
 from launcher.roles import ROLE_NAMES, RoleManager, child_env
 from launcher.rosterfetch import fetch_roster, roster_status
 from launcher.tools import SAFE_NAME, CharacterizationRunner, list_reports
@@ -48,12 +49,14 @@ class Launcher:
     """Everything the page talks to. Built once by __main__ (and by the self-test and the tests)."""
 
     def __init__(self, paths, port, roles=None, characterization=None, snapshot=snapshot_jpeg, cameras=list_cameras,
-                 roster_fetch=fetch_roster, open_folder=None, log=print):
+                 roster_fetch=fetch_roster, open_folder=None, network_warning=None, log=print):
         self.paths, self.port, self.log = paths, int(port), log
         self.roles = roles or RoleManager(paths, log=log)
         self.characterization = characterization or CharacterizationRunner(paths, env=child_env(paths))
         self.snapshot, self.cameras, self.roster_fetch = snapshot, cameras, roster_fetch
         self.open_folder = open_folder or open_in_file_manager
+        # "this network is Public" warning for the page (Windows only; asked at most once a minute)
+        self.network_warning = network_warning or CachedNetworkWarning().get
         self.exit_requested = threading.Event()
         self.lock = threading.Lock()          # one settings write / role action at a time
 
@@ -65,17 +68,21 @@ class Launcher:
         lapline, zone = S.read_lapline(self.paths), S.read_zone(self.paths)
         launcher = self.launcher_settings
         _, lapline_errors = S.validate_lapline(asdict(lapline))
+        # The studio token is a secret, and reading the state needs no PIN: the page only learns whether one is set
+        # (like the launcher's own PIN). Saving the form with the field empty keeps it (save_role_settings).
+        zone_settings = asdict(zone)
+        token_set = bool(zone_settings.pop("agent_token", ""))
         return dict(
             version=self.paths.version, build=self.paths.build_info, models_note=models_note(self.paths),
             installed=self.paths.installed, data_root=str(self.paths.data_root), hostname=socket.gethostname(),
-            addresses=lan_addresses(), launcher_port=self.port,
+            addresses=lan_addresses(), launcher_port=self.port, network_warning=self.network_warning(),
             launcher=dict(roles=launcher.roles, autostart=launcher.autostart, pin_set=bool(launcher.pin)),
             role_names=ROLE_NAMES,
             lapline=dict(settings=asdict(lapline), config_exists=self.paths.lapline_config.exists(),
                          config_path=str(self.paths.lapline_config),
                          errors=lapline_errors if self.paths.lapline_config.exists() else {},
                          roster=roster_status(lapline.event, self.paths)),
-            zone=dict(settings=asdict(zone), config_exists=self.paths.zone_config.exists(),
+            zone=dict(settings=zone_settings, token_set=token_set, config_exists=self.paths.zone_config.exists(),
                       config_path=str(self.paths.zone_config), bench=zone.profile in S.BENCH_PROFILES),
             processes=self.roles.status(log_lines=25),
             characterization=self.characterization.status(),
@@ -97,6 +104,11 @@ class Launcher:
                     return False, errors
                 return True, dict(path=str(S.write_lapline(self.paths, settings)))
             if role == "zone":
+                data = dict(data)
+                # empty or missing token field = keep the saved token (the page never receives it); to remove the
+                # token, type a single space (validate_zone strips it to "")
+                if data.get("agent_token") in (None, ""):
+                    data["agent_token"] = S.read_zone(self.paths).agent_token
                 settings, errors = S.validate_zone(data)
                 other = S.read_lapline(self.paths) if "lapline" in self.launcher_settings.roles else None
                 errors.update({k.split(".", 1)[1]: v for k, v in S.port_conflicts(other, settings, self.port, saving="zone")
@@ -134,10 +146,23 @@ class Launcher:
                 self.log("início automático %s: %s" % (role, message))
 
     def camera_in_use(self, device):
-        """The running role that holds this camera, or None."""
+        """The running role that holds this camera, or None. A config may name the camera by its index ("0") or by
+        its device path, and the page may ask with the other form: when the plain comparison does not match, both
+        sides are translated through the camera list (index -> device path) and compared again."""
+        running = self.roles.running_roles()
+        if not running:
+            return None
         uses = {"lapline": S.read_lapline(self.paths).camera_device, "zone": S.read_zone(self.paths).camera_device}
-        for role in self.roles.running_roles():
-            if str(uses.get(role)) == str(device):
+        for role in running:
+            if same_text(uses.get(role), device):
+                return role
+        try:
+            cameras, _ = self.cameras(self.paths.ffmpeg)
+        except Exception:  # noqa: BLE001 (no list: the plain comparison above is all we can do)
+            return None
+        wanted = canonical_camera(device, cameras)
+        for role in running:
+            if same_text(canonical_camera(uses.get(role), cameras), wanted):
                 return role
         return None
 
@@ -145,6 +170,21 @@ class Launcher:
         if stop_roles:
             self.roles.stop_all()
         self.exit_requested.set()
+
+
+def same_text(a, b):
+    """Camera names compared without case or surrounding spaces (Windows device paths differ in case)."""
+    return str(a or "").strip().lower() == str(b or "").strip().lower()
+
+
+def canonical_camera(device, cameras):
+    """The device path of a camera given by index ("0") or by path, using the list from list_cameras()."""
+    text = str(device or "").strip()
+    if text.isdigit():
+        for camera in cameras or []:
+            if str(camera.get("index")) == text:
+                return str(camera.get("device") or text)
+    return text
 
 
 def open_in_file_manager(folder):

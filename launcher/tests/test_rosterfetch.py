@@ -78,3 +78,20 @@ def test_rt_reads_the_downloaded_roster_first(paths):
 def test_rt_without_any_roster_still_runs_in_open_set_mode(paths):
     result = rt_config.load_roster("99XX", override_dir=str(paths.rosters_dir))
     assert result["open_set"] is True
+
+
+def test_an_event_code_that_is_not_one_is_refused_before_any_file_or_url(paths):
+    # The event code becomes part of a file name (rosters/<EVENT>.csv) and of the results site's address. Something
+    # like "../../x" could write a file outside the rosters folder; it must be refused, and the site never asked.
+    asked = []
+
+    def fake_page(url):
+        asked.append(url)
+        return RESULTS_PAGE
+    for bad in ("../../evil", "27SE/../../x", "27SE\\..\\x", "http://x", "27SEE1"):
+        result = fetch_roster(bad, paths, get_page=fake_page, sleep=no_sleep)
+        assert result["ok"] is False and "inválido" in result["message"]
+        assert roster_status(bad, paths)["where"] is None
+    assert asked == []
+    assert list(paths.rosters_dir.iterdir()) == []                     # nothing written
+    assert not (paths.data_root.parent / "evil.csv").exists()

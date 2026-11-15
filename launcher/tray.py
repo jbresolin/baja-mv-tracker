@@ -5,6 +5,18 @@ the launcher keeps running without an icon (the page still works; __main__ opens
 """
 import threading
 
+SERVER_DEAD_MESSAGE = ("O painel do Baja MV não iniciou (a porta %d já está em uso por outro programa?). "
+                       "Os papéis que estiverem rodando continuam. O Baja MV vai fechar; veja logs\\launcher.log.")
+
+
+def watch_server(server_alive, on_dead, stop_event, poll_s=1.0):
+    """Call on_dead() once if the page's web server stops (e.g. its port was taken: uvicorn then ends its thread),
+    unless stop_event is set first (the launcher is closing anyway). Runs in its own thread."""
+    while not stop_event.wait(poll_s):
+        if not server_alive():
+            on_dead()
+            return
+
 
 def make_icon_image(size=64):
     """A red disc with "MV" (RD Tests red), drawn with Pillow: no image file to ship."""
@@ -18,8 +30,10 @@ def make_icon_image(size=64):
     return image
 
 
-def run_tray(launcher, url, open_browser, log=print):
-    """Show the icon and block until the launcher should exit. Returns False if no tray could be shown."""
+def run_tray(launcher, url, open_browser, log=print, server_alive=None):
+    """Show the icon and block until the launcher should exit. Returns False if no tray could be shown.
+    server_alive(): is the page's web server still running? When it dies, the icon shows a notification and the
+    launcher exits (a tray icon whose page cannot open would only confuse the operator)."""
     try:
         import pystray
         image = make_icon_image()
@@ -56,6 +70,20 @@ def run_tray(launcher, url, open_browser, log=print):
         icon.stop()
 
     threading.Thread(target=stop_icon_on_exit, daemon=True).start()
+
+    def page_server_died():
+        message = SERVER_DEAD_MESSAGE % launcher.port
+        log(message)
+        try:
+            icon.notify(message, "Baja MV")
+        except Exception:  # noqa: BLE001 (not every tray backend can show notifications)
+            pass
+        launcher.exit_requested.wait(8.0)           # time to read the notification
+        launcher.request_exit(stop_roles=False)
+
+    if server_alive is not None:
+        threading.Thread(target=watch_server, args=(server_alive, page_server_died, launcher.exit_requested),
+                         daemon=True, name="launcher-web-watch").start()
     try:
         icon.run()
     except Exception as e:  # noqa: BLE001

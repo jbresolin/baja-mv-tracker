@@ -37,6 +37,11 @@ def child_env(paths, base=None):
     })
     if paths.installed:
         env["RT_VERSION"] = paths.version
+        # Like `python -P`: the current folder / script folder is not put first on the import path, so a child
+        # always imports the installed code (INSTALL\\app, through the .pth file), never a stray copy of rt/ or zone/
+        # in whatever folder it happens to start from. Children also start in the code folder (cwd), as a second
+        # guard. Not in repo mode: there the repo folder on the path is how `python -m zone.app` finds the code.
+        env["PYTHONSAFEPATH"] = "1"
     return env
 
 

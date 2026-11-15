@@ -146,3 +146,108 @@ def test_stage_writes_code_models_build_info_and_pth(tmp_path):
     # 8 repo files: run.py, the example config, app.py, launcher/__init__.py, the roster, teacher/rosters.py,
     # lapvision/clock.py and the manifest
     assert info["files"] == 8
+
+
+# ============================================================================================ self-test: new checks
+from launcher.selftest import check_code_location, check_network_profile, check_vc_runtime, stop_verdict  # noqa: E402
+
+
+def make_install(tmp_path):
+    """A fake install folder: INSTALL/python/python.exe and INSTALL/app/install.ini."""
+    install = tmp_path / "BajaMV"
+    (install / "python").mkdir(parents=True)
+    (install / "python" / "python.exe").write_text("")
+    (install / "app").mkdir()
+    (install / "app" / "install.ini").write_text("[paths]\ndata_root = C:\\BajaMV\n")
+    return install
+
+
+def test_code_location_fails_when_an_installed_python_runs_other_code(tmp_path):
+    # The first CI run: the installed python.exe, started from the repo checkout, imported the CHECKOUT's launcher
+    # (python -m puts the current folder first). Every installed file then looked "missing". Now this is one clear
+    # FAIL that names both folders.
+    install = make_install(tmp_path)
+    results = Results(out=lambda line: None)
+    check_code_location(results, tmp_path / "checkout", executable=str(install / "python" / "python.exe"))
+    assert results.items[0]["level"] == "fail"
+    assert "checkout" in results.items[0]["detail"]
+
+
+def test_code_location_is_ok_for_the_installed_code_and_for_a_developer_venv(tmp_path):
+    install = make_install(tmp_path)
+    results = Results(out=lambda line: None)
+    check_code_location(results, install / "app", executable=str(install / "python" / "python.exe"))
+    (tmp_path / "venv").mkdir()
+    check_code_location(results, tmp_path / "repo", executable=str(tmp_path / "venv" / "python"))
+    assert [item["level"] for item in results.items] == ["ok", "ok"]
+
+
+def test_vc_runtime_older_than_14_40_fails(tmp_path):
+    # ONNX Runtime / OpenVINO crash with an msvcp140.dll older than 14.40. The DLL versions are faked here.
+    python_dir, system_dir = tmp_path / "python", tmp_path / "System32"
+    python_dir.mkdir()
+    system_dir.mkdir()
+    (system_dir / "msvcp140.dll").write_text("")
+    versions = {system_dir / "msvcp140.dll": (14, 38, 33135, 0)}
+    results = Results(out=lambda line: None)
+    check_vc_runtime(results, python_dir, version_of=versions.get, system_dir=system_dir)
+    assert results.items[-1]["level"] == "fail"
+    versions[system_dir / "msvcp140.dll"] = (14, 44, 35211, 0)
+    check_vc_runtime(results, python_dir, version_of=versions.get, system_dir=system_dir)
+    assert results.items[-1]["level"] == "ok"
+
+
+def test_an_old_app_local_vc_runtime_fails_even_if_the_system_one_is_new(tmp_path):
+    # A msvcp140.dll next to python.exe is loaded instead of the system one: an old one there is the real problem.
+    python_dir, system_dir = tmp_path / "python", tmp_path / "System32"
+    python_dir.mkdir()
+    system_dir.mkdir()
+    (python_dir / "msvcp140.dll").write_text("")
+    (system_dir / "msvcp140.dll").write_text("")
+    versions = {python_dir / "msvcp140.dll": (14, 29, 0, 0), system_dir / "msvcp140.dll": (14, 44, 0, 0)}
+    results = Results(out=lambda line: None)
+    check_vc_runtime(results, python_dir, version_of=versions.get, system_dir=system_dir)
+    assert results.items[-1]["level"] == "fail" and "python" in results.items[-1]["detail"]
+
+
+def test_public_network_is_a_warning_not_a_failure():
+    results = Results(out=lambda line: None)
+    check_network_profile(results, lookup=lambda: [dict(name="RedeBaja", interface="Ethernet", category="Public")])
+    assert results.items[-1]["level"] == "warn" and results.failed == []
+
+
+def test_role_stop_check_needs_every_process_of_the_tree_gone():
+    # tree = [(pid, start time)] of the supervisor and its children, listed BEFORE the stop. find() says which of
+    # them still run (here: a fake that knows one survivor). The old check could never fail; this one can.
+    tree = [(100, 1.0), (101, 2.0), (102, 3.0)]
+    survivor = {(102, 3.0)}
+
+    def find(pid, created):
+        return object() if (pid, created) in survivor else None
+    ok, text = stop_verdict(tree, find=find, timeout_s=0, sleep=lambda s: None)
+    assert ok is False and "102" in text
+    survivor.clear()
+    ok, text = stop_verdict(tree, find=find, timeout_s=0, sleep=lambda s: None)
+    assert ok is True
+    # a tree that could not even be listed is not proof of a stop
+    assert stop_verdict([], find=find, timeout_s=0)[0] is False
+
+
+# ============================================================================================ staging: git fallback
+def test_staging_warns_loudly_when_git_cannot_list_the_files(tmp_path):
+    # Without git (or with git refusing a folder owned by another Windows user: "dubious ownership") staging walks
+    # the folders, which may pick up untracked local files. That must be impossible to miss in the build log.
+    class Failed:                                 # what subprocess.run returns when git refuses
+        returncode = 128
+        stdout = b""
+        stderr = b"fatal: detected dubious ownership in repository at 'C:/x'"
+    warnings = []
+    assert stage_app.git_files(tmp_path, run=lambda *a, **k: Failed(), warn=warnings.append) is None
+    text = " ".join(warnings[0])
+    assert "dubious ownership" in text and "safe.directory" in text
+
+    def no_git(*a, **k):
+        raise FileNotFoundError("git")
+    warnings.clear()
+    assert stage_app.git_files(tmp_path, run=no_git, warn=warnings.append) is None
+    assert warnings and "git could not run" in warnings[0][0]
