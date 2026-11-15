@@ -182,7 +182,8 @@ def check_ffmpeg(results, paths):
     if probe.returncode != 0:
         results.add("fail", "ffprobe", "did not run: %s" % paths.ffprobe)
     if missing:
-        results.add("fail", "ffmpeg", "%s lacks encoders %s" % (paths.ffmpeg, missing))
+        # the installer bundles a build with all three; a developer's own ffmpeg (repo mode) only gets a warning
+        results.add("fail" if paths.installed else "warn", "ffmpeg", "%s lacks encoders %s" % (paths.ffmpeg, missing))
     else:
         results.add("ok", "ffmpeg", "%s: libx264, h264_qsv, h264_amf present" % paths.ffmpeg)
 

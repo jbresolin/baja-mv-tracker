@@ -178,8 +178,10 @@ def load_roster(event, open_set_max=OPEN_SET_MAX, rosters_dir=None, override_dir
         problem = "%s unreadable (%s: %s)" % (p, type(e).__name__, e)
     if problem is None:
         return dict(numbers=numbers, teams=teams, open_set=False, warning=None, path=str(p))
+    fix = ("press \"Baixar lista de equipes\" in the Baja MV page" if override_dir else
+           "run `python teacher/rosters.py %s`" % event)      # override_dir is set by the installed app's launcher
     warning = ("no roster for %s (%s): numbers are not checked against the entry list (any number 1-%d can be "
-               "read, auto-confirm is off); run `python teacher/rosters.py %s` once the event's results page lists "
-               "the teams, then restart rt" % (event, problem, int(open_set_max), event))
+               "read, auto-confirm is off); %s once the event's results page lists the teams, then restart rt" % (
+                   event, problem, int(open_set_max), fix))
     return dict(numbers=list(range(1, int(open_set_max) + 1)), teams={}, open_set=True, warning=warning,
                 path=str(p))

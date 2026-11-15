@@ -53,7 +53,9 @@ jobs:
           Get-Content "$env:INSTALL\app\install.ini"
           Get-Content "$env:INSTALL\app\build_info.json"
           if (-not (Test-Path "$env:DATA")) { throw "data folder not created" }
-          netsh advfirewall firewall show rule name="Baja MV (portas)"
+          # cmd /c: netsh needs name="..." exactly as written, which PowerShell's argument passing may change
+          cmd /c 'netsh advfirewall firewall show rule name="Baja MV (portas)"'
+          if ($LASTEXITCODE -ne 0) { throw "firewall rule missing" }
 
       - name: Self-test of the installed app
         shell: cmd
@@ -90,8 +92,9 @@ jobs:
           Start-Sleep -Seconds 5      # the uninstaller finishes from a temporary copy of itself
           if (Test-Path "$env:INSTALL\app\rt") { throw "program files still there after uninstall" }
           if (-not (Test-Path "$env:DATA\config\keep-me.txt")) { throw "uninstall removed the data folder" }
-          $rule = netsh advfirewall firewall show rule name="Baja MV (portas)"
-          if ($LASTEXITCODE -eq 0) { throw "firewall rule still there: $rule" }
+          cmd /c 'netsh advfirewall firewall show rule name="Baja MV (portas)"'
+          if ($LASTEXITCODE -eq 0) { throw "firewall rule still there after uninstall" }
+          $global:LASTEXITCODE = 0
           Write-Host "uninstalled; data kept"
 
       - uses: actions/upload-artifact@v4

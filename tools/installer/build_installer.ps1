@@ -52,6 +52,9 @@ $Cache = Join-Path $Build "cache"
 $Stage = Join-Path $Build "stage"
 $Dist = Join-Path $Repo "dist"
 $Pins = Get-Content (Join-Path $PSScriptRoot "pins.json") -Raw | ConvertFrom-Json
+# Windows' own tar (bsdtar: .tar.gz and .zip). Not just "tar": Git for Windows' GNU tar may come first on PATH, and it
+# reads "C:\..." as a remote host.
+$Tar = Join-Path $env:SystemRoot "System32\tar.exe"
 
 function Write-Step([string]$Text) {
     Write-Host ""
@@ -108,7 +111,7 @@ New-Item -ItemType Directory -Force $Stage | Out-Null
 # ------------------------------------------------------------------------------------------------ 2. Python
 Write-Step "Python $($Pins.python.version) (python-build-standalone)"
 $pyArchive = Get-VerifiedDownload $Pins.python.url $Pins.python.sha256 $Pins.python.file
-Invoke-Native "tar.exe" @("-xzf", $pyArchive, "-C", $Stage)          # the archive's top folder is python\
+Invoke-Native $Tar @("-xzf", $pyArchive, "-C", $Stage)          # the archive's top folder is python\
 $Py = Join-Path $Stage "python\python.exe"
 if (-not (Test-Path $Py)) { throw "python.exe not found after unpacking $pyArchive" }
 & $Py -m pip --version
@@ -148,7 +151,7 @@ if ($FfmpegZip -and (Test-Path $FfmpegZip -PathType Container)) {
     $extract = Join-Path $Build "ffmpeg-extract"
     if (Test-Path $extract) { Remove-Item -Recurse -Force $extract }
     New-Item -ItemType Directory -Force $extract | Out-Null
-    Invoke-Native "tar.exe" @("-xf", $zip, "-C", $extract)
+    Invoke-Native $Tar @("-xf", $zip, "-C", $extract)
     $found = Get-ChildItem $extract -Recurse -Filter ffmpeg.exe | Select-Object -First 1
     if (-not $found) { throw "no ffmpeg.exe inside $zip" }
     $ffmpegRoot = Split-Path (Split-Path $found.FullName -Parent) -Parent
