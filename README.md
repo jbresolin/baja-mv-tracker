@@ -85,3 +85,13 @@ Open (need hardware or decisions): benchmark on the real laptop, the lap-app int
 minimum in seconds.
 
 Third-party components: Ultralytics YOLO (AGPL-3.0), YOLO-World, Qwen3-VL (Apache-2.0), PARSeq (Apache-2.0), CLIP.
+
+## Licence
+
+This project is licensed under the **GNU Affero General Public License v3.0** (see `LICENSE`). It has to be: the
+detectors are trained with Ultralytics YOLO (AGPL-3.0), the ONNX models derive from those weights, and the tracker
+reuses AGPL-3.0 code. In practice: anyone who receives a copy (including the Windows installer) or uses a modified
+version over a network is entitled to its source.
+
+`lap_count_dump_26se.sql` is the 26SE race's human lap count, kept as the benchmark's ground truth. Team and school
+names in it are public on the results site; the counting devices' token hashes were removed before publishing.
