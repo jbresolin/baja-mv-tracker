@@ -362,5 +362,5 @@ class ProgressTracker:
         s, v, vs, vv = self.predict_s_v(tp, t)
         age = max(0.0, t - tp.last_update_t)
         return TrackView(tp.track_id, s, v, math.sqrt(max(vs, 0)), math.sqrt(max(vv, 0)), tp.lateral_px,
-                         tp.n_updates, age, tp.off_corridor_frames, age > 1e-9, tp.box, tp.ground,
+                         tp.n_updates, age, tp.off_corridor_frames, bool(age > 1e-9), tp.box, tp.ground,
                          self.ground_speed(tp, t), self.profile.v_typ(s) if self.profile.learned else None)

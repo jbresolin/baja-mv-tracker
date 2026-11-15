@@ -8,6 +8,7 @@ The control branch (A or B) is chosen here, from config, never by editing code:
 import ast
 import copy
 import json
+import os
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -88,9 +89,28 @@ class Report:
         return dict(path=self.path, branch=self.branch, reason=self.reason)
 
 
-def load_report(path) -> Report:
+def newest_report(data_root=None):
+    """The newest `report.json` under <data folder>/reports (the installed launcher's characterization runs), or
+    None. The data folder comes from BAJAMV_DATA, which the launcher sets for the roles it starts."""
+    root = data_root or os.environ.get("BAJAMV_DATA")
+    if not root:
+        return None
+    reports = sorted(Path(root, "reports").glob("*/report.json"), key=lambda f: f.stat().st_mtime)
+    return reports[-1] if reports else None
+
+
+def load_report(path, data_root=None) -> Report:
     if not path:
-        return Report(PtzModel(), "B", "no characterization report: Branch B with default speed tables", "", {})
+        # 2026-11-15 bench: the zone ran on the simulator's default speed tables because no report was set, though a
+        # fresh characterization report sat in the data folder. Default tables are in other units than a real
+        # camera's, so every requested speed mapped to the top step and the PTZ ran to its end stops.
+        found = newest_report(data_root)
+        if found is not None:
+            report = load_report(str(found))
+            report.reason = "newest report in the data folder (ptz.report not set): " + report.reason
+            return report
+        return Report(PtzModel(), "B", "no characterization report: Branch B with DEFAULT speed tables "
+                      "(not this camera's: run the characterization and set ptz.report)", "", {})
     p = resolve_path(path)
     raw = json.loads(p.read_text(encoding="utf-8"))
     verdict = raw.get("verdict") or {}

@@ -423,6 +423,19 @@ class ZoneApp:
 
 
 # =========================================================================================================== web
+
+def plain_json(value):
+    """Copy `value` with every numpy number, bool or array turned into the plain Python equivalent.
+    The page's state is built from numbers numpy computed; the JSON encoder refuses numpy types (2026-11-15 bench:
+    'Object of type bool is not JSON serializable' made every /api/state request fail and froze the page)."""
+    if isinstance(value, dict):
+        return {key: plain_json(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [plain_json(item) for item in value]
+    if hasattr(value, "tolist") and type(value).__module__ == "numpy":
+        return plain_json(value.tolist())       # numpy scalar -> int/float/bool; numpy array -> nested lists
+    return value
+
 def create_web(zapp: ZoneApp):
     from fastapi import Body, FastAPI, HTTPException
     from fastapi.responses import FileResponse, JSONResponse, Response
@@ -450,7 +463,7 @@ def create_web(zapp: ZoneApp):
 
     @web.get("/api/state")
     def state():
-        return JSONResponse(zapp.state())
+        return JSONResponse(plain_json(zapp.state()))
 
     @web.get("/frame.jpg")
     def frame():
