@@ -155,6 +155,7 @@ provisional = true              # read a few crops while the car is in view (PTZ
 provisional_every_s = 0.5
 provisional_batch = 4
 provisional_max_reads = 16
+open_set_max = 999              # no roster for the event (rosters/<EV>.csv missing/empty): read any number 1..this, no auto-confirm
 queue_max = 64                  # identity jobs waiting; provisional jobs are dropped first when it is full
 
 [output]

@@ -218,17 +218,109 @@ def test_encoder_is_probed_once_at_start_and_logged(cfg, tmp_path):
 
     def fake_probe(ffmpeg, name, runner=None):
         probed.append(name)
-        return name == "h264_amf"
+        # (worked, ffmpeg's first error line)
+        return (True, "") if name == "h264_amf" else (False, "Error creating a MFX session: -9.")
 
-    original = recorder_module.probe_encoder
+    original_probe, original_find = recorder_module.probe_encoder, recorder_module.find_ffmpeg
     recorder_module.probe_encoder = fake_probe
+    recorder_module.find_ffmpeg = lambda ffmpeg: "C:/ffmpeg/bin/ffmpeg.exe"   # pretend ffmpeg is installed
     try:
         assert rec.choose_encoder() == "h264_amf"
         assert rec.choose_encoder() == "h264_amf"   # second call: no new probe
     finally:
-        recorder_module.probe_encoder = original
+        recorder_module.probe_encoder, recorder_module.find_ffmpeg = original_probe, original_find
     assert probed == ["h264_qsv", "h264_amf"]
     assert any("recording encoder: h264_amf" in line and "h264_qsv failed" in line for line in logs)
+    # The failed encoder's reason (from ffmpeg's error output) is in the log line too.
+    assert any("h264_qsv failed (Error creating a MFX session: -9.)" in line for line in logs)
+
+
+# ------------------------------------------------------------------------------------------------ ffmpeg missing
+# On a fresh Windows laptop ffmpeg is often not installed (or not on PATH). Every encoder probe then "failed", and rt
+# used to log "no H.264 encoder passed the probe ... trying libx264 anyway", which hides the real problem. Now a
+# missing ffmpeg is told apart from an encoder that does not work, recording is switched off with a clear message,
+# and detection carries on (run.py does not start the recorder at all).
+
+class ProbeResult:
+    """What subprocess.run returns, reduced to what the probe reads: the exit code and the error output."""
+    def __init__(self, returncode, stderr=b""):
+        self.returncode, self.stderr = returncode, stderr
+
+
+def test_probe_says_when_ffmpeg_itself_cannot_be_started():
+    from rt.recorder import FfmpegNotFound, probe_encoder
+
+    def runner(cmd, **kw):
+        raise FileNotFoundError(2, "The system cannot find the file specified")   # what Windows says
+
+    with pytest.raises(FfmpegNotFound):
+        probe_encoder("ffmpeg", "libx264", runner)
+
+
+def test_probe_gives_the_first_useful_line_of_an_encoder_failure():
+    from rt.recorder import probe_encoder
+    # ffmpeg runs, but this encoder does not work here: exit code 1, and the reason in its error output (with an
+    # empty first line, which must be skipped).
+    stderr = b"\n[h264_qsv @ 000001] Error creating a MFX session: -9.\nError initializing output stream\n"
+    worked, detail = probe_encoder("ffmpeg", "h264_qsv", lambda cmd, **kw: ProbeResult(1, stderr))
+    assert worked is False
+    assert detail == "[h264_qsv @ 000001] Error creating a MFX session: -9."
+    # An encoder that works: (True, "").
+    assert probe_encoder("ffmpeg", "libx264", lambda cmd, **kw: ProbeResult(0)) == (True, "")
+
+
+def test_missing_ffmpeg_turns_recording_off_with_a_clear_message(cfg, tmp_path, monkeypatch):
+    from rt import recorder as recorder_module
+    # find_ffmpeg() looks the program up (on PATH, or the configured full path). Here: not found.
+    monkeypatch.setattr(recorder_module, "find_ffmpeg", lambda ffmpeg: None)
+    cfg["capture"]["ffmpeg"] = "C:/tools/ffmpeg.exe"
+    logs = []
+    rec = Recorder(cfg, tmp_path, fps=10, log=logs.append, watchdog_poll_s=0)
+    assert rec.choose_encoder() is None                 # no encoder: recording cannot work
+    msg = rec.unavailable
+    # The message names the configured path, says recording is off, and how to fix it.
+    assert "ffmpeg not found at 'C:/tools/ffmpeg.exe'" in msg
+    assert "recording is off" in msg and "winget install Gyan.FFmpeg" in msg and "capture.ffmpeg" in msg
+    assert any(line == "WARNING recording: " + msg for line in logs)
+    # Not the old, misleading message.
+    assert not any("no H.264 encoder passed the probe" in line for line in logs)
+    # The recorder refuses frames (so it never tries to start ffmpeg) and says why on the status page.
+    assert rec.offer(b"frame", 0.0, 0.0, 1) is False
+    assert rec.status()["state"].startswith("off: ffmpeg not found")
+
+
+def test_ffmpeg_on_path_but_failing_to_start_is_also_reported_as_missing(cfg, tmp_path, monkeypatch):
+    # PATH says ffmpeg is there, but starting it fails (a broken install): same outcome as "not found".
+    from rt import recorder as recorder_module
+    monkeypatch.setattr(recorder_module, "find_ffmpeg", lambda ffmpeg: "/usr/bin/ffmpeg")
+
+    def probe(ffmpeg, name, runner=None):
+        raise recorder_module.FfmpegNotFound("cannot start")
+
+    monkeypatch.setattr(recorder_module, "probe_encoder", probe)
+    rec = Recorder(cfg, tmp_path, fps=10, log=lambda m: None, watchdog_poll_s=0)
+    assert rec.choose_encoder() is None and "ffmpeg not found" in rec.unavailable
+
+
+def test_ffmpeg_present_but_every_encoder_failing_keeps_trying_x264(cfg, tmp_path, monkeypatch):
+    # ffmpeg is installed but no encoder passed the probe: the old behaviour (try libx264 anyway), now with reasons.
+    from rt import recorder as recorder_module
+    monkeypatch.setattr(recorder_module, "find_ffmpeg", lambda ffmpeg: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(recorder_module, "probe_encoder", lambda ffmpeg, name, runner=None: (False, "no " + name))
+    logs = []
+    rec = Recorder(cfg, tmp_path, fps=10, log=logs.append, watchdog_poll_s=0)
+    assert rec.choose_encoder() == "libx264" and rec.unavailable is None
+    line = next(x for x in logs if "no H.264 encoder passed the probe" in x)
+    assert "h264_qsv failed (no h264_qsv)" in line and "libx264 failed (no libx264)" in line
+
+
+def test_status_page_shows_the_missing_ffmpeg_notice_in_yellow(cfg):
+    from rt.recorder import ffmpeg_missing_message
+    from rt.status import StatusBoard, render_html
+    board = StatusBoard(cfg)
+    board.notices.append(ffmpeg_missing_message("ffmpeg"))     # what run.py does when recording is off
+    page = render_html(board.payload())
+    assert '<div class="notice">ffmpeg not found at &#x27;ffmpeg&#x27;: recording is off' in page
 
 
 # ------------------------------------------------------------------------------------------------ gaps and losses

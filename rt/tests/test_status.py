@@ -183,3 +183,24 @@ def test_free_port_starts_the_page(cfg):
         assert server is not None and lines[0].startswith("status page: http://127.0.0.1:")
     finally:
         server.stop()
+
+
+def test_dropped_phone_connections_do_not_print_tracebacks(capsys):
+    # A phone that locks its screen closes the connection in the middle of a request. Python's web server would
+    # print a long traceback for each one ("ConnectionResetError ... WinError 10054"), flooding the console. Our
+    # server must stay quiet for those, but still print real errors.
+    from rt.status import StatusHTTPServer
+
+    server = StatusHTTPServer.__new__(StatusHTTPServer)  # no socket needed: we only call handle_error
+
+    try:
+        raise ConnectionResetError(10054, "connection reset by the phone")
+    except ConnectionResetError:
+        server.handle_error(None, ("192.168.2.90", 45940))
+    assert capsys.readouterr().err == ""                  # nothing printed for a dropped connection
+
+    try:
+        raise ValueError("a real bug")
+    except ValueError:
+        server.handle_error(None, ("192.168.2.90", 45940))
+    assert "a real bug" in capsys.readouterr().err        # a real error is still shown

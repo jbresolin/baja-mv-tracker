@@ -66,6 +66,10 @@ class StatusBoard:
         self.started_mono = self.clock.mono()
         self.started_wall = self.clock.wall()
         self.info = {}                                # static info: event, version, source
+        # Notices: warnings set once at start that stay for the whole run (no roster for the event, ffmpeg missing so
+        # no recording). Shown in yellow at the top of the page: rt works, but something should be fixed. run.py
+        # appends plain strings.
+        self.notices = []
         self.setup_token = str(s.get("setup_token", "") or "")   # Beam setup POSTs need it when set
 
     # ------------------------------------------------------------------ inputs
@@ -190,7 +194,7 @@ class StatusBoard:
                                     dropped=getattr(cap, "dropped", 0) if cap is not None else 0,
                                     last_frame_iso=iso(self.last_frame_t)),
                     camera=cam, clock=dict(self.time, bad=clock_bad, red_above_s=OFFSET_RED_S),
-                    recording=rec, beam=beam, passes=passes, warnings=warnings)
+                    recording=rec, beam=beam, passes=passes, warnings=warnings, notices=list(self.notices))
 
 
 def beam_warnings(beam):
@@ -259,7 +263,8 @@ CSS = """body{font-family:system-ui,sans-serif;margin:0 16px;background:#fff;col
 h1{font-size:1.2em}h2{font-size:1em;margin:1em 0 .3em}table{border-collapse:collapse;width:100%;font-size:.9em}
 td,th{border-bottom:1px solid #ddd;padding:3px 6px;text-align:left;vertical-align:middle}
 .ok{color:#070}.warn{color:#a60}.bad{color:#fff;background:#c00;padding:2px 6px;border-radius:3px}
-.box{background:#fdd;border:1px solid #c00;padding:6px;margin:6px 0}img{width:160px;max-width:40vw;display:block}
+.box{background:#fdd;border:1px solid #c00;padding:6px;margin:6px 0}
+.notice{background:#ffc;border:1px solid #c90;padding:6px;margin:6px 0}img{width:160px;max-width:40vw;display:block}
 .num{font-size:1.4em;font-weight:bold}small{color:#666}"""
 
 
@@ -298,6 +303,7 @@ def render_html(p):
                         img, _e(_t(x.get("thumb_iso"))), _e(num), _e(conf), _e(x.get("team") or ""),
                         _e(_t(x.get("t_cross_iso")) or _t(x.get("t_enter_iso"))), _e(x["pass_id"]), _e(x["state"])))
     warn = "".join('<div class="box">%s</div>' % _e(w) for w in p["warnings"])
+    warn += "".join('<div class="notice">%s</div>' % _e(n) for n in p.get("notices", []))
     return """<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="refresh" content="2">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>rt status</title><style>%s</style></head>
 <body><h1>rt lap line &middot; %s</h1><small>%s &middot; up %.0f s &middot; %s</small>%s
@@ -392,6 +398,18 @@ class StatusHTTPServer(ThreadingHTTPServer):
     fail instead, as it does on Linux."""
 
     daemon_threads = True
+
+    # A phone that locks its screen or leaves the page drops its connection mid-request. The stdlib server then
+    # prints a full traceback for each one, which floods the console and hides the messages that matter. Those
+    # dropped connections are normal, so they are ignored; any other error is still printed.
+    QUIET_ERRORS = (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, TimeoutError)
+
+    def handle_error(self, request, client_address):
+        error = sys.exc_info()[1]
+        if isinstance(error, self.QUIET_ERRORS):
+            return
+        super().handle_error(request, client_address)
+
     if sys.platform == "win32":
         allow_reuse_address = False
 
