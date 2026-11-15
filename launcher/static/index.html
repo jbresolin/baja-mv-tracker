@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Baja MV</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>Baja MV</h1>
+  <div id="build" class="small"></div>
+</header>
+<main>
+  <div id="message" class="message hidden"></div>
+
+  <!-- ===================================================== this laptop -->
+  <section class="card">
+    <h2>Este computador</h2>
+    <p class="small">Escolha o papel deste notebook. Os dois juntos só numa bancada de testes.</p>
+    <label class="check"><input type="checkbox" id="role-lapline"> Linha de chegada (contagem de voltas)</label>
+    <label class="check"><input type="checkbox" id="role-zone"> Zona PTZ (câmera que segue os carros)</label>
+    <label class="check"><input type="checkbox" id="autostart"> Iniciar esses papéis quando o Baja MV abrir</label>
+    <label>PIN do painel (vazio = qualquer um na rede pode mexer)
+      <input type="password" id="pin" autocomplete="new-password" placeholder="sem PIN">
+    </label>
+    <button id="save-launcher">Salvar</button>
+    <p class="small" id="data-root"></p>
+    <div class="row">
+      <button id="open-data">Abrir pasta de dados</button>
+      <button id="export-logs">Exportar logs</button>
+      <a id="export-link" class="hidden"></a>
+    </div>
+  </section>
+
+  <!-- ===================================================== lap line -->
+  <section class="card hidden" id="card-lapline">
+    <h2>Linha de chegada</h2>
+    <div class="status-row">
+      <span class="pill" id="pill-lapline">?</span>
+      <button data-role="lapline" data-action="start">Iniciar</button>
+      <button data-role="lapline" data-action="stop">Parar</button>
+      <button data-role="lapline" data-action="restart">Reiniciar</button>
+      <a id="link-lapline" target="_blank">Página de status</a>
+    </div>
+    <form id="form-lapline" autocomplete="off">
+      <label>Código do evento <input name="event" placeholder="27SE" maxlength="6"></label>
+      <div class="field-error" data-for="event"></div>
+      <div class="row">
+        <button type="button" id="fetch-roster">Baixar lista de equipes</button>
+        <span id="roster-status" class="small"></span>
+      </div>
+      <label>Câmera <select name="camera_choice" data-camera-for="lapline"></select></label>
+      <input name="camera_device" placeholder="índice (0) ou caminho do dispositivo">
+      <div class="field-error" data-for="camera_device"></div>
+      <div class="row">
+        <button type="button" class="refresh-cameras">Atualizar câmeras</button>
+        <button type="button" class="preview" data-preview-for="lapline">Prévia</button>
+      </div>
+      <img class="preview-img hidden" id="preview-lapline" alt="prévia da câmera">
+      <label>Resolução <select name="resolution"></select></label>
+      <label>Servidor de hora (NTP: IP do roteador do evento) <input name="ntp_server" placeholder="192.168.88.1"></label>
+      <div class="field-error" data-for="ntp_server"></div>
+      <label>Detector de carros <select name="car_detector">
+        <option value="openvino_gpu">Intel iGPU (OpenVINO GPU)</option>
+        <option value="openvino_cpu">CPU (OpenVINO)</option>
+        <option value="onnxruntime_cpu">CPU (ONNX Runtime)</option>
+        <option value="">manter o que está no arquivo</option>
+      </select></label>
+      <label>Porta da página de status <input name="status_port" inputmode="numeric"></label>
+      <div class="field-error" data-for="status_port"></div>
+      <button type="submit">Salvar configurações</button>
+      <p class="small">Reinicie a linha de chegada para aplicar. Arquivo: <span class="config-path"></span></p>
+    </form>
+    <details><summary>Últimas linhas do log</summary><pre id="log-lapline" class="log"></pre></details>
+  </section>
+
+  <!-- ===================================================== zone -->
+  <section class="card hidden" id="card-zone">
+    <h2>Zona PTZ</h2>
+    <div class="bench-warning hidden" id="bench-warning">
+      PERFIL DE BANCADA: detector COCO de carros de rua. NUNCA use na corrida.
+    </div>
+    <div class="status-row">
+      <span class="pill" id="pill-zone">?</span>
+      <button data-role="zone" data-action="start">Iniciar</button>
+      <button data-role="zone" data-action="stop">Parar</button>
+      <button data-role="zone" data-action="restart">Reiniciar</button>
+      <a id="link-zone" target="_blank">Página da zona</a>
+    </div>
+    <form id="form-zone" autocomplete="off">
+      <label>Câmera de observação (spotter) <select name="camera_choice" data-camera-for="zone"></select></label>
+      <input name="camera_device" placeholder="índice (0) ou caminho do dispositivo">
+      <div class="field-error" data-for="camera_device"></div>
+      <div class="row">
+        <button type="button" class="refresh-cameras">Atualizar câmeras</button>
+        <button type="button" class="preview" data-preview-for="zone">Prévia</button>
+      </div>
+      <img class="preview-img hidden" id="preview-zone" alt="prévia da câmera">
+      <label>Resolução <select name="resolution"></select></label>
+      <label>Servidor de hora (NTP) <input name="ntp_server" placeholder="192.168.88.1"></label>
+      <div class="field-error" data-for="ntp_server"></div>
+      <label>IP do PTZ <input name="ptz_host" placeholder="192.168.0.100"></label>
+      <div class="field-error" data-for="ptz_host"></div>
+      <label>Relatório de caracterização <select name="ptz_report"></select></label>
+      <div class="field-error" data-for="ptz_report"></div>
+      <label>Perfil <select name="profile">
+        <option value="normal">normal (corrida)</option>
+        <option value="strict">strict (comparação, corrida)</option>
+        <option value="bench">bench (BANCADA: detector COCO)</option>
+        <option value="bench_strict">bench_strict (BANCADA: COCO + strict)</option>
+      </select></label>
+      <div class="bench-warning hidden" id="bench-warning-form">
+        Perfil de bancada selecionado: a zona vai seguir carros de rua com um modelo COCO. Não use na corrida.
+      </div>
+      <label>Porta da página da zona <input name="web_port" inputmode="numeric"></label>
+      <div class="field-error" data-for="web_port"></div>
+      <label>Porta da API do estúdio <input name="agent_port" inputmode="numeric"></label>
+      <div class="field-error" data-for="agent_port"></div>
+      <label>Token do estúdio (X-Agent-Token; defina um no evento) <input name="agent_token"></label>
+      <div class="field-error" data-for="agent_token"></div>
+      <button type="submit">Salvar configurações</button>
+      <p class="small">Reinicie a zona para aplicar. Arquivo: <span class="config-path"></span></p>
+    </form>
+    <details><summary>Últimas linhas do log</summary><pre id="log-zone" class="log"></pre></details>
+  </section>
+
+  <!-- ===================================================== characterization -->
+  <section class="card hidden" id="card-characterize">
+    <h2>Caracterização do PTZ</h2>
+    <p class="small">Mede o PTZ (15-25 min; rápido: menos). A câmera VAI SE MOVER. Abre uma janela neste computador:
+      confirme o movimento e responda às perguntas NELA. A zona PTZ precisa estar parada.</p>
+    <label>IP do PTZ <input id="char-ip" placeholder="192.168.0.100"></label>
+    <label>Nome da pasta do relatório <input id="char-folder" placeholder="automático (ptz_data_hora)"></label>
+    <label class="check"><input type="checkbox" id="char-quick"> Rápido (~10 velocidades por eixo)</label>
+    <button id="char-start">Iniciar caracterização</button>
+    <pre id="char-log" class="log"></pre>
+  </section>
+</main>
+
+<div id="pin-dialog" class="dialog hidden">
+  <div class="dialog-box">
+    <p>Este painel pede um PIN.</p>
+    <input type="password" id="pin-input" autocomplete="current-password">
+    <button id="pin-ok">OK</button>
+  </div>
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>

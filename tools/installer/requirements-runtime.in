@@ -1,0 +1,15 @@
+# Runtime packages of the installed app (rt + zone + launcher), top level only. The locked, hashed list the build
+# installs is requirements-runtime.txt, generated from this file (see tools/installer/README.md, "Updating pins"):
+#   uv pip compile tools/installer/requirements-runtime.in --python-platform x86_64-pc-windows-msvc \
+#       --python-version 3.12 --only-binary :all: --generate-hashes -o tools/installer/requirements-runtime.txt
+numpy
+opencv-python
+onnxruntime==1.31.0      # the version the models were validated with (requirements.txt)
+openvino==2026.4.1       # Intel CPU / iGPU backend (lap line car detector on the T14's iGPU)
+fastapi                  # zone page + studio agent API + launcher page
+uvicorn
+websockets               # uvicorn's WebSocket support: the studio's /agent/ws
+psutil                   # CPU/RAM stats, affinity, priority, killing process trees
+pyserial                 # beam input (CP2102)
+pystray                  # launcher tray icon
+pillow                   # tray icon image

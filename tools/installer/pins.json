@@ -1,0 +1,16 @@
+{
+ "comment": "Pinned downloads of the build (build_installer.ps1 verifies each sha256 and stops on a mismatch). Sources of the hashes: python = uv's python-build-standalone download metadata (uv 0.11.32); ffmpeg = the winget manifest Gyan.FFmpeg.Essentials 8.0.1 (microsoft/winget-pkgs). See README.md, 'Updating pins'.",
+ "python": {
+  "version": "3.12.13",
+  "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260718/cpython-3.12.13%2B20260718-x86_64-pc-windows-msvc-install_only_stripped.tar.gz",
+  "sha256": "0d422a1439ec308e03f47df551bc30f5994727c456e414b026d202bcda9b7c1c",
+  "file": "cpython-3.12.13+20260718-x86_64-pc-windows-msvc-install_only_stripped.tar.gz"
+ },
+ "ffmpeg": {
+  "version": "8.0.1 essentials (gyan.dev, GPL: libx264, QSV, AMF)",
+  "url": "https://github.com/GyanD/codexffmpeg/releases/download/8.0.1/ffmpeg-8.0.1-essentials_build.zip",
+  "sha256": "e2aaeaa0fdbc397d4794828086424d4aaa2102cef1fb6874f6ffd29c0b88b673",
+  "file": "ffmpeg-8.0.1-essentials_build.zip",
+  "folder": "ffmpeg-8.0.1-essentials_build"
+ }
+}

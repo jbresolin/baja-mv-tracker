@@ -1,0 +1,107 @@
+name: installer smoke test
+
+# Builds the Windows installer with stand-in models, installs it silently, runs the installed app's self-test and
+# the test suites on the installed Python, then checks an in-place upgrade and the uninstall (data kept).
+# Only on demand and on tags: a full run takes ~15-25 minutes of a Windows runner.
+#   gh api -X POST repos/<owner>/<repo>/actions/workflows/installer-smoke.yml/dispatches -f ref=<branch>
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*", "installer-*"]
+
+jobs:
+  smoke:
+    runs-on: windows-latest
+    timeout-minutes: 75
+    env:
+      DATA: C:\BajaMVData
+      INSTALL: C:\Program Files\BajaMV
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0            # the version is the commit date + hash
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Stand-in models (the real ones are not in git)
+        run: |
+          python -m pip install --disable-pip-version-check onnx numpy
+          python tools/installer/make_dummy_models.py build/dummy-models
+
+      - name: Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+          }
+
+      - name: Build the installer
+        shell: pwsh
+        run: tools/installer/build_installer.ps1 -ModelsDir build/dummy-models -AllowDummyModels
+
+      - name: Silent install
+        shell: pwsh
+        run: |
+          $setup = (Get-ChildItem dist\BajaMV-Setup-*.exe | Select-Object -First 1).FullName
+          Write-Host "installer: $setup ($([math]::Round((Get-Item $setup).Length / 1MB)) MB)"
+          $p = Start-Process $setup -Wait -PassThru -ArgumentList @(
+            "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-", "/DATADIR=$env:DATA", "/TASKS=firewall",
+            "/LOG=$PWD\install.log")
+          if ($p.ExitCode -ne 0) { Get-Content install.log -Tail 60; exit $p.ExitCode }
+          Get-Content "$env:INSTALL\app\install.ini"
+          Get-Content "$env:INSTALL\app\build_info.json"
+          if (-not (Test-Path "$env:DATA")) { throw "data folder not created" }
+          netsh advfirewall firewall show rule name="Baja MV (portas)"
+
+      - name: Self-test of the installed app
+        shell: cmd
+        run: '"%INSTALL%\BajaMV.cmd" --self-test'
+
+      - name: Test suites on the installed Python
+        shell: pwsh
+        run: |
+          $py = "$env:INSTALL\python\python.exe"
+          & $py -m pip install --disable-pip-version-check --no-warn-script-location pytest httpx
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:PATH = "$env:INSTALL\ffmpeg\bin;$env:PATH"
+          & $py -m pytest rt zone launcher -q -p no:cacheprovider -rs
+          exit $LASTEXITCODE
+
+      - name: Upgrade in place keeps the data folder
+        shell: pwsh
+        run: |
+          Set-Content "$env:DATA\config\keep-me.txt" "written before the upgrade"
+          $setup = (Get-ChildItem dist\BajaMV-Setup-*.exe | Select-Object -First 1).FullName
+          $p = Start-Process $setup -Wait -PassThru -ArgumentList @(
+            "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-", "/LOG=$PWD\upgrade.log")
+          if ($p.ExitCode -ne 0) { Get-Content upgrade.log -Tail 60; exit $p.ExitCode }
+          if (-not (Test-Path "$env:DATA\config\keep-me.txt")) { throw "the upgrade lost the data folder" }
+          $ini = Get-Content "$env:INSTALL\app\install.ini" -Raw
+          if ($ini -notmatch [regex]::Escape($env:DATA)) { throw "the upgrade changed the data folder: $ini" }
+          & "$env:INSTALL\python\python.exe" -c "import launcher.paths as p; print(p.resolve_paths().data_root)"
+
+      - name: Uninstall keeps the data folder
+        shell: pwsh
+        run: |
+          $p = Start-Process "$env:INSTALL\unins000.exe" -Wait -PassThru -ArgumentList @(
+            "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/LOG=$PWD\uninstall.log")
+          Start-Sleep -Seconds 5      # the uninstaller finishes from a temporary copy of itself
+          if (Test-Path "$env:INSTALL\app\rt") { throw "program files still there after uninstall" }
+          if (-not (Test-Path "$env:DATA\config\keep-me.txt")) { throw "uninstall removed the data folder" }
+          $rule = netsh advfirewall firewall show rule name="Baja MV (portas)"
+          if ($LASTEXITCODE -eq 0) { throw "firewall rule still there: $rule" }
+          Write-Host "uninstalled; data kept"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: installer-logs
+          path: |
+            install.log
+            upgrade.log
+            uninstall.log
+            C:\BajaMVData\logs
+            C:\BajaMVData\config
+          if-no-files-found: ignore

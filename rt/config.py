@@ -146,14 +146,26 @@ def read_roster(event, rosters_dir=None):
     return sorted(teams), teams
 
 
-def load_roster(event, open_set_max=OPEN_SET_MAX, rosters_dir=None):
+def pick_rosters_dir(event, rosters_dir=None, override_dir=None):
+    """The folder to read <event>.csv from. `override_dir` (identity.rosters_dir: the installed app's data folder,
+    where the launcher's "Baixar lista de equipes" button saves fetched rosters) wins when it has a file for this
+    event; otherwise `rosters_dir` (default: rosters/ in the repo, i.e. the rosters bundled with the code)."""
+    if override_dir and roster_path(event, override_dir).exists():
+        return override_dir
+    return rosters_dir
+
+
+def load_roster(event, open_set_max=OPEN_SET_MAX, rosters_dir=None, override_dir=None):
     """The event roster for rt, or an "open set" when it cannot be used. Never stops rt.
+
+    `override_dir` (optional, identity.rosters_dir): a folder searched first (see pick_rosters_dir).
 
     Returns dict(numbers, teams, open_set, warning):
       * roster found: numbers/teams from the file, open_set False, warning None.
       * file missing, empty or unreadable: numbers 1..open_set_max, no team names, open_set True, and a warning to
         log and to show on the status page. In open-set mode auto-confirm is off: its ~99% precision was measured
         with the real roster, which also throws away misreads that are not entry numbers."""
+    rosters_dir = pick_rosters_dir(event, rosters_dir, override_dir)
     p = roster_path(event, rosters_dir)
     problem = None
     try:
