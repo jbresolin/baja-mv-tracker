@@ -169,6 +169,26 @@ class ZoneRuntime:
                 self.controller.stop()      # immediately, not at the next frame
             return True, mode
 
+    def hand_over(self, mode, why, stop_camera, lock_timeout_s=1.0):
+        """For the studio (zone/agent): switch the director to PASSIVE or STOPPED *without* its usual one-shot stop at
+        the next cycle. The studio's own command (a move, a preset recall) goes out right after this, and a stop from
+        the director ~0.1 s later would cut it. `stop_camera=True` stops the PTZ now instead (leaving AUTO for manual
+        or hold: the zone's own motion must end). -> (ok, message); not ok only if the control loop held its lock for
+        longer than `lock_timeout_s` (a hung PTZ call)."""
+        mode = str(mode).upper()
+        if mode not in (D.PASSIVE, D.STOPPED):
+            raise ValueError("hand_over is for PASSIVE or STOPPED, not %r" % mode)
+        if not self.lock.acquire(timeout=lock_timeout_s):
+            return False, "the zone's control loop is busy (a PTZ call is hanging)"
+        try:
+            self.director.set_mode(mode, self.clock.monotonic(), why)
+            self.director.discard_pending()
+            if stop_camera:
+                self.controller.stop()
+            return True, mode
+        finally:
+            self.lock.release()
+
     def big_stop(self, lock_timeout_s=None):
         """The big red button: a stop command right now, then STOPPED.
 
