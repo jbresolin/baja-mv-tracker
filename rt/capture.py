@@ -65,9 +65,13 @@ def out_size(w, h, max_width):
 
 
 # ------------------------------------------------------------------------------------------------ file clock
-def overlay_start(path, log=print):
+def overlay_start(path, ffmpeg, log=print, grab=None):
     """OBS clock overlay (lapvision/clock.py): read at pts 0.5 and 2.5; accepted when both read with a margin and the
-    difference is 2 s (+-0.2). Returns the time-of-day at pts 0 (UTC-3 per the overlay), or None."""
+    difference is 2 s (+-0.2). Returns the time-of-day at pts 0 (UTC-3 per the overlay), or None.
+
+    `ffmpeg` is the configured program (capture.ffmpeg), never a bare "ffmpeg": the installed app's bundled ffmpeg
+    is not on PATH, and a FileNotFoundError here took rt and the zone down on every file source (installer smoke
+    test). `grab` (tests) replaces clock.grab."""
     sys.path.insert(0, str(ROOT / "lapvision"))
     try:
         import clock
@@ -76,7 +80,7 @@ def overlay_start(path, log=print):
         return None
     starts = []                       # time of day at pts 0, from each of the two readings
     for t in (0.5, 2.5):
-        f = clock.grab(path, t)
+        f = (grab or clock.grab)(path, t, ffmpeg=ffmpeg)
         if f is None:
             return None
         s, mg = clock.read(f)
@@ -88,13 +92,13 @@ def overlay_start(path, log=print):
     return starts[0]
 
 
-def file_start_epoch(path, info, mode, log=print):
-    """-> (epoch at pts 0, how)"""
+def file_start_epoch(path, info, mode, ffmpeg, log=print, grab=None):
+    """-> (epoch at pts 0, how). `ffmpeg`: the configured program (capture.ffmpeg), for the overlay reading."""
     path = Path(path)
     modes = ["overlay", "creation", "mtime"] if mode == "auto" else [mode]
     for m in modes:
         if m == "overlay":
-            tod = overlay_start(path, log)
+            tod = overlay_start(path, ffmpeg, log, grab=grab)
             if tod is None:
                 continue
             md = re.search(r"(\d{4})-(\d{2})-(\d{2})", path.name)
@@ -253,7 +257,8 @@ class FileCapture(Capture):
             self.base = self.frame_times[0]
             self.clock_how = "frames.csv (the recorded time of each frame)"
         else:
-            self.base, self.clock_how = file_start_epoch(self.path, self.info, cfg["clock"]["mode"], log)
+            self.base, self.clock_how = file_start_epoch(self.path, self.info, cfg["clock"]["mode"],
+                                                                c["ffmpeg"], log)
         self.ss = max(0.0, parse_start(start, self.base) or 0.0)
         self.duration = float(duration) if duration else None
         self.step = max(1, int(round(self.info["fps"] / self.det_fps)))

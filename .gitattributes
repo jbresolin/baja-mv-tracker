@@ -1,4 +1,5 @@
 # Windows batch files need CRLF line endings to run reliably in cmd.exe
 *.bat text eol=crlf
+*.cmd text eol=crlf
 # test fixtures are binary
 *.mp4 binary

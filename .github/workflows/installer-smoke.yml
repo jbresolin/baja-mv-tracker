@@ -1,0 +1,133 @@
+name: installer smoke test
+
+# Builds the Windows installer with stand-in models, installs it silently, runs the installed app's self-test and
+# the test suites on the installed Python, then checks an in-place upgrade and the uninstall (data kept).
+# Only on demand and on tags: a full run takes ~15-25 minutes of a Windows runner.
+#   gh api -X POST repos/<owner>/<repo>/actions/workflows/installer-smoke.yml/dispatches -f ref=<branch>
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*", "installer-*"]
+
+jobs:
+  smoke:
+    runs-on: windows-latest
+    timeout-minutes: 75
+    env:
+      DATA: C:\BajaMVData
+      INSTALL: C:\Program Files\BajaMV
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0            # the version is the commit date + hash
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Stand-in models (the real ones are not in git)
+        run: |
+          python -m pip install --disable-pip-version-check onnx numpy
+          python tools/installer/make_dummy_models.py build/dummy-models
+
+      - name: Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+          }
+
+      - name: Build the installer
+        # Windows PowerShell 5.1 (powershell.exe), the shell the owner builds with, not PowerShell 7 (pwsh)
+        shell: powershell
+        run: '& .\tools\installer\build_installer.ps1 -ModelsDir build\dummy-models -AllowDummyModels'
+
+      - name: Silent install
+        shell: pwsh
+        run: |
+          $setup = (Get-ChildItem dist\BajaMV-Setup-*.exe | Select-Object -First 1).FullName
+          Write-Host "installer: $setup ($([math]::Round((Get-Item $setup).Length / 1MB)) MB)"
+          $p = Start-Process $setup -Wait -PassThru -ArgumentList @(
+            "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-", "/DATADIR=$env:DATA", "/TASKS=firewall",
+            "/LOG=$PWD\install.log")
+          if ($p.ExitCode -ne 0) { Get-Content install.log -Tail 60; exit $p.ExitCode }
+          Get-Content "$env:INSTALL\app\install.ini"
+          Get-Content "$env:INSTALL\app\build_info.json"
+          if (-not (Test-Path "$env:DATA")) { throw "data folder not created" }
+          # cmd /c: netsh needs name="..." exactly as written, which PowerShell's argument passing may change
+          cmd /c 'netsh advfirewall firewall show rule name="Baja MV (portas)"'
+          if ($LASTEXITCODE -ne 0) { throw "firewall rule missing" }
+
+      - name: Self-test of the installed app
+        # deliberately run from the checkout folder (it has its own launcher\): BajaMV.cmd must still run the
+        # installed code (python -P), and the self-test's "code location" check fails if it does not
+        shell: cmd
+        run: '"%INSTALL%\BajaMV.cmd" --self-test'
+
+      - name: Test suites on the installed Python
+        shell: pwsh
+        run: |
+          $py = "$env:INSTALL\python\python.exe"
+          & $py -m pip install --disable-pip-version-check --no-warn-script-location pytest httpx
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:PATH = "$env:INSTALL\ffmpeg\bin;$env:PATH"
+          & $py -m pytest rt zone launcher -q -p no:cacheprovider -rs
+          exit $LASTEXITCODE
+
+      - name: Upgrade in place keeps the data folder
+        shell: pwsh
+        run: |
+          Set-Content "$env:DATA\config\keep-me.txt" "written before the upgrade"
+          $setup = (Get-ChildItem dist\BajaMV-Setup-*.exe | Select-Object -First 1).FullName
+          $p = Start-Process $setup -Wait -PassThru -ArgumentList @(
+            "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-", "/LOG=$PWD\upgrade.log")
+          if ($p.ExitCode -ne 0) { Get-Content upgrade.log -Tail 60; exit $p.ExitCode }
+          if (-not (Test-Path "$env:DATA\config\keep-me.txt")) { throw "the upgrade lost the data folder" }
+          $ini = Get-Content "$env:INSTALL\app\install.ini" -Raw
+          if ($ini -notmatch [regex]::Escape($env:DATA)) { throw "the upgrade changed the data folder: $ini" }
+          # -P: not the checkout's launcher\ (the current folder), the installed one
+          $out = & "$env:INSTALL\python\python.exe" -P -c "import launcher.paths as p; r = p.resolve_paths(); print(r.code_root); print(r.data_root)"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host ($out -join "`n")
+          if ($out[0] -ne "$env:INSTALL\app") { throw "the installed Python imported the code from $($out[0])" }
+          if ($out[1] -ne $env:DATA) { throw "data root after the upgrade: $($out[1])" }
+
+      - name: Uninstall keeps the data folder
+        shell: pwsh
+        run: |
+          $p = Start-Process "$env:INSTALL\unins000.exe" -Wait -PassThru -ArgumentList @(
+            "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/LOG=$PWD\uninstall.log")
+          # unins000.exe hands over to a temporary copy of itself and returns at once: wait (up to 60 s) until the
+          # program files are really gone
+          $deadline = (Get-Date).AddSeconds(60)
+          while ((Test-Path "$env:INSTALL\app") -and ((Get-Date) -lt $deadline)) { Start-Sleep -Seconds 1 }
+          if (Test-Path "$env:INSTALL\app") { throw "program files still there 60 s after the uninstall started" }
+          if (-not (Test-Path "$env:DATA\config\keep-me.txt")) { throw "uninstall removed the data folder" }
+          cmd /c 'netsh advfirewall firewall show rule name="Baja MV (portas)"'
+          if ($LASTEXITCODE -eq 0) { throw "firewall rule still there after uninstall" }
+          $global:LASTEXITCODE = 0
+          Write-Host "uninstalled; data kept"
+
+      - name: Collect the data folder's logs and configs
+        # upload-artifact needs every path under one root folder, and the data folder (C:) is on another drive than
+        # the checkout (D:): copy them into the checkout first
+        if: always()
+        shell: pwsh
+        run: |
+          foreach ($sub in "logs", "config") {
+            if (Test-Path "$env:DATA\$sub") {
+              New-Item -ItemType Directory -Force "data-folder" | Out-Null
+              Copy-Item -Recurse -Force "$env:DATA\$sub" "data-folder\$sub"
+            }
+          }
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: installer-logs
+          path: |
+            install.log
+            upgrade.log
+            uninstall.log
+            data-folder
+          if-no-files-found: ignore
