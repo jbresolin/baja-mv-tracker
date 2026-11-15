@@ -90,6 +90,38 @@ def wait_for_http(url, timeout_s, is_alive=lambda: True, poll_s=0.5):
     return None
 
 
+def wait_for_json(url, accept, timeout_s, is_alive=lambda: True, poll_s=0.5, get=None):
+    """GET url (JSON) until `accept(data)` is true (-> data) or the time runs out / the process dies (-> None).
+    A page that answers is not enough to call a role healthy: in the smoke test rt and the zone both served their
+    page for a moment and then crashed on their first video frame, and the check passed or failed by luck."""
+    def default_get(address):
+        with urllib.request.urlopen(address, timeout=2) as response:
+            return json.loads(response.read().decode("utf-8"))
+    get = get or default_get
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            data = get(url)
+            if accept(data):
+                return data
+        except Exception:  # noqa: BLE001
+            pass
+        if not is_alive():
+            return None
+        time.sleep(poll_s)
+    return None
+
+
+def role_log(process, lines=40):
+    """The last `lines` lines of a role's own log (logs/<role>.log: everything the role and the processes under it
+    printed, tracebacks included), one per line, for a FAIL detail. Fifteen lines joined on one line were not enough
+    to see why a role died in CI: the useful lines had scrolled away behind a long traceback."""
+    status = process.status(lines)
+    exit_text = "running" if status["running"] else "exit code %s" % status["exit_code"]
+    return "\n".join(["%s (%s), last %d lines:" % (status["log_file"], exit_text, lines)] +
+                     ["    | " + line for line in status["log"]])
+
+
 def module_names(code_root, packages=PACKAGES):
     """Every importable module of the packages, tests and dev-only modules excluded."""
     names = []
@@ -321,18 +353,23 @@ def check_lapline_role(results, paths, video, timeout_s=180):
         results.add("fail", "lap line role", message)
         return
     process = roles.processes["lapline"]
-    body = wait_for_http("http://127.0.0.1:%d/status.json" % port, timeout_s, is_alive=process.running)
+    url = "http://127.0.0.1:%d/status.json" % port
+    body = wait_for_http(url, timeout_s, is_alive=process.running)
+    # the page alone is not enough: rt must also read and process frames of the video (it serves the page before it
+    # opens its source, so a crash on opening the source would otherwise go unnoticed)
+    status = wait_for_json(url, lambda data: (data.get("processing") or {}).get("frames", 0) > 0, timeout_s,
+                           is_alive=process.running) if body is not None else None
+    log_text = role_log(process)                       # read before the stop (which adds its own lines)
     tree = process_tree(process.proc.pid) if process.running() else []
     roles.stop("lapline")
     stopped, stop_text = stop_verdict(tree)
-    if body is None:
-        results.add("fail", "lap line role", "status page never answered; log: %s" % " | ".join(
-            process.status(15)["log"]))
+    if body is None or status is None:
+        results.add("fail", "lap line role", "%s; log %s" % (
+            "status page never answered" if body is None else "status page answered but no frame was processed",
+            log_text))
         return
-    status = json.loads(body.decode("utf-8"))
-    results.add("ok" if stopped else "fail", "lap line role", "status page answered (event %s, fps %s); %s" % (
-        (status.get("info") or {}).get("event"), (status.get("processing") or {}).get("fps"),
-        stop_text))
+    results.add("ok" if stopped else "fail", "lap line role", "status page answered (event %s, %s frames); %s" % (
+        (status.get("info") or {}).get("event"), (status.get("processing") or {}).get("frames"), stop_text))
 
 
 def check_zone_role(results, paths, video, timeout_s=180):
@@ -355,18 +392,26 @@ def check_zone_role(results, paths, video, timeout_s=180):
             results.add("fail", "zone role", message)
             return
         process = roles.processes["zone"]
-        page = wait_for_http("http://127.0.0.1:%d/api/state" % web_port, timeout_s, is_alive=process.running)
+        state_url = "http://127.0.0.1:%d/api/state" % web_port
+        page = wait_for_http(state_url, timeout_s, is_alive=process.running)
+        # the zone must also be processing spotter frames (its frame loop runs in a thread: the page answers even
+        # when the loop crashed, until the process exits a moment later)
+        state = wait_for_json(state_url, lambda data: (data.get("frame") or {}).get("size") is not None,
+                              timeout_s, is_alive=process.running) if page is not None else None
         agent = wait_for_http("http://127.0.0.1:%d/agent/info" % agent_port, 30, is_alive=process.running) \
-            if page is not None else None
+            if state is not None else None
+        log_text = role_log(process)                   # read before the stop (which adds its own lines)
         tree = process_tree(process.proc.pid) if process.running() else []
         ok, message = roles.stop("zone")
         stopped, stop_text = stop_verdict(tree)
-        if page is None or agent is None:
-            results.add("fail", "zone role", "%s did not answer; log: %s" % (
-                "page" if page is None else "studio API", " | ".join(process.status(15)["log"])))
+        if page is None or state is None or agent is None:
+            what = ("page did not answer" if page is None else
+                    "page answered but no spotter frame was processed" if state is None else
+                    "studio API did not answer")
+            results.add("fail", "zone role", "%s; log %s" % (what, log_text))
             return
-        results.add("ok" if stopped else "fail", "zone role", "page and studio API answered; %s (%s)" % (
-            stop_text, message))
+        results.add("ok" if stopped else "fail", "zone role", "page and studio API answered, frame %s processed; "
+                    "%s (%s)" % ("x".join(str(v) for v in state["frame"]["size"]), stop_text, message))
     finally:
         camera.stop()
 

@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from launcher.selftest import Results, module_names, wait_for_http
+from launcher.selftest import Results, module_names, role_log, wait_for_http, wait_for_json
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -54,6 +54,38 @@ def test_waiting_for_a_page_stops_as_soon_as_the_process_is_gone():
     started = time.monotonic()
     assert wait_for_http("http://127.0.0.1:9/nothing", timeout_s=60, is_alive=lambda: False, poll_s=0.01) is None
     assert time.monotonic() - started < 10
+
+
+def test_a_role_counts_as_healthy_only_once_it_processes_frames():
+    # A role's page answering is not enough: rt and the zone serve their page first and open the video afterwards;
+    # in CI both crashed right after (ffmpeg not found) and the self-test passed or failed by luck. The self-test
+    # now waits for a status that says frames were processed. Here a fake "GET" returns, one call after another,
+    # what a starting rt would show: no frames yet, still none, then 3 frames.
+    answers = iter([dict(processing=dict(frames=0)), dict(processing=dict(frames=0)), dict(processing=dict(frames=3))])
+    data = wait_for_json("http://fake/status.json", lambda d: d["processing"]["frames"] > 0, timeout_s=60,
+                         poll_s=0.001, get=lambda url: next(answers))
+    assert data == dict(processing=dict(frames=3))
+
+
+def test_waiting_for_frames_gives_up_as_soon_as_the_role_is_gone():
+    # The page keeps saying "0 frames" and the process has died: no point waiting the full minute.
+    started = time.monotonic()
+    data = wait_for_json("http://fake/status.json", lambda d: d["processing"]["frames"] > 0, timeout_s=60,
+                         is_alive=lambda: False, poll_s=0.01, get=lambda url: dict(processing=dict(frames=0)))
+    assert data is None
+    assert time.monotonic() - started < 10
+
+
+def test_a_failed_role_shows_the_last_40_lines_of_its_own_log(tmp_path):
+    # When a role fails in CI, the reason (a traceback, "frame loop crashed: ...") must be in the self-test output.
+    # role_log() gives the log file's name, whether the role still runs, and its last 40 lines, one per line.
+    from launcher.procs import ManagedProcess
+    process = ManagedProcess("zone", lambda: ["unused"], tmp_path)
+    process.log_path.write_text("\n".join("line %d" % k for k in range(100)) + "\n", encoding="utf-8")
+    text = role_log(process, lines=40)
+    lines = text.splitlines()
+    assert lines[0].startswith(str(process.log_path)) and "last 40 lines" in lines[0]
+    assert lines[1:] == ["    | line %d" % k for k in range(60, 100)]
 
 
 # ============================================================================================ staging: files
