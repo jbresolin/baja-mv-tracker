@@ -20,7 +20,7 @@ pytest.importorskip("fastapi")
 
 from zone.agent.camera import speed_step  # noqa: E402
 from zone.ptz.sim import PtzModel, SimulatedPtz  # noqa: E402
-from zone.tests.agent_fixtures import DeadPtz, make_rig  # noqa: E402
+from zone.tests.agent_fixtures import CountingPtz, DeadPtz, RefusingPtz, make_rig  # noqa: E402
 from zone.zonefile import Zone  # noqa: E402
 
 
@@ -276,6 +276,7 @@ def test_auto_is_refused_while_the_ptz_does_not_answer(tmp_path):
     assert refused.status_code == 409 and "not answering" in refused.json()["detail"]
     assert rig.studio.post("/cameras/cam1/presets/10/recall").status_code == 503
     dead.alive = True
+    rig.connect_studio()                                 # (the agent polls the position only for a studio)
     rig.advance(0.6)                                     # the agent's position poll gets an answer again
     assert rig.agent.camera.state()["status"] == "ok" and ("device_online", {}) in rig.events()
     assert rig.studio.put("/cameras/cam1/mode", json={"mode": "auto"}).status_code == 200
@@ -452,3 +453,162 @@ def _receive_until(ws, matches, tries=50):
         if matches(message):
             return message
     raise AssertionError("no matching message")
+
+
+# =========================================================================================================== review fixes
+def test_a_studio_stop_reaches_the_camera_first_and_includes_the_zoom(tmp_path):
+    # /stop goes to the PTZ driver before anything else (the mode rules may have to wait for the zone's control
+    # loop), for pan/tilt AND zoom, and once more after the mode change.
+    rig = make_rig(tmp_path)
+    before = len(rig.ptz.commands)
+    rig.studio.post("/cameras/cam1/stop")
+    sent = [name for _, name, _ in rig.ptz.commands[before:]]
+    assert sent == ["stop", "zoom_stop", "stop", "zoom_stop"]
+
+
+def test_a_zoom_move_stops_by_itself_after_its_ttl(tmp_path):
+    # The dead-man switch for zoom too: one zoom move, then nothing; the zoom stops about ttl_ms later.
+    rig = make_rig(tmp_path)
+    rig.studio.post("/cameras/cam1/move", json={"zoom": 0.5, "ttl_ms": 300})
+    rig.advance(0.25)
+    assert rig.ptz.is_moving()
+    rig.advance(1.0)
+    zoom = rig.ptz.true_zoom()
+    assert zoom > 100                                   # it did zoom in
+    rig.advance(1.0)
+    assert rig.ptz.true_zoom() == pytest.approx(zoom)   # and stopped by itself
+
+
+def test_a_preset_the_camera_refuses_to_store_is_a_bad_request(tmp_path):
+    # The camera answered, with an error: it is there (not "offline"), it just won't store that one.
+    rig = make_rig(tmp_path)
+    refusing = make_rig(tmp_path / "b", ptz=RefusingPtz(rig.ptz), clock=rig.clock)
+    answer = refusing.studio.post("/cameras/cam1/presets/5/store")
+    assert answer.status_code == 400 and answer.json()["error"] == "bad_request"
+    assert refusing.agent.camera.online()
+
+
+def test_a_stop_while_the_control_loop_is_busy_is_not_lost(tmp_path):
+    # In AUTO, the zone's control loop holds its lock (a PTZ call that hangs). The studio presses stop:
+    # * the stop reaches the camera at once anyway (sent before any lock);
+    # * the studio is told the zone is late (503), instead of a quiet "ok" while the zone keeps tracking;
+    # * the camera is auto_paused for the studio, and the zone's director goes quiet at its very next cycle.
+    rig = make_rig(tmp_path)
+    rig.zapp.runtime.handover_lock_timeout_s = 0.05    # don't wait a whole second in a test
+    rig.studio.put("/cameras/cam1/mode", json={"mode": "auto"})
+    _hold_lock_in_another_thread(rig, lambda: _check_busy_stop(rig))
+    assert rig.director() == "AUTO"                     # the loop hasn't run yet...
+    rig.cycle()                                         # ...its next cycle obeys the queued hand-over
+    assert rig.director() == "PASSIVE" and rig.mode() == "auto_paused"
+
+
+def _check_busy_stop(rig):
+    before = len(rig.ptz.commands)
+    answer = rig.studio.post("/cameras/cam1/stop")
+    assert answer.status_code == 503 and answer.json()["error"] == "device_offline"
+    assert "busy" in answer.json()["detail"]
+    assert [name for _, name, _ in rig.ptz.commands[before:]][:2] == ["stop", "zoom_stop"]
+
+
+def test_manual_or_hold_while_the_control_loop_is_busy_is_not_lost(tmp_path):
+    for mode in ("manual", "hold"):
+        rig = make_rig(tmp_path / mode)
+        rig.zapp.runtime.handover_lock_timeout_s = 0.05
+        rig.studio.put("/cameras/cam1/mode", json={"mode": "auto"})
+        _hold_lock_in_another_thread(
+            rig, lambda: _expect_status(rig.studio.put("/cameras/cam1/mode", json={"mode": mode}), 503))
+        assert rig.mode() == mode
+        before = len(rig.ptz.commands)
+        rig.cycle()
+        assert rig.director() == "PASSIVE"
+        assert "stop" in [name for _, name, _ in rig.ptz.commands[before:]]     # the zone's own motion ended
+
+
+def test_a_director_left_in_auto_is_silenced_by_the_tick(tmp_path):
+    # Belt and braces: whatever the cause, if the studio has the camera (manual) but the director is in AUTO, the
+    # agent's next tick puts the director back in PASSIVE.
+    rig = make_rig(tmp_path)
+    rig.zapp.runtime.director.set_mode("AUTO", rig.clock.monotonic(), "test: a lost hand-over")
+    rig.advance(0.1)
+    assert rig.director() == "PASSIVE" and rig.mode() == "manual"
+
+
+def test_hand_over_drops_the_directors_queued_stop(tmp_path):
+    # Leaving AUTO normally queues a stop for the next cycle. When the studio takes over (a pause), that stop would
+    # cut the studio's own move ~0.1 s later, so the hand-over drops it: the next cycle sends nothing.
+    rig = make_rig(tmp_path)
+    rig.studio.put("/cameras/cam1/mode", json={"mode": "auto"})
+    rig.cycle()                                         # the entry preset recall that starts AUTO
+    ok, _ = rig.zapp.runtime.hand_over("PASSIVE", "test", stop_camera=False)
+    assert ok
+    before = len(rig.ptz.commands)
+    rig.cycle()
+    assert rig.ptz.commands[before:] == []
+
+
+def test_the_page_releases_a_hold_only_when_confirmed(tmp_path):
+    rig = make_rig(tmp_path)
+    rig.studio.put("/cameras/cam1/mode", json={"mode": "hold"})
+    assert rig.page.post("/api/agent/release_hold", json={}).status_code == 400        # no confirmation
+    assert rig.mode() == "hold"
+    assert rig.page.post("/api/agent/release_hold", json={"confirm": True}).json() == {"ok": True, "mode": "manual"}
+    assert rig.mode() == "manual"
+    log = rig.studio.get("/agent/log", params={"limit": 1}).json()[0]
+    assert log["command"] == "release_hold" and log["source"] == "local:zone-page"
+    assert log["args"] == {"holder": "studio:test-studio"}
+    assert rig.page.post("/api/agent/release_hold", json={"confirm": True}).status_code == 409   # not in hold now
+
+
+def test_a_hold_remembered_across_a_restart_can_be_released_on_the_page(tmp_path):
+    make_rig(tmp_path).studio.put("/cameras/cam1/mode", json={"mode": "hold"})
+    restarted = make_rig(tmp_path)
+    assert restarted.page.post("/api/mode", json={"mode": "AUTO"}).status_code == 409
+    restarted.page.post("/api/agent/release_hold", json={"confirm": True})
+    assert restarted.page.post("/api/mode", json={"mode": "AUTO"}).status_code == 200
+    assert make_rig(tmp_path).mode() == "manual"      # and the release itself is remembered
+
+
+def test_the_position_is_polled_only_for_a_studio_and_never_in_auto(tmp_path):
+    # A zone running without a studio must not send the camera anything new; in AUTO the controller owns the wire.
+    rig0 = make_rig(tmp_path)
+    counting = CountingPtz(rig0.ptz)
+    rig = make_rig(tmp_path / "b", ptz=counting, clock=rig0.clock)
+    rig.advance(2.0)
+    assert counting.inquiries == 0                     # nobody connected: no inquiry at all
+    rig.connect_studio()
+    rig.advance(2.0)
+    assert 6 <= counting.inquiries <= 10               # 2 Hz, pan/tilt + zoom each time
+    rig.studio.put("/cameras/cam1/mode", json={"mode": "auto"})
+    counted = counting.inquiries
+    rig.advance(2.0)
+    assert counting.inquiries == counted               # AUTO: none from the agent
+
+
+def test_the_page_shows_when_the_studio_api_is_down(tmp_path):
+    from zone.app import agent_down
+    rig = make_rig(tmp_path)
+    agent_down(rig.zapp, "porta 8890: SystemExit (outro programa usa a porta?)")
+    assert rig.page.get("/api/state").json()["agent"]["error"].startswith("porta 8890")
+
+
+def _expect_status(answer, status):
+    assert answer.status_code == status, answer.text
+
+
+def _hold_lock_in_another_thread(rig, action):
+    """Make the zone's control loop "busy": another thread holds its lock while `action()` runs."""
+    import threading
+    taken, done = threading.Event(), threading.Event()
+
+    def busy_loop():
+        with rig.zapp.runtime.lock:
+            taken.set()
+            done.wait(5)
+    thread = threading.Thread(target=busy_loop)
+    thread.start()
+    taken.wait(5)
+    try:
+        action()
+    finally:
+        done.set()
+        thread.join(5)

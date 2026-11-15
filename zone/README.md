@@ -282,7 +282,8 @@ studio's Cameras page; their moves pause the zone's tracking, which resumes by i
 
 * `enabled = true`, `host = "0.0.0.0"`, `port = 8890` (the studio's subnet scan looks on 8890).
 * `token`: the shared `X-Agent-Token` (empty = no token). Put the same value in the studio's Agents page.
-  `GET /agent/info` never needs it (the scan knows no token).
+  `GET /agent/info` never needs it (the scan knows no token). **Set one at the event** (`site.toml`): on the event
+  LAN, without it anyone could move the PTZ.
 * `agent_id` (default: the hostname), `camera_id = "cam1"` (the studio's "remote camera id"), `camera_label`.
 * `resume_after_ms = 3000`: AUTO comes back this long after the studio's last move / stop / recall *ends* (a
   joystick held 10 s pauses 10 s + this). The studio's mode profile can change it.
@@ -315,6 +316,15 @@ studio's Cameras page; their moves pause the zone's tracking, which resumes by i
   AUTO makes it `auto` (the studio gets a `mode_changed`), and PARAR is also a stop (it ends AUTO or a pause). In
   **hold** the page's AUTO is refused (the contract: only the studio brings AUTO back); PARADO / PASSIVO keep hold.
   The page's header shows the studio's mode and who paused or holds the camera (its `X-Studio-Id`).
+* **Liberar HOLD**: a studio that holds the camera and then disappears (or a hold remembered across a restart) would
+  lock the person at the laptop out. The page shows a "Liberar HOLD" button while in hold; after a confirmation it
+  makes the camera `manual` (a `mode_changed` "HOLD released on the laptop page" for the studios, logged in
+  `/agent/log` as `release_hold`), and the page's AUTO works again. Tell the studio when you do it.
+* **A busy control loop**: if the zone's control loop holds its lock (a PTZ call waiting for a camera that doesn't
+  answer) for more than 1 s, a studio pause / manual / hold is queued and the loop obeys it at its next cycle; the
+  studio gets `503 device_offline` ("busy") instead of a quiet ok, and a move is then not sent. `/stop` always goes
+  to the PTZ first, before any lock, then once more after. If the studio has the camera but the director is still in
+  AUTO for any reason, the agent's next tick (0.1 s) puts it back in PASSIVE.
 * **After a restart** the director is in STOPPED (WP-Z2's rule), so a camera that was in auto comes back in `manual`,
   and every studio that connects is told: `mode_changed {from auto, to manual, reason tracker_not_ready}` (contract
   §9), until a studio sets a mode. `hold` and `manual` survive a restart.
@@ -334,7 +344,15 @@ studio's Cameras page; their moves pause the zone's tracking, which resumes by i
   (`400 bad_request`, with the free numbers), so the studio can never break the teach. The studio's own presets
   (0-127, outside the keyframes) are stored on the camera and remembered in `zone.agent.json`.
 * Position: degrees from home and zoom 0..1, only with a bench report that measured units per degree and Branch A
-  (inquiry while moving). Otherwise `null` and `has_position_feedback: false`.
+  (inquiry while moving). Otherwise `null` and `has_position_feedback: false`. Polled (2 Hz) only while a studio's
+  WebSocket is open and never in AUTO (the controller's own inquiries are reused): a zone without a studio sends the
+  camera nothing new.
+* **Stop at startup**: the zone sends the PTZ a stop (pan/tilt and zoom) as soon as it starts. A VISCA camera has no
+  dead-man of its own; the TTL lives in the zone process, so a crash mid-move would otherwise leave it moving.
+* **API down**: if port 8890 is taken or `websockets` is missing, the zone keeps running, the console prints
+  "API DO ESTÚDIO FORA DO AR" between rows of `!`, and the page's header shows it in red.
+* A studio's WebSocket is closed after 10 s without a word from it (the studio pings every 2 s), and at most 40 state
+  pushes wait for a studio that doesn't read (events are always kept).
 * Not in this package: image controls (`image_controls: []`, `GET /image` is `{}`), crop (`400 not_supported`).
 * The PTZ counts as offline after 3 failed exchanges in a row (health probe, the agent's position poll, studio
   commands); commands then answer `503 device_offline`. One answer brings it back.
@@ -367,6 +385,7 @@ moves a little; a preset is stored at the highest free number, 127).
 message that arrives after its commands, including one the agent pushed a few milliseconds *before* its next
 `PUT /mode` reached it. If a push (every 0.25 s) falls in that gap, it fails with `'manual' == 'hold'`. About 2-4% of
 single runs; runs started back to back can lock onto the same phase and fail several times in a row. Run it again.
+(Fixed on the studio's side in baja-studio PR #25.)
 
 End to end with the studio (a scratch studio started by the script, then the checks: link ok, camera listed, a move
 moves the PTZ, Auto, pause and resume, zone killed -> VISCA fallback, zone back -> hand back):

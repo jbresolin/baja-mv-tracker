@@ -1871,10 +1871,29 @@ the real `ViscaPtz` against the fake VISCA camera; the end-to-end script with a 
   `runtime.hand_over()` (director to PASSIVE with no queued action; an immediate stop only when manual / hold ends
   AUTO).
 * **A VISCA PTZ has no dead-man of its own.** The TTL is in the zone process (`ViscaPtz`'s watchdog thread): a
-  zone app killed mid-move leaves the camera moving until the launcher restarts it (STOPPED sends nothing) or someone
-  stops it, and the studio's direct fallback takes over only after offline (5 s) + `direct_fallback_after_s` (10 s)
-  and sends nothing on take-over. Not changed here; see the PR.
+  zone app killed mid-move leaves the camera moving until someone stops it. **Correction (review of PR #6):** the
+  zone now sends a stop (pan/tilt + zoom) as soon as it starts, and the studio's direct fallback sends one when it
+  takes over (baja-studio PR #25).
 * **Positions differ between routes unless the units agree.** The agent converts with the bench report's units per
   degree, pan / tilt sign and zoom range; the studio's direct VISCA driver with fixed 0.075 deg/unit, no sign, zoom
   / 0x4000. Same for speeds: the agent's top steps come from the report, the fallback's from the studio's camera
   limits (and its zoom uses steps 2-7, the agent 1-7).
+
+### Review fixes on PR #6 (2026-11-15)
+
+* **Correction: a studio stop / manual / hold could be lost while the zone kept tracking.** `runtime.hand_over`
+  gives up after 1 s when the control loop holds its lock (VISCA timeouts and retries), and the mode rules ignored
+  that: the studio got "200 auto_paused" with the director still in AUTO, forever for manual / hold (the tick only
+  reconciled the other way). Now a failed hand-over is queued (`handover_requested`, obeyed by the next cycle like
+  the big STOP's `stop_requested`), the studio gets 503, and the tick also silences a director left in AUTO.
+* **Correction: the studio's /stop waited for the locks** before reaching the PTZ. It now goes to the driver first,
+  then once more after the mode change, like the page's big STOP.
+* **HOLD could lock the person at the laptop out forever** (a studio gone, or HOLD restored from zone.agent.json):
+  "Liberar HOLD" on the page, with a confirmation, makes the camera manual.
+* The agent polled the PTZ's position with no studio connected: a zone-only run sent new VISCA traffic. Now only for
+  a connected studio, and never in AUTO.
+* An agent API that can't start (port taken: uvicorn exits its thread with SystemExit; `websockets` missing) is shown
+  on the page and shouted on the console; the zone keeps running.
+* Mutation check: removing `discard_pending()` from the hand-over, the zoom TTL, the /stop's zoom stop, the queued
+  hand-over, the reverse reconciliation, the 400 for a refused store or the "only for a studio" poll rule each makes
+  a test fail now (before, the first three left the suite green).

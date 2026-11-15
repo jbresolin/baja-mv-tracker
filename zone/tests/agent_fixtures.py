@@ -9,6 +9,7 @@ For a first-time reader:
 * In the real program a background thread calls `agent.tick()` ten times a second (device status, the "resume after
   a pause" countdown...). Here `rig.advance()` calls it, so a test decides exactly when time passes.
 """
+import asyncio
 from dataclasses import dataclass
 
 import numpy as np
@@ -19,7 +20,7 @@ from zone.agent.server import create_agent_app
 from zone.agent.service import ZoneAgent
 from zone.app import ZoneApp, create_web
 from zone.clock import FakeClock
-from zone.ptz.interface import TIMEOUT, CommandResult
+from zone.ptz.interface import ERROR, TIMEOUT, CommandResult
 from zone.ptz.sim import PtzModel, SimulatedPtz
 from zone.source import ZoneFrame
 from zone.tests.z2_fixtures import straight_zone
@@ -50,6 +51,15 @@ class Rig:
                 self.frame()
             self.agent.tick()
             self.ptz.tick()
+
+    def connect_studio(self):
+        """Pretend a studio has its state WebSocket open (the agent only polls the PTZ's position for a studio)."""
+        self.agent.subscribers.add(asyncio.Queue())
+
+    def cycle(self):
+        """One control cycle of the zone's frame loop, with no cars in view (what the loop does 10 times a second)."""
+        t = self.clock.monotonic()
+        return self.zapp.runtime.cycle(ZoneFrame(None, t, self.clock.wall(), 0), tracker_out=[])
 
     def mode(self):
         """The camera's mode as the studio sees it (manual / auto / auto_paused / hold)."""
@@ -119,3 +129,33 @@ class DeadPtz:
                 return None
             return CommandResult(TIMEOUT)
         return call
+
+
+class CountingPtz:
+    """The simulator, counting the position inquiries it is asked (to check who sends what to the camera)."""
+
+    def __init__(self, sim):
+        self.sim = sim
+        self.inquiries = 0
+
+    def __getattr__(self, name):
+        attr = getattr(self.sim, name)
+        if not name.startswith("inquire"):
+            return attr
+
+        def call(*args, **kwargs):
+            self.inquiries += 1
+            return attr(*args, **kwargs)
+        return call
+
+
+class RefusingPtz:
+    """The simulator, except that it answers every preset store with a VISCA error (it is there, it just refuses)."""
+
+    def __init__(self, sim):
+        self.sim = sim
+
+    def __getattr__(self, name):
+        if name == "preset_store":
+            return lambda n: CommandResult(ERROR, error_code=0x02)
+        return getattr(self.sim, name)
