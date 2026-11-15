@@ -6,6 +6,25 @@ let clickMode = null;      // "path" | "keyframe" | "move" | null
 let speedLevel = 1;        // 0 slow, 1 medium, 2 fast
 let jogTimer = null;
 
+// why the director let a car go (zone/director.py, runtime): pt-BR for the header and the events list.
+// ok = a normal end of a pass; the others are drops, shown in red
+const DROP_REASONS = {
+  exit: ["saiu da zona", true],
+  lost: ["PERDIDO: sem detecção por mais de director.lost_timeout_s", false],
+  stopped: ["PARADO: quase sem movimento por mais de director.stopped_timeout_s", false],
+  off_corridor: ["FORA DO CORREDOR por mais de director.off_corridor_frames quadros", false],
+  gone: ["o track sumiu (rastreador)", false],
+  diverged: ["DIVERGIU: câmera longe demais do alvo (controller.divergence_deg)", false],
+  wrong_direction: ["PTZ GIRANDO AO CONTRÁRIO: sinal de pan/tilt errado (ptz.pan_sign)", false],
+};
+const SIGN_HOW = { config: "site.toml", teach: "medido no ensino", report: "relatório da bancada",
+                   default: "PADRÃO, não medido" };
+
+function dropText(reason) {
+  const r = DROP_REASONS[reason];
+  return r ? r[0] : reason;
+}
+
 function msg(t, isErr) {
   const m = $("#msg");
   m.textContent = t || "";
@@ -202,6 +221,9 @@ function render(s) {
                                            returning: "voltando à entrada" }[d.sub] || d.sub) : "";
   const L = s.runtime.locked;
   $("#locked").textContent = L ? `carro ${L.id}  s=${L.s.toFixed(2)}  v=${L.v.toFixed(2)}/s${L.predicted ? " (previsto)" : ""}` : "";
+  const ld = d.last_drop, ldEl = $("#lastDrop");
+  ldEl.textContent = ld ? `último: ${dropText(ld.reason)} (s=${ld.s === null ? "?" : ld.s.toFixed(2)}, seguido ${ld.held_s} s)` : "";
+  ldEl.className = ld && !(DROP_REASONS[ld.reason] || [0, false])[1] ? "bad" : "";
   document.querySelectorAll("[data-mode]").forEach((b) => b.classList.toggle("on", b.dataset.mode === d.mode));
   document.querySelector('[data-mode="AUTO"]').disabled = !s.runtime.zone_ready;
   renderStudio(s.agent);
@@ -245,6 +267,9 @@ function render(s) {
             (h.ptz_reachable_how === "last_command" ? " (último comando)" : ""),
      h.ptz_reachable === false ? "bad" : (h.ptz_reachable ? "good" : "")],
     ["ramo de controle", `${h.branch} · ${h.report.reason || h.report.path || "sem relatório"}`],
+    ["sinal pan / tilt", h.ptz_signs ? ["pan", "tilt"].map((a) => `${a} ${h.ptz_signs[a].sign > 0 ? "+1" : "-1"} (${SIGN_HOW[h.ptz_signs[a].how] || h.ptz_signs[a].how})`).join(" · ")
+                         + (h.sign_warnings && h.sign_warnings.length ? " · " + h.sign_warnings.join(" · ") : "") : "–",
+     h.sign_warnings && h.sign_warnings.length ? "bad" : ""],
     ["relógio (NTP)", h.ntp_server ? (h.ntp_offset_s === null ? "sem resposta de " + h.ntp_server
                                      : `${h.ntp_offset_s >= 0 ? "+" : ""}${h.ntp_offset_s} s vs ${h.ntp_server}`)
                                   : (h.clock_warnings.length ? h.clock_warnings.join(" ") : "não configurado"),
@@ -258,7 +283,9 @@ function render(s) {
     ["fonte", h.source || "–"],
   ]);
   $("#events").innerHTML = s.events.slice().reverse().map((e) =>
-    `<div>${e.wall_iso} ${e.event || e.type} ${e.reason || e.why || ""} ${e.track_id !== undefined ? "carro " + e.track_id : ""}
+    `<div class="${e.event === "release" && e.reason !== "exit" || e.type === "direction_mismatch" || e.type === "divergence" ? "bad" : ""}">${e.wall_iso} ${e.event || e.type} ${e.event === "release" ? dropText(e.reason) : (e.reason || e.why || "")} ${e.track_id !== undefined ? "carro " + e.track_id : ""}
+     ${e.s !== undefined && e.s !== null ? "s=" + e.s : ""} ${e.held_s !== undefined ? "após " + e.held_s + " s" : ""}
+     ${e.type === "divergence" ? `gap pan ${e.gap_pan} tilt ${e.gap_tilt}` : ""}
      ${e.new ? "→ " + e.new : ""} ${e.msg || ""}</div>`).join("");
 }
 

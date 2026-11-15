@@ -73,6 +73,9 @@ class Zone:
     cameras: dict = field(default_factory=dict)   # {"spotter": "...", "ptz": "..."}: ids, for the record
     report: dict = field(default_factory=dict)    # the characterization report the poses were taken with
     notes: str = ""
+    # pan/tilt sign measured while teaching (zone/direction.py): {"pan": -1, "tilt": 1, "pan_votes": 4, ...}
+    # +1 = the reported value grows when turning right / up. Empty = not measured (e.g. no position inquiry)
+    ptz_signs: dict = field(default_factory=dict)
 
     # ------------------------------------------------------------------ derived
     def keyframe_indices(self):
@@ -108,6 +111,7 @@ class Zone:
                     corridor_half_width_px=float(self.corridor_half_width_px),
                     entry_preset=self.entry_preset,
                     cameras=dict(self.cameras), report=dict(self.report), notes=self.notes,
+                    ptz_signs=dict(self.ptz_signs),
                     points=[p.to_dict() for p in self.points])
 
     @classmethod
@@ -118,7 +122,8 @@ class Zone:
         return cls(points=[PathPoint.from_dict(p) for p in d.get("points", [])],
                    corridor_half_width_px=float(d.get("corridor_half_width_px", 60.0)),
                    image_size=d.get("image_size"), cameras=dict(d.get("cameras") or {}),
-                   report=dict(d.get("report") or {}), notes=str(d.get("notes", "")))
+                   report=dict(d.get("report") or {}), notes=str(d.get("notes", "")),
+                   ptz_signs=dict(d.get("ptz_signs") or {}))
 
 
 def backup_dir(path):

@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import cv2  # noqa: E402
 
 from zone import config as C  # noqa: E402
+from zone import direction  # noqa: E402
 from zone import director as D  # noqa: E402
 from zone import draw  # noqa: E402
 from zone import zonefile  # noqa: E402
@@ -104,9 +105,14 @@ class ZoneApp:
         self._probe_answered_once = False    # has this camera ever answered the health probe?
         self.stop_ev = threading.Event()
         self.exit_code = 0
-        self._log("zone app start: branch %s (%s), pose source %s, zone %s (%d points)" % (
-            settings.controller.branch, settings.report.reason or settings.report.path, settings.pose_source,
-            self.zone_path, len(zone.points)))
+        self._log("zone app start: branch %s (%s), pose source %s, pan_sign %+d (%s), tilt_sign %+d (%s), zone %s "
+                  "(%d points)" % (
+                      settings.controller.branch, settings.report.reason or settings.report.path, settings.pose_source,
+                      settings.controller.pan_sign, (settings.sign_how or {}).get("pan"),
+                      settings.controller.tilt_sign, (settings.sign_how or {}).get("tilt"),
+                      self.zone_path, len(zone.points)))
+        for w in self.runtime.sign_warnings:
+            self._log("WARNING: " + w, "warning")
 
     # ------------------------------------------------------------------------------------------- logging
     def _log(self, msg, kind="info"):
@@ -327,6 +333,9 @@ class ZoneApp:
                         spotter_recording=self.recorder.status() if self.recorder else None,
                         ptz_recording=self.ptz_recording_state(), ptz_driver=self.cfg["ptz"]["driver"],
                         branch=self.settings.controller.branch, report=self.settings.report.summary(),
+                        # pan/tilt sign and where it came from (zone/direction.py), + warnings ("não medido"...)
+                        ptz_signs=direction.summary(self.settings) if self.settings.sign_how else None,
+                        sign_warnings=list(self.runtime.sign_warnings),
                         source=getattr(self.source, "description", ""),
                         # which car detector runs; bench=True (COCO) makes the page show a "bench detector" warning
                         detector=getattr(self.spotter, "detector_info", None)))
@@ -414,6 +423,19 @@ class ZoneApp:
 
 
 # =========================================================================================================== web
+
+def plain_json(value):
+    """Copy `value` with every numpy number, bool or array turned into the plain Python equivalent.
+    The page's state is built from numbers numpy computed; the JSON encoder refuses numpy types (2026-11-15 bench:
+    'Object of type bool is not JSON serializable' made every /api/state request fail and froze the page)."""
+    if isinstance(value, dict):
+        return {key: plain_json(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [plain_json(item) for item in value]
+    if hasattr(value, "tolist") and type(value).__module__ == "numpy":
+        return plain_json(value.tolist())       # numpy scalar -> int/float/bool; numpy array -> nested lists
+    return value
+
 def create_web(zapp: ZoneApp):
     from fastapi import Body, FastAPI, HTTPException
     from fastapi.responses import FileResponse, JSONResponse, Response
@@ -441,7 +463,7 @@ def create_web(zapp: ZoneApp):
 
     @web.get("/api/state")
     def state():
-        return JSONResponse(zapp.state())
+        return JSONResponse(plain_json(zapp.state()))
 
     @web.get("/frame.jpg")
     def frame():

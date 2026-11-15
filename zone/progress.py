@@ -21,7 +21,7 @@ import math
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 
@@ -186,6 +186,8 @@ class ProgressSettings:
     profile_min_updates: int = 5
     ratio_clip: tuple = (0.4, 2.5)      # a car's speed relative to the typical profile, when predicting ahead
     max_prediction_s: float = 3.0       # never predict further than this past the last update
+    ground_window_s: float = 1.0        # image speed of the ground point (px/s) is measured over this window: the
+                                        # director's lock rule uses it (an entry seen head-on, where s grows slowly)
 
 
 @dataclass
@@ -202,6 +204,8 @@ class TrackProgress:
     ground: tuple = ()
     samples: list = field(default_factory=list)   # (t, s_raw, s_filtered, v_filtered) at each update
     ratio: float = 1.0                  # v / v_typ(s) at the last update (car-specific speed factor)
+    ground_hist: deque = field(default_factory=lambda: deque(maxlen=200))   # (t, x, y) of every detection's
+                                                                            # ground point, for ground_px_s
 
     def s_raw_last(self):
         return self.samples[-1][1] if self.samples else self.filt.s
@@ -222,11 +226,19 @@ class TrackView:
     predicted: bool           # True when s/v are a prediction (no fresh detection)
     box: tuple
     ground: tuple
+    # How fast the ground point (bottom centre of the box) moves in the IMAGE, pixels per second, over the last
+    # `ground_window_s` (straight-line distance first -> last detection in the window). None = not enough recent
+    # detections to tell. Unlike v it doesn't shrink where the path runs toward the camera (few pixels of path
+    # for many metres), so it tells "really stopped" from "moving head-on".
+    ground_px_s: Optional[float] = None
+    v_typ: Optional[float] = None      # the learned typical speed at s (None until the speed profile has learned)
 
     def to_log(self):
         return dict(id=self.track_id, s=round(self.s, 4), v=round(self.v, 4), s_std=round(self.s_std, 4),
                     v_std=round(self.v_std, 4), lat=round(self.lateral_px, 1), n=self.n_updates,
-                    age=round(self.since_update_s, 3), off=self.off_corridor_frames, pred=self.predicted)
+                    age=round(self.since_update_s, 3), off=self.off_corridor_frames, pred=self.predicted,
+                    gpx=None if self.ground_px_s is None else round(self.ground_px_s, 1),
+                    vtyp=None if self.v_typ is None else round(self.v_typ, 4))
 
 
 class ProgressTracker:
@@ -273,10 +285,12 @@ class ProgressTracker:
                 v0 = self.profile.v_typ(proj.s) if self.profile.learned else 0.0
                 tp = TrackProgress(tid, SVFilter(t, proj.s, meas_sigma, c.accel_sigma, v0, c.v_sigma0),
                                    first_t=t, last_update_t=t, last_seen_t=t)
+                tp.ground_hist.append((t, gx, gy))
                 tp.samples.append((t, proj.s, proj.s, v0))
                 self.tracks[tid] = tp
             else:
                 tp.last_seen_t = t
+                tp.ground_hist.append((t, gx, gy))
                 if not inside:
                     tp.off_corridor_frames += 1
                     tp.box, tp.ground = tuple(box), (gx, gy)
@@ -332,8 +346,21 @@ class ProgressTracker:
             s += v * h
         return s, v, vs, vv
 
+    def ground_speed(self, tp: TrackProgress, t):
+        """Image speed of the ground point (px/s) over the last ground_window_s, or None: fewer than two detections
+        in the window, spanning less than half of it, or the newest one older than half the window."""
+        w = self.cfg.ground_window_s
+        recent = [h for h in tp.ground_hist if h[0] >= t - w - 1e-9]
+        if len(recent) < 2 or t - recent[-1][0] > w / 2:
+            return None
+        dt = recent[-1][0] - recent[0][0]
+        if dt < w / 2 - 1e-9:
+            return None
+        return math.hypot(recent[-1][1] - recent[0][1], recent[-1][2] - recent[0][2]) / dt
+
     def view(self, tp: TrackProgress, t) -> TrackView:
         s, v, vs, vv = self.predict_s_v(tp, t)
         age = max(0.0, t - tp.last_update_t)
         return TrackView(tp.track_id, s, v, math.sqrt(max(vs, 0)), math.sqrt(max(vv, 0)), tp.lateral_px,
-                         tp.n_updates, age, tp.off_corridor_frames, age > 1e-9, tp.box, tp.ground)
+                         tp.n_updates, age, tp.off_corridor_frames, bool(age > 1e-9), tp.box, tp.ground,
+                         self.ground_speed(tp, t), self.profile.v_typ(s) if self.profile.learned else None)

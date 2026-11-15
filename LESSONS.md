@@ -2012,3 +2012,41 @@ and that page talks to the camera all the time. Rerun with every tab closed (`vi
   and runs a file source with PATH emptied. The ordinary test runs had ffmpeg on PATH, which is why nothing caught it.
 * The self-test now requires processed frames (rt `processing.frames > 0`, zone `frame.size`), not just a page, and
   prints the last 40 lines of a failed role's own log, one per line.
+
+## Session 3: "the PTZ turns the wrong way" on the bench (zone-direction-fixes, 2026-11-15)
+
+João's bench (real SMTAV over VISCA/IP, spotter webcam, a printed buggy moved by hand): "when it detects at the start,
+the camera starts moving in a completely wrong direction" and "I can get it to lock on, but I can't make it keep the
+tracking". No logs yet; this is what an audit of the real path found, with a new end-to-end test (`ViscaPtz` over UDP
+against the fake camera, taught through the page API, `zone/tests/test_direction_e2e.py`).
+
+* **The pan/tilt sign was assumed, not known.** The controller turns "the pose must grow" into "turn right" with
+  `pan_sign`. It came only from the bench report, and was +1 whenever the bench couldn't measure it: no report at all,
+  or a report without a speed table (e.g. the one made with the camera's web page open: inquiry "never"). On a camera
+  whose reported pan shrinks when it turns right the PTZ then turns away from the car from the first command. Branch B
+  never notices (its dead reckoning uses the same wrong sign: it believes it is on target; the e2e test showed 186
+  degrees of error and a release reason `exit` that looks like success). Branch A: the feedback pushes further the
+  wrong way until the divergence guard drops the car (`diverged`), which matches both symptoms. Everything else on
+  the path checked out: the VISCA direction bytes (01 left / 02 right, 01 up / 02 down) match the driver's signs and
+  the fake camera, the inquiry decoding is proper two's complement, the first command after lock is ~0 by design
+  (ease-in slope is 0 at s_lock) and then grows the right way, Branch B starts from the entry keyframe's pose after
+  the recall settles (not from 0), and in Branch A `pan_now` (inquiry) and the keyframes (inquiry) are in the same
+  frame. **Not known yet:** which way the SMTAV counts. Fix: `zone/direction.py` (config > measured while teaching
+  from the jogs > bench report > +1 flagged "não medido"), a Branch A live check (`wrong_direction`), page/log display.
+* **Commanded pose source can't measure the sign** (no inquiry): the page warns in red and the fix is
+  `ptz.pan_sign = -1`. Keyframes taught by dead reckoning don't depend on the sign at all.
+* **Hand-moved picture vs drop rules** (synthetic check, `test_stopped_rule.py`): the race rules drop it first for
+  `off_corridor` (0.3 s with the bottom edge off the line), then `lost` (1.5 s without detection), then `stopped`
+  (a pause > 3 s). New profile `bench_hand`. The last drop reason is now in the page header.
+* **Stopped rule (owner's concern for the race):** `s` is image arc length, so on a stretch seen head-on a car at
+  racing speed gains little s and `|v| < 0.02` for 3 s dropped it. Now stopped = slow (below 0.15 x the learned v_typ
+  at that s, or 0.02 before learning) AND its ground point moved < 8 px/s over the stopped time (measured from where
+  it got slow, not frame to frame: per-frame detection jitter of several px would otherwise reset the timer). Lock
+  also accepts a forward car moving >= 15 px/s in the image.
+* **Open risks seen in the audit, not changed:** (1) after a preset recall the zone waits a fixed `settle_s` (report
+  or 1.5 s); a slow preset speed set on the camera's web page, or a long move back from the exit, can still be under
+  way when the next car is locked. Branch B then assumes the entry pose, and the first velocity command cancels the
+  recall half way (the camera then moves "away" from the car at the entry). Measure the recall time exit -> entry on
+  the bench and set `director.settle_s` above it. (2) A camera that reports pan in an unsigned frame crossing
+  0x7FFF/0x8000 would make keyframes jump by 65536 after the signed decoding; the SMTAV's values (~0x01A5, 1070) look
+  signed around home, so not a concern unless keyframes show huge values.

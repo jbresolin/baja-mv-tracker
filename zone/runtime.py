@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional
 
+from zone import direction
 from zone import director as D
 from zone.config import Settings
 from zone.controller import CycleCommand, Controller
@@ -108,6 +109,7 @@ class ZoneRuntime:
         self.curve: Optional[PoseCurve] = None
         self.progress: Optional[ProgressTracker] = None
         self.last: Optional[CycleResult] = None
+        self.sign_warnings = []                  # e.g. "pan sign not measured" (zone/direction.py), for the page
         self.frame_size = None
         self.cycles = 0
         self.fps = 0.0
@@ -120,6 +122,7 @@ class ZoneRuntime:
         speed profile is kept (after a big edit of the path, delete zone.speed.json and re-learn it in PASSIVE)."""
         with self.vision_lock, self.lock:
             self.zone = zone
+            self._apply_signs(zone)
             path = PathModel.build(zone)
             self.path = path
             if path is None:
@@ -145,6 +148,23 @@ class ZoneRuntime:
                 size = zone.image_size or self.frame_size
                 margin = float(self.settings.cfg["spotter"].get("roi_margin_px", 40))
                 self.spotter.set_roi(path.corridor_bbox(margin, size))
+
+    def _apply_signs(self, zone: Zone):
+        """Use the pan/tilt sign measured while teaching this zone (zone/direction.py), and say so when the sign the
+        keyframes depend on was never measured. Warnings are repeated only when they change."""
+        if getattr(self.settings, "sign_how", None) is None:
+            return
+        warnings = direction.apply_zone(self.settings, zone)
+        info = direction.summary(self.settings)
+        if (info, warnings) != getattr(self, "_signs_said", None):
+            self._signs_said = (info, warnings)
+            self._event(dict(type="ptz_signs", pan=info["pan"]["sign"], pan_how=info["pan"]["how"],
+                             tilt=info["tilt"]["sign"], tilt_how=info["tilt"]["how"],
+                             msg="pan %+d (%s), tilt %+d (%s)" % (info["pan"]["sign"], info["pan"]["how"],
+                                                                  info["tilt"]["sign"], info["tilt"]["how"])))
+            for w in warnings:
+                self._event(dict(type="warning", msg=w))
+        self.sign_warnings = warnings
 
     def entry_pose(self):
         k = self.zone.keyframes()[0]
@@ -276,7 +296,20 @@ class ZoneRuntime:
             if decision.action == D.FOLLOW and decision.track is not None:
                 tr = decision.track
                 command = self.controller.follow(tr.s, tr.v, frame.t)
-                if command.diverged:
+                if command.wrong_direction:
+                    # Branch A saw the camera turn against the pan/tilt sign we use (zone/direction.py): every
+                    # correction would push it further from the car. Give the car up and say what to fix.
+                    w = command.wrong_direction
+                    self._event(dict(type="direction_mismatch", track_id=tr.track_id, s=round(tr.s, 3),
+                                     axis=w["axis"], sign=w["sign"], observed=w["observed"],
+                                     msg="a PTZ gira ao contrário: %s_sign está %+d mas a câmera se comporta como %+d "
+                                         "(ponha ptz.%s_sign = %d no site.toml, ou ensine com jog)" % (
+                                             w["axis"], w["sign"], w["observed"], w["axis"], w["observed"])))
+                    decision = self.director.drop(now, "wrong_direction", tr) or decision
+                    if decision.action == D.RECALL_ENTRY and self.zone.entry_preset is not None:
+                        self.controller.recall(self.zone.entry_preset, self.entry_pose(),
+                                               self.settings.director.settle_s)
+                elif command.diverged:
                     # the divergence guard: the camera has been too far from the target for too long: give the car
                     # up and go back to the entry for the next one (logged, and shown on the page as a drop)
                     self._event(dict(type="divergence", track_id=tr.track_id, s=round(tr.s, 3),

@@ -8,10 +8,12 @@ The control branch (A or B) is chosen here, from config, never by editing code:
 import ast
 import copy
 import json
+import os
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
+from zone import direction
 from zone.controller import ControllerSettings
 from zone.director import DirectorSettings
 from zone.progress import ProgressSettings
@@ -87,9 +89,28 @@ class Report:
         return dict(path=self.path, branch=self.branch, reason=self.reason)
 
 
-def load_report(path) -> Report:
+def newest_report(data_root=None):
+    """The newest `report.json` under <data folder>/reports (the installed launcher's characterization runs), or
+    None. The data folder comes from BAJAMV_DATA, which the launcher sets for the roles it starts."""
+    root = data_root or os.environ.get("BAJAMV_DATA")
+    if not root:
+        return None
+    reports = sorted(Path(root, "reports").glob("*/report.json"), key=lambda f: f.stat().st_mtime)
+    return reports[-1] if reports else None
+
+
+def load_report(path, data_root=None) -> Report:
     if not path:
-        return Report(PtzModel(), "B", "no characterization report: Branch B with default speed tables", "", {})
+        # 2026-11-15 bench: the zone ran on the simulator's default speed tables because no report was set, though a
+        # fresh characterization report sat in the data folder. Default tables are in other units than a real
+        # camera's, so every requested speed mapped to the top step and the PTZ ran to its end stops.
+        found = newest_report(data_root)
+        if found is not None:
+            report = load_report(str(found))
+            report.reason = "newest report in the data folder (ptz.report not set): " + report.reason
+            return report
+        return Report(PtzModel(), "B", "no characterization report: Branch B with DEFAULT speed tables "
+                      "(not this camera's: run the characterization and set ptz.report)", "", {})
     p = resolve_path(path)
     raw = json.loads(p.read_text(encoding="utf-8"))
     verdict = raw.get("verdict") or {}
@@ -115,6 +136,11 @@ class Settings:
     pan_map: AxisSpeedMap
     tilt_map: AxisSpeedMap
     pose_source: str
+    # pan/tilt sign (zone/direction.py): from the config and the report (sign_base, sign_base_how), then the zone's
+    # own measurement on top (apply_zone writes controller.pan_sign / tilt_sign and sign_how)
+    sign_base: dict = None
+    sign_base_how: dict = None
+    sign_how: dict = None
 
 
 def build(cfg, report: Report = None) -> Settings:
@@ -126,6 +152,8 @@ def build(cfg, report: Report = None) -> Settings:
     if branch == "A" and m.inquiry_mode != "always":
         # a forced Branch A on a camera that can't answer while moving would feed back stale positions
         branch = "B"
+    # which way the reported pan / tilt count (zone/direction.py): config, else the report's measurement, else +1
+    signs, signs_how = direction.resolve(cfg.get("ptz", {}), report)
     latency = _auto(c["latency_s"], None)
     if latency is None:
         latency = (m.command_latency_s + m.ramp_s / 2.0) if report.path else 0.25
@@ -147,7 +175,7 @@ def build(cfg, report: Report = None) -> Settings:
         model_latency_s=float(m.command_latency_s),
         model_stop_latency_s=float(getattr(m, "stop_latency_s", m.command_latency_s)),
         model_ramp_s=float(m.ramp_s),
-        pan_sign=int(getattr(m, "pan_sign", 1) or 1), tilt_sign=int(getattr(m, "tilt_sign", 1) or 1),
+        pan_sign=signs["pan"], tilt_sign=signs["tilt"],
         divergence_pan_units=float(c.get("divergence_deg", 0.0)) * units_per_degree(m, "pan"),
         divergence_tilt_units=float(c.get("divergence_deg", 0.0)) * units_per_degree(m, "tilt"),
         divergence_cycles=int(c.get("divergence_cycles", 5)))
@@ -161,6 +189,8 @@ def build(cfg, report: Report = None) -> Settings:
         min_updates=int(d["min_updates"]),
         lost_timeout_s=float(d["lost_timeout_s"]), stopped_v=float(d["stopped_v"]),
         stopped_timeout_s=float(d["stopped_timeout_s"]), off_corridor_frames=int(d["off_corridor_frames"]),
+        stopped_ratio=float(d.get("stopped_ratio", 0.15)), stopped_px_s=float(d.get("stopped_px_s", 8.0)),
+        lock_px_s=float(d.get("lock_px_s", 15.0)),
         s_exit=float(d["s_exit"]), settle_s=float(settle))
 
     p = cfg["progress"]
@@ -169,7 +199,8 @@ def build(cfg, report: Report = None) -> Settings:
         window_back_px=float(p["window_back_px"]), window_ahead_px=float(p["window_ahead_px"]),
         window_sigmas=float(p.get("window_sigmas", 3.0)),
         corridor_factor=float(p["corridor_factor"]), finish_after_s=float(p["finish_after_s"]),
-        profile_min_span=float(p["profile_min_span"]), max_prediction_s=float(p["max_prediction_s"]))
+        profile_min_span=float(p["profile_min_span"]), max_prediction_s=float(p["max_prediction_s"]),
+        ground_window_s=float(p.get("ground_window_s", 1.0)))
 
     s = cfg["speedmap"]
     pan_min = _auto(s["pan_min_smooth_step"], getattr(m, "pan_min_smooth_step", 1) or 1)
@@ -184,7 +215,8 @@ def build(cfg, report: Report = None) -> Settings:
         # the ease-in starts moving the camera at s = -ease_in: a car locked later would find it already gone
         director.s_lock = -ease
     return Settings(cfg, report, ctrl, director, progress, pan_map, tilt_map,
-                    pose_source_for(cfg["teach"]["pose_source"], report))
+                    pose_source_for(cfg["teach"]["pose_source"], report), dict(signs), dict(signs_how),
+                    dict(signs_how))
 
 
 def units_per_degree(model, axis):

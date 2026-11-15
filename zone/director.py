@@ -14,7 +14,11 @@ Modes (chosen on the page):
       Other cars are ignored (overtakes too, for this test).
       The car is let go when it reaches s >= s_exit (normally 1), or dropped when:
         * lost: no detection for longer than `lost_timeout_s` (meanwhile it's predicted ahead on the speed profile),
-        * stopped: |v| below `stopped_v` for longer than `stopped_timeout_s`,
+        * stopped: for longer than `stopped_timeout_s`, BOTH slow along the path (|v| below `stopped_ratio` x the
+          learned typical speed at its s, or below `stopped_v` before the profile has learned) AND still in the
+          image (its ground point moved less than `stopped_px_s` pixels per second over that time). `s` is arc length in the image, so where the
+          path runs toward the camera a car at racing speed advances very little s per second: the speed alone
+          would call it stopped. The pixel test is what says it really is,
         * off the line: outside the corridor for more than `off_corridor_frames` frames in a row,
         * gone: the track no longer exists at all,
         * diverged: the camera stayed too far from the target for too many cycles (the controller's divergence
@@ -48,8 +52,12 @@ class DirectorSettings:
     v_min: float = 0.05             # s per second; a car crossing the zone in 20 s has 0.05
     min_updates: int = 3
     lost_timeout_s: float = 1.5
-    stopped_v: float = 0.02
+    stopped_v: float = 0.02         # "slow" before the speed profile has learned anything (s per second)
     stopped_timeout_s: float = 3.0
+    stopped_ratio: float = 0.15     # once learned: "slow" = below this fraction of the typical speed at that s
+    stopped_px_s: float = 8.0       # ... and a car whose ground point moves this fast in the image is never stopped
+    lock_px_s: float = 15.0         # lock also a car slower than v_min (in s) that goes forward and whose ground
+                                    # point moves at least this fast in the image (an entry seen head-on); 0 = off
     off_corridor_frames: int = 3
     s_exit: float = 1.0
     settle_s: float = 1.5           # wait after recalling the entry preset (seeded from the report)
@@ -72,7 +80,9 @@ class Director:
         self.lock_t = None
         self.return_until = 0.0
         self.stopped_since = None
+        self.stopped_anchor = None            # the ground point (x, y) when the car got slow (the stopped rule)
         self.last_drop_reason = ""
+        self.last_drop = None                 # {"reason", "s", "held_s", "t"} of the last release (for the page)
         self.passes_followed = 0
         self._pending: Optional[str] = None   # an action requested by set_mode, delivered on the next step
 
@@ -102,7 +112,8 @@ class Director:
 
     def state(self):
         return dict(mode=self.mode, sub=self.sub if self.mode == AUTO else None, locked_id=self.locked_id,
-                    last_drop_reason=self.last_drop_reason, passes_followed=self.passes_followed)
+                    last_drop_reason=self.last_drop_reason, last_drop=self.last_drop,
+                    passes_followed=self.passes_followed)
 
     # ------------------------------------------------------------------------------------------- one cycle
     def step(self, t, tracks: Dict[int, TrackView]) -> Decision:
@@ -143,11 +154,28 @@ class Director:
     def _candidate(self, tracks):
         c = self.cfg
         ok = [tr for tr in tracks.values()
-              if c.s_lock <= tr.s <= c.s_lock + c.lock_window and tr.s < c.s_exit and tr.v >= c.v_min
+              if c.s_lock <= tr.s <= c.s_lock + c.lock_window and tr.s < c.s_exit and self._moving_forward(tr)
               and tr.n_updates >= c.min_updates and not tr.predicted and tr.off_corridor_frames == 0]
         if not ok:
             return None
         return max(ok, key=lambda tr: tr.s)   # two at once: the one further along reached s_lock first
+
+    def _moving_forward(self, tr):
+        """Lock rule's "moving forward": v >= v_min, or (an entry seen head-on, where v in s is small) going forward
+        at all while its ground point visibly moves in the image. Prefer an entry that is NOT head-on: the speed
+        measured on the approach is what the camera's feed-forward starts from."""
+        c = self.cfg
+        if tr.v >= c.v_min:
+            return True
+        px = getattr(tr, "ground_px_s", None)
+        return c.lock_px_s > 0 and tr.v > 0 and px is not None and px >= c.lock_px_s
+
+    def is_slow(self, tr):
+        """Slow along the path: below stopped_ratio x the learned typical speed at its s, or below stopped_v before the
+        speed profile has learned anything."""
+        c = self.cfg
+        v_typ = getattr(tr, "v_typ", None)
+        return abs(tr.v) < (c.stopped_ratio * v_typ if v_typ else c.stopped_v)
 
     def _drop_reason(self, t, tr: Optional[TrackView]):
         c = self.cfg
@@ -159,17 +187,26 @@ class Director:
             return "lost"
         if tr.off_corridor_frames > c.off_corridor_frames:
             return "off_corridor"
-        if abs(tr.v) < c.stopped_v:
+        if self.is_slow(tr):
             if self.stopped_since is None:
-                self.stopped_since = t
+                self.stopped_since, self.stopped_anchor = t, tr.ground
             elif t - self.stopped_since > c.stopped_timeout_s:
-                return "stopped"
+                # Slow for the whole timeout. Did its ground point stay put in the image over that time? Measured from
+                # where it was when it got slow to where it is now (not frame to frame: a detection's few pixels of
+                # jitter must not count as motion). A car that crossed pixels on a head-on stretch is moving: the
+                # check starts over from here.
+                moved = _distance(tr.ground, self.stopped_anchor) / (t - self.stopped_since)
+                if moved < c.stopped_px_s:
+                    return "stopped"
+                self.stopped_since, self.stopped_anchor = t, tr.ground
         else:
             self.stopped_since = None
         return ""
 
     def _release(self, t, reason, tr):
         self.last_drop_reason = reason
+        self.last_drop = dict(reason=reason, s=None if tr is None else round(tr.s, 3),
+                              held_s=round(t - (self.lock_t or t), 2), t=round(t, 3))
         if reason == "exit":
             self.passes_followed += 1
         self._event(t, "release", track_id=self.locked_id, reason=reason,
@@ -191,3 +228,10 @@ class Director:
     def _event(self, t, kind, **kw):
         self.on_event(dict(type="director", event=kind, t=round(t, 3), mode=self.mode,
                            sub=self.sub if self.mode == AUTO else None, **kw))
+
+
+def _distance(a, b):
+    """Pixels between two (x, y) ground points; 0 when either is unknown (no detection yet)."""
+    if not a or not b:
+        return 0.0
+    return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
