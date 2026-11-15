@@ -1,8 +1,9 @@
 # zone/: spotter-driven PTZ tracking (AUTOPTZ-10)
 
 This package holds WP-Z1 (AUTOPTZ-15): the PTZ driver, a simulated PTZ and the bench script that characterizes a
-real camera (Python standard library only), and WP-Z2 (AUTOPTZ-16, -17, -18): the zone tracker, click-teach and
-controller (numpy, OpenCV, ONNX Runtime and FastAPI; see "WP-Z2" below).
+real camera (Python standard library only), WP-Z2 (AUTOPTZ-16, -17, -18): the zone tracker, click-teach and
+controller (numpy, OpenCV, ONNX Runtime and FastAPI; see "WP-Z2" below), and WP-Z3 (AUTOPTZ-24): the studio's agent
+API on the zone laptop (see "Agent API" at the end).
 
 ## WP-Z1: PTZ driver, simulator and bench
 
@@ -114,8 +115,10 @@ spotter frame -> car detector on the corridor ROI (rt/) -> ByteTrack (rt/) -> s,
 Python 3.11+, ffmpeg/ffprobe on PATH, the deployed models in `deploy/models/` (see `rt/README.md`). Then:
 
 ```
-pip install onnxruntime numpy opencv-python psutil fastapi uvicorn
+pip install onnxruntime numpy opencv-python psutil fastapi uvicorn websockets
 ```
+
+(`websockets` is what lets uvicorn serve the studio's state WebSocket, `/agent/ws`; without it the studio can't link.)
 
 Copy `zone/configs/zone.example.toml` to `zone/configs/site.toml` and keep only the keys you change (camera index,
 PTZ IP, report path, recording). `zone\run_zone.bat` picks `site.toml` up by itself.
@@ -255,3 +258,123 @@ and `tracks.json` (re-run the control part alone with other settings).
 * `ptz_<start>.mkv` + `.json` (the PTZ's own H.264, copied).
 
 Tests: no camera, no real time (fake clock, `SimulatedPtz`, synthetic cars in `zone/testing.py`).
+
+## Agent API: the studio drives the zone's PTZ (WP-Z3, AUTOPTZ-24)
+
+The zone process (`python -m zone.app`) also serves the studio's **agent API**, contract 1.0 (baja-studio
+`docs/agent-api.md`), on its own port, **8890**, next to the page on 8090. It shares the zone's one PTZ driver and
+director: there is no second VISCA client on the laptop. In the studio (baja-studio on the streaming PC) the PTZ is
+then an **agent-owned camera**: the operators move it, recall presets and switch Manual / Auto / Hold from the
+studio's Cameras page; their moves pause the zone's tracking, which resumes by itself.
+
+| module | what |
+|---|---|
+| `agent/contract.py` | the contract's constants, error codes and request bodies |
+| `agent/modes.py` | the contract's modes on top of the director's (pure rules, fake clock tests) |
+| `agent/link.py` | what the mode rules need from the zone app (switch the director, "can AUTO run?") |
+| `agent/presets.py` | keyframe presets + the studio's presets, `zone.agent.json` (presets, last mode) |
+| `agent/camera.py` | the PTZ for the studio: velocities -> speed steps, presets, position, state |
+| `agent/service.py`, `agent/server.py` | command log, events, state pushes; the HTTP / WebSocket routes |
+| `tools/agent_rig.py` | an all-simulated zone node (recording, zone, report, fake VISCA PTZ) |
+| `tools/studio_e2e.py` | the end-to-end check with a running studio |
+
+### Config (`[agent]` in `zone.example.toml`)
+
+* `enabled = true`, `host = "0.0.0.0"`, `port = 8890` (the studio's subnet scan looks on 8890).
+* `token`: the shared `X-Agent-Token` (empty = no token). Put the same value in the studio's Agents page.
+  `GET /agent/info` never needs it (the scan knows no token).
+* `agent_id` (default: the hostname), `camera_id = "cam1"` (the studio's "remote camera id"), `camera_label`.
+* `resume_after_ms = 3000`: AUTO comes back this long after the studio's last move / stop / recall *ends* (a
+  joystick held 10 s pauses 10 s + this). The studio's mode profile can change it.
+* `frames_max_age_s = 3.0`: AUTO needs a spotter frame at most this old.
+* `state_file`: default `zone.agent.json` next to `zone.json`: the presets the studio stored and the last mode.
+
+### Adding it in the studio
+
+1. Agents page: Scan (the laptop's subnet) or add it by address: host = the laptop's IP, port 8890, the token.
+   The link must show **ok**.
+2. Camera configuration: a camera with owner **agent**, driver **agent**, agent = that agent's id, remote camera id
+   `cam1`, and a **direct fallback**: driver `visca_ip`, the PTZ's own IP and port 52381. If the agent is offline for
+   the studio's `direct_fallback_after_s` (default 10 s), the studio drives the PTZ directly; when the laptop is back
+   it stops, hands the camera back and calls `/resync`.
+3. Set the fallback's top speed steps (pan / tilt) in the studio's camera limits to the bench report's (`report.json`,
+   the largest step in `model.pan_speed_table` / `tilt_speed_table`), so a stick feels the same in both routes.
+
+### Modes (contract §7; the director's own modes are unchanged)
+
+| studio (contract) | zone director | who drives the PTZ |
+|---|---|---|
+| manual | PASSIVE if spotter frames arrive, else STOPPED | the studio; the zone sends nothing |
+| auto | AUTO | the zone's tracker |
+| auto_paused | PASSIVE (estimating, not driving) | the studio; AUTO again `resume_after_ms` after its last motion, from a clean state (back to the entry preset, next car) |
+| hold | PASSIVE / STOPPED like manual | the studio; nothing on the zone side brings AUTO back |
+
+* `PUT /mode {auto}` answers `409 tracker_not_ready` with the reason: no zone taught (fewer than 2 keyframes), no
+  spotter frames (none yet, or none for 3 s), or the PTZ not answering.
+* **The laptop page stays in charge** for the person next to it: PARADO / PASSIVO make the studio's mode `manual`,
+  AUTO makes it `auto` (the studio gets a `mode_changed`), and PARAR is also a stop (it ends AUTO or a pause). In
+  **hold** the page's AUTO is refused (the contract: only the studio brings AUTO back); PARADO / PASSIVO keep hold.
+  The page's header shows the studio's mode and who paused or holds the camera (its `X-Studio-Id`).
+* **After a restart** the director is in STOPPED (WP-Z2's rule), so a camera that was in auto comes back in `manual`,
+  and every studio that connects is told: `mode_changed {from auto, to manual, reason tracker_not_ready}` (contract
+  §9), until a studio sets a mode. `hold` and `manual` survive a restart.
+* Tracker state for the studio's badges: `idle` outside the auto modes, `searching` (waiting at the entry, paused,
+  or going back after a car left the zone), `tracking` (target `track-<ByteTrack id>`, not the car's number), `lost`
+  (the car was dropped and the camera goes back to the entry). Events `tracker_acquired` / `tracker_lost` on lock and
+  release. No "car N" events (the contract has none).
+
+### Motion, presets, position
+
+* `/move`: -1..1 becomes a signed speed step (1.0 = the top step of the bench report's speed table, or the driver's
+  limit without a report; the studio's own VISCA rounding). Every move goes out with the driver's TTL = `ttl_ms`:
+  if the studio's link drops while a joystick is held, the PTZ stops within the TTL. `/stop` is never refused
+  because of the mode.
+* Presets: the zone's **keyframe presets** (10, 11, ... from the teach) are listed with their keyframe's name
+  ("Zone entry (keyframe 1)"). The studio may recall them, but storing over (or renaming) one is refused
+  (`400 bad_request`, with the free numbers), so the studio can never break the teach. The studio's own presets
+  (0-127, outside the keyframes) are stored on the camera and remembered in `zone.agent.json`.
+* Position: degrees from home and zoom 0..1, only with a bench report that measured units per degree and Branch A
+  (inquiry while moving). Otherwise `null` and `has_position_feedback: false`.
+* Not in this package: image controls (`image_controls: []`, `GET /image` is `{}`), crop (`400 not_supported`).
+* The PTZ counts as offline after 3 failed exchanges in a row (health probe, the agent's position poll, studio
+  commands); commands then answer `503 device_offline`. One answer brings it back.
+
+### Conformance (the acceptance test) and end to end, without hardware
+
+An all-simulated zone node: a synthetic spotter recording (the "blobs" detector), a taught zone, a Branch A report
+and the fake VISCA PTZ (`--driver visca`, the real `ViscaPtz` driver over UDP) or the simulator in-process
+(`--driver sim`). Needs ffmpeg. From the repo root:
+
+```
+python -m zone.tools.agent_rig prepare --dir out/agent_rig --driver visca --token T
+python -m zone.tools.agent_rig camera --dir out/agent_rig          # terminal 1: the fake PTZ on 127.0.0.1:52399
+python -m zone.app --config out/agent_rig/site.toml                 # terminal 2: the zone node, agent on 8890
+```
+
+Then, from baja-studio's `server` folder (its venv):
+
+```
+pytest tests/agent_contract --agent-url http://127.0.0.1:8890 --agent-token T
+```
+
+Expected: all pass, 9 skipped: 5 crop-camera checks (the zone has no crop camera) and 4 that need the fake agent's
+failure switches (offline device, tracker not ready, two restarts; the zone's tests cover those). The mode tests run
+(the rig's tracker is ready). `--driver sim` runs the same with the simulator inside the zone process. Against the
+real laptop: `--agent-url http://<laptop>:8890` while the zone runs with its taught zone and the spotter on (the PTZ
+moves a little; a preset is stored at the highest free number, 127).
+
+**Known flake (the suite, not the agent):** `test_manual_and_hold_never_resume_auto_by_themselves` reads every state
+message that arrives after its commands, including one the agent pushed a few milliseconds *before* its next
+`PUT /mode` reached it. If a push (every 0.25 s) falls in that gap, it fails with `'manual' == 'hold'`. About 2-4% of
+single runs; runs started back to back can lock onto the same phase and fail several times in a row. Run it again.
+
+End to end with the studio (a scratch studio started by the script, then the checks: link ok, camera listed, a move
+moves the PTZ, Auto, pause and resume, zone killed -> VISCA fallback, zone back -> hand back):
+
+```
+python -m zone.tools.studio_e2e --studio-python <baja-studio>/server/.venv/bin/python \
+    --studio-server <baja-studio>/server --studio-data <scratch folder>
+python -m zone.tools.studio_e2e --studio-url http://127.0.0.1:8899     # or a studio already running (scratch data!)
+```
+
+It needs `websockets` and the ports 8890, 8090, 52399 (and 8899) free on 127.0.0.1.

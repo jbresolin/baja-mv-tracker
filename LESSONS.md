@@ -1842,3 +1842,39 @@ probe.
   Suggest, Apply / Turn off) saves to `<config>.beam.toml` and restarts only the BeamService. Setup mode pauses the
   driver (one COM port owner) and ends by itself after 300 s without a page refresh. Checked here with a headless
   Chrome against fake serial ports; not yet with the real CP2102.
+
+## Session 3: the studio's agent API on the zone laptop (WP-Z3, AUTOPTZ-24, 2026-11-14)
+
+Code: `zone/agent/` (contract 1.0 of baja-studio `docs/agent-api.md`, served by `python -m zone.app` on 8890),
+`zone/tools/agent_rig.py` (all-simulated zone node), `zone/tools/studio_e2e.py` (end-to-end check with a studio).
+Checked against baja-studio 90b81d2: its conformance suite (32 pass, 9 skip) with the in-process simulator and with
+the real `ViscaPtz` against the fake VISCA camera; the end-to-end script with a scratch studio (10/10).
+
+* **The conformance suite's `test_manual_and_hold_never_resume_auto_by_themselves` races with any agent.** It opens
+  the state WebSocket, sends `PUT auto`, `PUT manual|hold`, a move, then asserts on *every* state message it reads
+  for 1.1 s, including one pushed a few ms before its next command reached the agent. Two windows: between its
+  `PUT auto` and `PUT manual` (fixed here: a state push due within 0.1 s of a mode change waits until then), and
+  between the end of one collect and the next `PUT auto` (can't be fixed agent-side). The pushes stay on a fixed
+  0.25 s grid; an earlier version restarted the grid at each mode change, which phase-locked it to the test's own
+  1.1 s collect and made it fail most runs. Residual: ~2-4% of single runs; pytest runs started back to back keep
+  the same phase and can fail several in a row. The fake agent passes because its process is idle (the gap is
+  ~1 ms). Fix belongs in the suite (ignore states whose `ts` is older than the command's answer).
+* **uvicorn serves WebSockets only with a WS library installed** (`websockets` or `wsproto`); without one,
+  `/agent/ws` is a plain 404/400 and the studio never links. The laptop install line now has `websockets`.
+  A second `uvicorn.Server` runs fine in a thread (it only installs signal handlers in the main thread).
+  A token-refused handshake answers HTTP 401 (`send_denial_response`), and uvicorn still logs "ASGI callable
+  returned without completing handshake" for it: noise.
+* **`SimulatedPtz` is not thread-safe**, and in the running app the control loop, the health probe, the page and
+  the agent all call the PTZ. `ptz.driver = "sim"` is now wrapped in `LockedPtz` (`ViscaPtz` has its own lock).
+* **Handing the PTZ to the studio must not send a stop afterwards.** The director's switch out of AUTO queues a stop
+  for its next cycle (~0.1 s later), which would cut the studio's move that triggered the pause. The agent uses
+  `runtime.hand_over()` (director to PASSIVE with no queued action; an immediate stop only when manual / hold ends
+  AUTO).
+* **A VISCA PTZ has no dead-man of its own.** The TTL is in the zone process (`ViscaPtz`'s watchdog thread): a
+  zone app killed mid-move leaves the camera moving until the launcher restarts it (STOPPED sends nothing) or someone
+  stops it, and the studio's direct fallback takes over only after offline (5 s) + `direct_fallback_after_s` (10 s)
+  and sends nothing on take-over. Not changed here; see the PR.
+* **Positions differ between routes unless the units agree.** The agent converts with the bench report's units per
+  degree, pan / tilt sign and zoom range; the studio's direct VISCA driver with fixed 0.075 deg/unit, no sign, zoom
+  / 0x4000. Same for speeds: the agent's top steps come from the report, the fallback's from the studio's camera
+  limits (and its zoom uses steps 2-7, the agent 1-7).
