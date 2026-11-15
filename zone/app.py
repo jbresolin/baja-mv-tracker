@@ -40,8 +40,11 @@ STATIC = Path(__file__).resolve().parent / "static"
 def make_ptz(cfg, settings, clock, log=print):
     p = cfg["ptz"]
     if p["driver"] == "sim":
+        from zone.ptz.locked import LockedPtz
         from zone.ptz.sim import SimulatedPtz
-        return SimulatedPtz(settings.report.model, clock)
+        # the simulator isn't thread-safe, and the control loop, the health check, the page and the agent API all
+        # call it: one call at a time (the real driver has its own lock)
+        return LockedPtz(SimulatedPtz(settings.report.model, clock))
     from zone.ptz.visca import ViscaPtz
     log_path = C.resolve_path(p["command_log"]) if p.get("command_log") else None
     return ViscaPtz(p["host"], int(p["port"]), float(p["timeout_s"]), clock=clock, log_path=log_path)
@@ -75,6 +78,9 @@ class ZoneApp:
         self.control_log = ControlLog(self.out_dir / ("zone_%s.jsonl" % stamp), clock,
                                       cfg["log"]["flush_every"]) if cycle_log else None
         self.events = []                 # last state changes, shown on the page
+        self.event_listeners = []        # callables that also get every event (the agent API: car locked / let go)
+        self.agent = None                # the studio's agent API (zone/agent), when [agent] enabled: attached later
+        self.agent_error = None          # why the agent API is down (port taken, websockets missing...): on the page
         self.runtime = ZoneRuntime(settings, zone, ptz, clock, spotter, profile_path=profile_path_for(zone_path),
                                    log=self.control_log, on_event=self._on_event)
         self.pose_source = make_pose_source(settings.pose_source, ptz, clock, settings)
@@ -114,6 +120,11 @@ class ZoneApp:
         e["wall_iso"] = dt.datetime.fromtimestamp(self.clock.wall()).strftime("%H:%M:%S")
         self.events.append(e)
         del self.events[:-30]
+        for listener in list(self.event_listeners):
+            try:
+                listener(ev)
+            except Exception as err:  # noqa: BLE001 (a listener must never break the control loop)
+                self.print("event listener failed: %s: %s" % (type(err).__name__, err))
 
     # ------------------------------------------------------------------------------------------- frame loop
     def run_loop(self):
@@ -286,6 +297,8 @@ class ZoneApp:
             fr = self.latest[0] if self.latest else None
         return dict(
             runtime=snap, events=self.events[-15:],
+            agent=(self.agent.page_state() if self.agent is not None
+                   else dict(enabled=False, error=self.agent_error)),
             zone=dict(points=[dict(i=i, **p.to_dict()) for i, p in enumerate(z.points)],
                       corridor=z.corridor_half_width_px, entry_preset=z.entry_preset, dirty=self.teach.dirty,
                       file=str(self.zone_path), keyframe_s=path.keyframe_s() if path else None),
@@ -354,20 +367,33 @@ class ZoneApp:
             pass
 
     def set_mode(self, mode):
-        """Mode buttons. Entering AUTO or PARADO ends teach mode (and any held jog)."""
+        """Mode buttons. Entering AUTO or PARADO ends teach mode (and any held jog). With the agent API on, the
+        buttons also set the studio's view of the camera (PARADO / PASSIVO = manual, AUTO = auto; AUTO is refused
+        while the studio holds the camera): see zone/agent/modes.py."""
+        if self.agent is not None:
+            return self.agent.local_mode(mode)   # -> agent's link -> runtime.set_mode + teach_after_mode
         ok, msg = self.runtime.set_mode(mode)
-        if ok and msg in (D.AUTO, D.STOPPED) and self.teach_mode:
-            self.teach_mode = False
-            if msg == D.STOPPED:
-                self._cancel_jog()
+        if ok:
+            self.teach_after_mode(msg)
         return ok, msg
+
+    def teach_after_mode(self, mode):
+        """After a mode change: AUTO and STOPPED end teach mode; STOPPED also cancels a held jog."""
+        mode = str(mode).upper()
+        if mode in (D.AUTO, D.STOPPED) and self.teach_mode:
+            self.teach_mode = False
+            if mode == D.STOPPED:
+                self._cancel_jog()
 
     def big_stop(self):
         """The big red button: teach mode off first (so held-jog repeats are refused from now on), the runtime's
-        immediate stop, then the teach jog's own stop (zoom included)."""
+        immediate stop, then the teach jog's own stop (zoom included). For the studio it is also a stop: its
+        velocity is forgotten and auto (or a pause) ends."""
         self.teach_mode = False
         self.runtime.big_stop()
         self._cancel_jog()
+        if self.agent is not None:
+            self.agent.local_stop()
 
     def save_zone(self):
         size = self.runtime.frame_size or self.teach.zone.image_size
@@ -425,6 +451,19 @@ def create_web(zapp: ZoneApp):
     def big_stop():
         zapp.big_stop()
         return dict(ok=True)
+
+    @web.post("/api/agent/release_hold")
+    def release_hold(body: dict = Body(...)):
+        """"Liberar HOLD": the person at the laptop takes the camera back from a studio that holds it. The page asks
+        for a confirmation first, and sends {"confirm": true}."""
+        if body.get("confirm") is not True:
+            raise HTTPException(400, "confirme para liberar o HOLD do estúdio")
+        if zapp.agent is None:
+            raise HTTPException(409, "a API do estúdio não está ligada")
+        ok, msg = zapp.agent.local_release_hold()
+        if not ok:
+            raise HTTPException(409, msg)
+        return dict(ok=True, mode=msg)
 
     # ---- teach mode (needed to move the PTZ from the page)
     @web.post("/api/teach/mode")
@@ -518,6 +557,75 @@ def create_web(zapp: ZoneApp):
     return web
 
 
+def stop_at_startup(ptz, log=print):
+    """Stop the PTZ when the process starts. A VISCA camera has no dead-man of its own: the TTL lives in this process
+    (ViscaPtz's watchdog thread), so a crash or a kill mid-move leaves the camera moving. The zone restarts in
+    STOPPED, which sends nothing; this stop is what ends that motion. Never fails the start (a camera that doesn't
+    answer yet is the health check's business)."""
+    for stop in (ptz.stop, ptz.zoom_stop):
+        try:
+            stop()
+        except Exception as e:  # noqa: BLE001
+            log("stop at startup failed: %s: %s" % (type(e).__name__, e))
+
+
+# =========================================================================================================== agent
+def agent_server_problem(find_spec=None):
+    """What would keep the agent API from serving the studio, checked at startup: uvicorn (the server) and a
+    WebSocket library for it (`websockets`, or `wsproto`). Without one, uvicorn answers /agent/ws with a plain HTTP
+    error and the studio never links. -> None, or the problem as a sentence for the page and the console."""
+    import importlib.util
+    find_spec = find_spec or importlib.util.find_spec
+    if find_spec("uvicorn") is None:
+        return "uvicorn não instalado (pip install uvicorn websockets)"
+    if find_spec("websockets") is None and find_spec("wsproto") is None:
+        return "websockets não instalado: o estúdio não consegue se conectar (pip install websockets)"
+    return None
+
+
+def agent_down(zapp, why):
+    """The agent API is down: shown on the page ("API DO ESTÚDIO FORA DO AR") and shouted on the console."""
+    zapp.agent_error = why
+    zapp._log("!" * 100 + "\n!!! API DO ESTÚDIO FORA DO AR (agent API down): %s\n" % why + "!" * 100, "error")
+
+
+def start_agent(zapp, cfg):
+    """The studio's agent API (zone/agent) on its own port, in this process: same PTZ driver, same director. Runs in
+    background threads (its server, and its ticker). -> the uvicorn server (to stop it), or None if it can't start;
+    the zone itself keeps running either way, and the page says the studio's API is down."""
+    problem = agent_server_problem()
+    if problem and problem.startswith("uvicorn"):
+        agent_down(zapp, problem)
+        return None
+    import uvicorn
+    from zone.agent.server import create_agent_app
+    from zone.agent.service import ZoneAgent
+    a = cfg["agent"]
+    try:
+        agent = ZoneAgent(zapp, a, log=zapp.print).attach()
+    except Exception as e:  # noqa: BLE001 (the zone must run without the studio)
+        agent_down(zapp, "%s: %s" % (type(e).__name__, e))
+        return None
+    if problem:
+        agent_down(zapp, problem)       # HTTP works, the studio's WebSocket won't: still down for the studio
+    threading.Thread(target=agent.run_ticker, args=(zapp.stop_ev,), daemon=True, name="agent-tick").start()
+    server = uvicorn.Server(uvicorn.Config(create_agent_app(agent), host=a["host"], port=int(a["port"]),
+                                           log_level="warning", ws_ping_interval=None))
+
+    def serve():
+        try:
+            server.run()
+        except BaseException as e:  # noqa: BLE001 (port taken: uvicorn exits its thread with SystemExit)
+            agent_down(zapp, "porta %s: %s: %s (outro programa usa a porta?)" % (a["port"], type(e).__name__, e))
+            return
+        if not zapp.stop_ev.is_set():
+            agent_down(zapp, "o servidor parou (porta %s ocupada?)" % a["port"])
+    threading.Thread(target=serve, daemon=True, name="agent-api").start()
+    zapp._log("agent API (studio): http://<this laptop>:%d/agent/info, agent_id %s, camera %s, token %s" % (
+        int(a["port"]), agent.agent_id, agent.camera_id, "set" if agent.token else "none"))
+    return server
+
+
 # =========================================================================================================== main
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -537,11 +645,13 @@ def main(argv=None):
     else:
         zone = zonefile.Zone(corridor_half_width_px=float(cfg["teach"]["default_corridor_px"]))
     ptz = make_ptz(cfg, settings, clock)
+    stop_at_startup(ptz, print)
     seed_sim_presets(ptz, zone)
     spotter = make_spotter(cfg, rtcfg)
     source = SpotterSource(cfg, rtcfg)
     zapp = ZoneApp(cfg, settings, ptz, clock, zone, zone_path, C.resolve_path(cfg["zone"]["out_dir"]), source,
                    spotter, cycle_log=bool(cfg["log"]["cycle_log"]))
+    agent_server = start_agent(zapp, cfg) if cfg["agent"]["enabled"] else None
     for target in (zapp.run_loop, zapp.watchdog, zapp.health_loop):
         threading.Thread(target=target, daemon=True).start()
 
@@ -549,8 +659,12 @@ def main(argv=None):
     web = create_web(zapp)
     server = uvicorn.Server(uvicorn.Config(web, host=cfg["web"]["host"], port=int(cfg["web"]["port"]),
                                            log_level="warning"))
-    threading.Thread(target=lambda: (zapp.stop_ev.wait(), setattr(server, "should_exit", True)),
-                     daemon=True).start()
+    def stop_servers():
+        zapp.stop_ev.wait()
+        server.should_exit = True
+        if agent_server is not None:
+            agent_server.should_exit = True
+    threading.Thread(target=stop_servers, daemon=True).start()
     print("zone page: http://localhost:%d/" % int(cfg["web"]["port"]), flush=True)
     try:
         server.run()

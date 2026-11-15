@@ -94,6 +94,12 @@ class Director:
         self.mode = mode
         self._event(t, "mode", old=old, new=mode, why=why)
 
+    def discard_pending(self):
+        """Forget the action the last `set_mode` queued for the next step (the stop when leaving AUTO, the recall when
+        entering it). Used when the studio takes the camera over (zone/agent): its own command follows at once, and a
+        stop from the director one cycle later would cut it."""
+        self._pending = None
+
     def state(self):
         return dict(mode=self.mode, sub=self.sub if self.mode == AUTO else None, locked_id=self.locked_id,
                     last_drop_reason=self.last_drop_reason, passes_followed=self.passes_followed)

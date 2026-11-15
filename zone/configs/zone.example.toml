@@ -153,6 +153,23 @@ port = 8090
 jpeg_quality = 70
 frame_max_width = 1280            # the page's live frame is downscaled to this width
 
+[agent]                           # the studio's agent API (baja-studio contract 1.0), served by this process
+enabled = true                    # false = no agent API: the PTZ stays out of the studio's camera list
+host = "0.0.0.0"                  # 0.0.0.0 = reachable from the streaming PC on the LAN
+port = 8890                       # the contract's port (the studio's subnet scan looks there)
+token = ""                        # shared X-Agent-Token; "" = no token (the contract allows it). Same value in the
+                                  # studio's Agents page. GET /agent/info never needs it (the scan knows no token)
+                                  # AT THE EVENT, SET ONE in site.toml: on the event LAN anyone could move the PTZ
+agent_id = ""                     # "" = this computer's hostname
+name = ""                         # "" = "Zone laptop <hostname>"
+camera_id = "cam1"                # the PTZ's id on this agent (the studio's remote_camera_id)
+camera_label = "Zone PTZ"
+resume_after_ms = 3000            # auto comes back this long after the studio's last move / stop / recall ends,
+                                  # unless the studio's mode profile says otherwise
+frames_max_age_s = 3.0            # AUTO needs a spotter frame at most this old ("tracker_not_ready" otherwise)
+position_hz = 2.0                 # Branch A: position inquiries for the studio, while the zone isn't driving
+state_file = ""                   # presets the studio stored + the last mode; "" = zone.agent.json next to zone.file
+
 [log]
 cycle_log = true                  # JSONL per control cycle in out_dir (zone_<start>.jsonl)
 flush_every = 10                  # lines between flushes
