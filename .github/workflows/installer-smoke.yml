@@ -108,6 +108,19 @@ jobs:
           $global:LASTEXITCODE = 0
           Write-Host "uninstalled; data kept"
 
+      - name: Collect the data folder's logs and configs
+        # upload-artifact needs every path under one root folder, and the data folder (C:) is on another drive than
+        # the checkout (D:): copy them into the checkout first
+        if: always()
+        shell: pwsh
+        run: |
+          foreach ($sub in "logs", "config") {
+            if (Test-Path "$env:DATA\$sub") {
+              New-Item -ItemType Directory -Force "data-folder" | Out-Null
+              Copy-Item -Recurse -Force "$env:DATA\$sub" "data-folder\$sub"
+            }
+          }
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -116,6 +129,5 @@ jobs:
             install.log
             upgrade.log
             uninstall.log
-            C:\BajaMVData\logs
-            C:\BajaMVData\config
+            data-folder
           if-no-files-found: ignore
