@@ -73,6 +73,7 @@ class Director:
         self.return_until = 0.0
         self.stopped_since = None
         self.last_drop_reason = ""
+        self.last_drop = None                 # {"reason", "s", "held_s", "t"} of the last release (for the page)
         self.passes_followed = 0
         self._pending: Optional[str] = None   # an action requested by set_mode, delivered on the next step
 
@@ -102,7 +103,8 @@ class Director:
 
     def state(self):
         return dict(mode=self.mode, sub=self.sub if self.mode == AUTO else None, locked_id=self.locked_id,
-                    last_drop_reason=self.last_drop_reason, passes_followed=self.passes_followed)
+                    last_drop_reason=self.last_drop_reason, last_drop=self.last_drop,
+                    passes_followed=self.passes_followed)
 
     # ------------------------------------------------------------------------------------------- one cycle
     def step(self, t, tracks: Dict[int, TrackView]) -> Decision:
@@ -170,6 +172,8 @@ class Director:
 
     def _release(self, t, reason, tr):
         self.last_drop_reason = reason
+        self.last_drop = dict(reason=reason, s=None if tr is None else round(tr.s, 3),
+                              held_s=round(t - (self.lock_t or t), 2), t=round(t, 3))
         if reason == "exit":
             self.passes_followed += 1
         self._event(t, "release", track_id=self.locked_id, reason=reason,

@@ -73,6 +73,10 @@ port = 52381
 timeout_s = 0.2
 report = ""                       # characterization report JSON (python -m zone.tools.characterize); picks the branch
 command_log = ""                  # optional JSONL of every VISCA packet (debugging)
+pan_sign = "auto"                 # +1: the camera's reported pan GROWS when it turns right; -1: it shrinks. "auto" =
+tilt_sign = "auto"                # measured while teaching (jogs, "inquiry" pose source), else the bench report, else
+                                  # +1 (shown as "padrão" on the page). A wrong sign turns the PTZ AWAY from the car
+                                  # (zone/direction.py). Set -1 here if the page says "NÃO MEDIDO" and it turns wrong
 
 [teach]
 preset_base = 10                  # keyframe presets are numbered from here (10, 11, 12, ...)

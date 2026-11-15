@@ -67,12 +67,64 @@ class PoseSource:
 
 
 class InquirySource(PoseSource):
+    """Ask the camera. Also measures the pan/tilt SIGN as a side effect of the operator's jogs (zone/direction.py):
+    the pose is read when a held jog starts (or changes direction) and when it ends. A right jog after which the
+    reported pan went DOWN is one vote for pan_sign = -1. The operator jogs a lot while teaching, so a zone taught
+    this way always knows its signs, even without a bench report."""
     name = "inquiry"
+    MIN_DELTA = 4                        # raw units: a jog that moved the reading less than this is not a vote
 
     def __init__(self, ptz, clock, ttl_s=0.3):
         super().__init__(ptz, clock, ttl_s)
         self.approximate = False
         self.zoom_readable = None        # unknown until the first read; False -> the page asks for the zoom
+        self.sign_votes = {"pan": [], "tilt": []}   # +1 / -1 per finished jog that moved that axis
+        self._segment = None             # (pan direction, tilt direction, pose at the start) of the jog being held
+
+    def jog(self, pan_step, tilt_step, zoom_step):
+        direction = (_sgn(pan_step), _sgn(tilt_step))
+        with self.lock:
+            if self._segment is None or self._segment[:2] != direction:
+                self._close_segment()
+                if any(direction):
+                    self._segment = direction + (self._read_pan_tilt(),)
+        super().jog(pan_step, tilt_step, zoom_step)
+
+    def jog_stop(self):
+        super().jog_stop()
+        with self.lock:
+            self._close_segment()
+
+    def _read_pan_tilt(self):
+        try:
+            return self.ptz.inquire_pan_tilt()
+        except Exception:  # noqa: BLE001 (no reading = no vote, never an error for the operator)
+            return None
+
+    def _close_segment(self):
+        """The held jog ended (or changed direction): compare the reading now with the one at its start."""
+        seg, self._segment = self._segment, None
+        if seg is None or seg[2] is None:
+            return
+        now = self._read_pan_tilt()
+        if now is None:
+            return
+        for i, axis in enumerate(("pan", "tilt")):
+            step_direction = seg[i]
+            delta = now[i] - seg[2][i]
+            if step_direction and abs(delta) >= self.MIN_DELTA:
+                # + step moved the reading up -> +1; down -> -1
+                self.sign_votes[axis].append(step_direction * (1 if delta > 0 else -1))
+
+    def measured_signs(self):
+        """{"pan": -1, "pan_votes": 3, "pan_consistent": True, ...} for the axes with at least one vote."""
+        from zone.direction import vote_sign
+        out = {}
+        for axis, votes in self.sign_votes.items():
+            sign, consistent = vote_sign(votes)
+            if sign is not None:
+                out.update({axis: sign, axis + "_votes": len(votes), axis + "_consistent": consistent})
+        return out
 
     def read(self):
         """-> (pan, tilt, zoom), with zoom None when the camera doesn't answer the zoom inquiry (some don't). The
@@ -218,6 +270,11 @@ class TeachSession:
 
     def _changed(self):
         self.dirty = True
+        # the pan/tilt sign the pose source measured from the jogs (InquirySource): saved with the zone, so the
+        # controller turns the right way (zone/direction.py). An axis not measured this session keeps its old value.
+        measured = getattr(self.source, "measured_signs", lambda: {})()
+        if measured:
+            self.zone.ptz_signs = dict(self.zone.ptz_signs, **measured, how="teach_jog")
         self.on_change(self.zone.copy())
 
     def _check_index(self, i):
@@ -347,6 +404,10 @@ class TeachSession:
             backup = zonefile.save(self.zone, path)
             self.dirty = False
             return backup
+
+
+def _sgn(x):
+    return (x > 0) - (x < 0)
 
 
 def _zoom_value(zoom):

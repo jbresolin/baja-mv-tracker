@@ -95,6 +95,7 @@ class PoseEstimator:
         self.known_after = None                  # a recall is settling: pose becomes known at this time
         self.pending_known = None
         self.inq = None                          # (pan, tilt, t) of the last successful inquiry
+        self.inq_prev = None                     # ... and the one before it (Branch A's direction check)
         self.t_last_poll = -math.inf
         self.inquiry_failures = 0
         # the camera's modelled speed (reported units/s): a command takes effect after the latency, and the speed
@@ -177,7 +178,7 @@ class PoseEstimator:
         self.pending = []
         self.known_after = now + max(0.0, settle_s)
         self.pending_known = (pose.pan, pose.tilt, pose.zoom)
-        self.inq = None
+        self.inq = self.inq_prev = None
 
     def set_known(self, pan, tilt, zoom=None):
         self._integrate(self.clock.monotonic())
@@ -203,7 +204,7 @@ class PoseEstimator:
         if r is None:
             self.inquiry_failures += 1
             return
-        self.inq = (float(r[0]), float(r[1]), now)
+        self.inq_prev, self.inq = self.inq, (float(r[0]), float(r[1]), now)
         self.set_known(r[0], r[1])
 
     def estimate(self) -> PoseNow:
@@ -240,6 +241,8 @@ class CycleCommand:
     gap_pan: Optional[float] = None      # target minus where the camera will be (raw units), for the divergence guard
     gap_tilt: Optional[float] = None
     diverged: bool = False               # the gap was over the limit for more than divergence_cycles cycles
+    wrong_direction: Optional[dict] = None  # Branch A: the camera turns against the sign we believe in (see
+                                            # Controller._check_direction): {"axis", "sign", "observed", "cycles"}
 
     def to_log(self):
         pn = self.pose_now
@@ -256,7 +259,7 @@ class CycleCommand:
                                  source=pn.source, trusted=pn.trusted), ok=self.result_ok,
                     gap=dict(pan=None if self.gap_pan is None else round(self.gap_pan, 1),
                              tilt=None if self.gap_tilt is None else round(self.gap_tilt, 1)),
-                    diverged=self.diverged)
+                    diverged=self.diverged, wrong_direction=self.wrong_direction)
 
 
 class Controller:
@@ -277,6 +280,11 @@ class Controller:
         self.t_follow = None            # time of the last follow() (None = the next one starts a new segment)
         self.want = (0.0, 0.0)          # wanted rates of the last cycle (reported units/s)
         self.diverged_cycles = 0        # consecutive cycles with the camera too far from the target
+        # Branch A direction check: when each axis' commanded direction last changed, and how many inquiries in a
+        # row showed the camera moving the other way
+        self.step_dir_since = {"pan": (0, -math.inf), "tilt": (0, -math.inf)}
+        self.wrong_dir_count = {"pan": 0, "tilt": 0}
+        self.checked_inq = None
 
     def set_curve(self, curve: PoseCurve):
         self.curve = curve
@@ -312,6 +320,7 @@ class Controller:
                 fb_pan = _clip(c.k_pan * gap_pan, c.max_feedback_pan)
                 fb_tilt = _clip(c.k_tilt * gap_tilt, c.max_feedback_tilt)
         diverged = self._check_divergence(gap_pan, gap_tilt)
+        wrong_direction = self._check_direction() if c.branch == "A" else None
         # rates are in the reported frame; the sign turns them into physical directions (+ step = right / up)
         want_pan, want_tilt = ff_pan + fb_pan, ff_tilt + fb_tilt
         # Quantization compensation: the camera only has whole speed steps, and with hysteresis the chosen step can
@@ -341,7 +350,7 @@ class Controller:
         ok = self._send_velocity()
         zoom_sent = self._maybe_zoom(target.zoom, now)
         return CycleCommand(s, v, s_ahead, lookahead, target, ff_pan, ff_tilt, fb_pan, fb_tilt, self.pan_step,
-                            self.tilt_step, zoom_sent, pn, ok, gap_pan, gap_tilt, diverged)
+                            self.tilt_step, zoom_sent, pn, ok, gap_pan, gap_tilt, diverged, wrong_direction)
 
     def _check_divergence(self, gap_pan, gap_tilt):
         """Divergence guard (mostly for Branch B, where nothing else notices). The camera's estimated position (dead
@@ -357,6 +366,44 @@ class Controller:
         self.diverged_cycles = self.diverged_cycles + 1 if over else 0
         return self.diverged_cycles > c.divergence_cycles > 0 or (over and c.divergence_cycles == 0)
 
+    WRONG_DIRECTION_INQUIRIES = 3   # inquiries in a row showing the camera turning the wrong way -> give up
+    WRONG_DIRECTION_MIN_UNITS = 2.0  # a move smaller than this between two inquiries says nothing
+
+    def _check_direction(self):
+        """Branch A only: is the camera really turning the way we command it? Between two inquiries during which one
+        direction has been commanded for longer than the camera needs to obey (latency + ramp), the reported value
+        must move by `sign * direction`. If it moves the other way for WRONG_DIRECTION_INQUIRIES inquiries in a row,
+        the pan/tilt sign is wrong (zone/direction.py): with it, every correction pushes the camera further from the
+        car. -> {"axis", "sign", "observed", "cycles"} once that is established, else None. The runtime then drops
+        the car (reason "wrong_direction") and logs a "direction_mismatch" event that says what to fix."""
+        pe, c = self.pose, self.cfg
+        if pe.inq is None or pe.inq_prev is None or pe.inq is self.checked_inq:
+            return None
+        self.checked_inq = pe.inq
+        settle = c.model_latency_s + c.model_ramp_s
+        for i, axis in enumerate(("pan", "tilt")):
+            direction, since = self.step_dir_since[axis]
+            delta = pe.inq[i] - pe.inq_prev[i]
+            if direction == 0 or pe.inq_prev[2] < since + settle or abs(delta) < self.WRONG_DIRECTION_MIN_UNITS:
+                continue                      # not moving on purpose, still starting, or too small to tell
+            sign = getattr(c, axis + "_sign")
+            observed = direction * (1 if delta > 0 else -1)
+            if observed == sign:
+                self.wrong_dir_count[axis] = 0
+                continue
+            self.wrong_dir_count[axis] += 1
+            if self.wrong_dir_count[axis] >= self.WRONG_DIRECTION_INQUIRIES:
+                return dict(axis=axis, sign=sign, observed=observed, cycles=self.wrong_dir_count[axis])
+        return None
+
+    def _note_direction(self):
+        now = self.clock.monotonic()
+        for axis, step in (("pan", self.pan_step), ("tilt", self.tilt_step)):
+            d = (step > 0) - (step < 0)
+            if d != self.step_dir_since[axis][0]:
+                self.step_dir_since[axis] = (d, now)
+                self.wrong_dir_count[axis] = 0
+
     def _send_velocity(self):
         try:
             r = self.ptz.pan_tilt_velocity(self.pan_step, self.tilt_step, ttl=self.cfg.ttl_s)
@@ -366,6 +413,7 @@ class Controller:
             ok = False
             self.ptz_ok = False
         self.pose.commanded(self.pan_step, self.tilt_step)
+        self._note_direction()
         return ok
 
     def _maybe_zoom(self, taught_zoom, now):
@@ -388,6 +436,7 @@ class Controller:
 
     def _reset_quant(self):
         self.diverged_cycles = 0
+        self.wrong_dir_count = {"pan": 0, "tilt": 0}
         self.q_pan = self.q_tilt = 0.0
         self.t_follow = None
         self.want = (0.0, 0.0)
@@ -403,12 +452,14 @@ class Controller:
             except Exception:  # noqa: BLE001
                 self.ptz_ok = False
         self.pose.commanded(0, 0)
+        self._note_direction()
 
     def recall(self, preset, pose: Pose, settle_s):
         """Recall a preset whose pose is known (a keyframe's). After `settle_s` the pose estimate is reset to it,
         which is what makes Branch B's feedback usable again for the next car."""
         self.pan_step = self.tilt_step = 0
         self._reset_quant()
+        self._note_direction()
         try:
             self.ptz_ok = answered(self.ptz.preset_recall(int(preset)))
         except Exception:  # noqa: BLE001
