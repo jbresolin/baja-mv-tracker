@@ -67,6 +67,7 @@ class ZoneAgent:
                                    on_mode=self.state_file.set_last_mode)
         self.state_file.set_last_mode(mode)
         self.camera.arbiter = self.arbiter
+        self.camera.studio_connected = lambda: bool(self.subscribers)
 
     # ------------------------------------------------------------------------------------------- plugging in
     def attach(self) -> "ZoneAgent":
@@ -97,6 +98,16 @@ class ZoneAgent:
             self.camera._commanded_by(LOCAL_SOURCE)
         return ok, msg
 
+    def local_release_hold(self) -> tuple[bool, str]:
+        """The page's "liberar HOLD" (confirmed on the page): see ModeArbiter.local_release_hold. Logged."""
+        holder = self.arbiter.holder
+        ok, msg = self.arbiter.local_release_hold()
+        self.record(self.camera_id, LOCAL_SOURCE, "release_hold", {"holder": holder}, "ok" if ok else "error: refused")
+        if ok:
+            self.camera._commanded_by(LOCAL_SOURCE)
+            self.print("agent: HOLD of %s released on the laptop page" % holder)
+        return ok, msg
+
     def local_stop(self) -> None:
         self.camera.local_stop()
         self.arbiter.local_stop()
@@ -105,7 +116,8 @@ class ZoneAgent:
     def page_state(self) -> dict:
         """What the laptop page shows about the studio."""
         a = self.arbiter
-        return {"enabled": True, "port": int(self.cfg.get("port", 8890)), "mode": a.mode, "holder": a.holder,
+        return {"enabled": True, "error": self.zapp.agent_error, "port": int(self.cfg.get("port", 8890)),
+                "mode": a.mode, "holder": a.holder,
                 "resume_in_s": None if a.resume_in_s() is None else round(a.resume_in_s(), 1),
                 "studio_moving": self.camera.moving() and (self.camera.last_command_source or "").startswith("studio"),
                 "last_command_source": self.camera.last_command_source, "studios": len(self.subscribers)}

@@ -9,8 +9,8 @@ It shares the zone's one PTZ driver (`ViscaPtz`, or the simulator) with the cont
   TTL = the request's ttl_ms: the driver's dead-man stops the camera if the studio link is lost.
 * **Position.** Degrees from home and zoom 0..1, only when the report measured units per degree and the camera
   answers position inquiries while moving (Branch A). Otherwise `null` and `has_position_feedback: false`.
-  It's polled at `agent.position_hz` (2 Hz) when the zone isn't driving the camera; while AUTO drives it, the
-  controller's own inquiry answers are reused, so the agent adds nothing on the wire then.
+  It's polled at `agent.position_hz` (2 Hz) only while a studio is connected and the zone isn't in AUTO; in AUTO the
+  controller's own inquiry answers are reused. A zone running without a studio sends the camera nothing new.
 * **Device status.** Offline when the PTZ stopped answering: 3 failed exchanges in a row, counting the app's health
   probe, the agent's own inquiries and the studio's commands; one answer brings it back. Commands then answer
   503 device_offline (a stop is still sent, just in case).
@@ -22,8 +22,8 @@ from typing import Callable, Optional
 
 from zone import director as D
 from zone.agent.contract import (
-    AUTO, AUTO_PAUSED, DEVICE_OFFLINE, DEVICE_OFFLINE_ERROR, DEVICE_ONLINE, IDLE, LOST, NOT_SUPPORTED, OFFLINE, OK,
-    PRESETS_CHANGED, SEARCHING, TRACKER_ACQUIRED, TRACKER_LOST, TRACKING, AgentError,
+    AUTO, AUTO_PAUSED, BAD_REQUEST, DEVICE_OFFLINE, DEVICE_OFFLINE_ERROR, DEVICE_ONLINE, IDLE, LOST, NOT_SUPPORTED,
+    OFFLINE, OK, PRESETS_CHANGED, SEARCHING, TRACKER_ACQUIRED, TRACKER_LOST, TRACKING, AgentError,
 )
 from zone.agent.presets import PresetBook
 from zone.controller import answered
@@ -56,6 +56,7 @@ class ZoneCamera:
         self.presets = presets
         self.emit = emit                      # emit(event, detail): a contract event about this camera
         self.arbiter = None                   # the ModeArbiter, set by the service once it exists
+        self.studio_connected: Callable[[], bool] = lambda: False   # is a studio's WebSocket open? (the service)
         self.position_period_s = 1.0 / max(0.1, float(position_hz))
         self.lock = threading.RLock()
         report = zapp.settings.report
@@ -155,7 +156,9 @@ class ZoneCamera:
         self.require_online()
         now = self.clock.monotonic()
         ttl = ttl_ms / 1000.0
-        self.arbiter.studio_motion(source, motion_ends_at=now + ttl)   # pauses AUTO first: the zone goes quiet
+        # pauses AUTO first: the zone goes quiet. If its control loop is too busy for that, this raises 503 and the
+        # move is not sent (the pause is recorded, and the loop obeys it at its next cycle)
+        self.arbiter.studio_motion(source, motion_ends_at=now + ttl)
         with self.lock:
             previous = self.velocity if now < self.velocity_until else (0, 0, 0)
             self.velocity, self.velocity_until = steps, now + ttl
@@ -170,22 +173,34 @@ class ZoneCamera:
         return self._reply()
 
     def stop(self, source: str) -> dict:
-        """POST /stop: every axis, now. Never refused because of the mode (a pause in AUTO, like any studio motion)."""
+        """POST /stop: every axis, now. Never refused because of the mode (a pause in AUTO, like any studio motion).
+
+        Like the page's big STOP: the stop goes to the PTZ driver *first*, before any lock (the mode rules may have to
+        wait for the zone's control loop), then the pause, then the stop once more (a velocity the control loop had
+        already decided on may have gone out in between: this second stop is the last word)."""
+        first = self._send_stops()
         now = self.clock.monotonic()
-        self.arbiter.studio_motion(source, motion_ends_at=now)
         with self.lock:
             self.velocity, self.velocity_until, self.recall_until = (0, 0, 0), -math.inf, -math.inf
             self._commanded_by(source)
+        try:
+            self.arbiter.studio_motion(source, motion_ends_at=now)
+        finally:
+            second = self._send_stops()
+        answers = [self._note_result(r) for r in first + second if r is not None]
+        if not answers or not any(answers):
+            raise AgentError(DEVICE_OFFLINE_ERROR, "the zone's PTZ did not answer the stop")
+        return self._reply()
+
+    def _send_stops(self) -> list:
+        """Stop pan/tilt and zoom through the driver. -> their results (None for a call that raised)."""
         results = []
         for fn in (self.ptz.stop, self.ptz.zoom_stop):
             try:
                 results.append(fn())
             except Exception:  # noqa: BLE001 (a dead PTZ must not keep us from trying the other axis)
                 results.append(None)
-        answers = [self._note_result(r) for r in results if r is not None]
-        if not answers or not all(answers):
-            raise AgentError(DEVICE_OFFLINE_ERROR, "the zone's PTZ did not answer the stop")
-        return self._reply()
+        return results
 
     def local_stop(self) -> None:
         """The laptop page's PARAR has stopped the camera: forget any studio velocity."""
@@ -214,7 +229,9 @@ class ZoneCamera:
         if not self._note_result(result):
             raise AgentError(DEVICE_OFFLINE_ERROR, "the zone's PTZ did not answer the preset store")
         if not getattr(result, "ok", True):
-            raise AgentError(DEVICE_OFFLINE_ERROR, "the zone's PTZ refused to store preset %d" % n)
+            # it answered, with an error: the camera is there, it just won't store this one
+            raise AgentError(BAD_REQUEST, "the zone's PTZ refused to store preset %d (VISCA error %s)"
+                             % (n, getattr(result, "error_code", None)))
         preset = self.presets.stored(n)
         self._presets_signature = self.presets.signature()
         self.emit(PRESETS_CHANGED, {"n": n})
@@ -241,22 +258,26 @@ class ZoneCamera:
         if not self.has_position_feedback:
             return None
         self.require_online()
-        self.refresh_position()
+        if self.clock.monotonic() - self._position_t >= self.position_period_s:
+            self.refresh_position(force=True)      # the studio asks: a fresh answer, even without a WebSocket
         return self._position_contract()
 
     def refresh_position(self, force: bool = False) -> None:
         """Ask the PTZ where it is, at most position_hz times a second (or now, with `force`).
 
-        While AUTO drives the camera (tracking a car, going back to the entry), the controller's own inquiry answers
-        are used instead: an inquiry from here would compete with its velocity commands for the driver."""
+        Only while a studio is connected (`studio_connected()`, or a studio asking with `force`): a zone running
+        without a studio sends nothing new to the camera. And never in AUTO: the controller's own inquiry answers
+        are used instead (an inquiry from here would compete with its velocity commands for the driver)."""
         if not self.has_position_feedback:
+            return
+        if not force and not self.studio_connected():
             return
         now = self.clock.monotonic()
         if not force and now - self._position_t < self.position_period_s:
             return
         self._position_t = now
         director = self.runtime.director
-        if director.mode == D.AUTO and director.sub in (D.TRACKING, D.RETURNING):
+        if director.mode == D.AUTO:
             pose = self.runtime.controller.pose
             if pose.inq is not None and now - pose.inq[2] <= 1.0:
                 zoom = pose.zoom if pose.zoom is not None else (self._position_raw or (0, 0, 0))[2]

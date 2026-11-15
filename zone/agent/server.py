@@ -9,6 +9,8 @@ Rules from the contract that live here:
 * Every error is `{"error": "<code>", "detail": "<sentence>"}` with the contract's status; a malformed body or an
   out-of-range value is `400 bad_request` (not FastAPI's 422).
 * Every command (§6) is logged in `GET /agent/log`, refused ones too, with `X-Studio-Id` as its source.
+* A studio's socket is closed after 10 s without a word from it (it pings every 2 s), and a studio that doesn't
+  read gets no more than MAX_QUEUED_STATES state pushes queued (events are always kept).
 * State is pushed to every WebSocket at once on accept, then every 0.25 s (the contract asks for >= 2 Hz); a push
   due right after a mode change waits 0.1 s for the dust to settle. Events go out as they happen. `{"type": "ping"}` is answered `{"type": "pong"}`.
 """
@@ -30,6 +32,8 @@ from zone.agent.contract import (
 
 PresetNumber = Annotated[int, Path(ge=0, le=MAX_PRESET_NUMBER)]
 STATE_SETTLE_S = 0.1          # a state push due within this long after a mode change waits (see _push_forever)
+MAX_QUEUED_STATES = 40        # a studio that doesn't read (10 s of pushes behind) gets no more state pushes...
+SILENT_STUDIO_CLOSE_S = 10.0  # ... and its socket is closed after this long without a word (the studio pings every 2 s)
 
 
 def error_response(status: int, code: str, detail: str) -> JSONResponse:
@@ -223,7 +227,12 @@ async def _push_forever(agent) -> None:
 
 
 def _broadcast(agent, message: dict) -> None:
+    """Queue a message for every studio. A studio that has stopped reading (a dead link, a hung studio) must not make
+    the queue grow forever: once MAX_QUEUED_STATES messages wait, state pushes are dropped for it (the next one
+    says everything anyway); events are always kept."""
     for queue in list(agent.subscribers):
+        if message.get("type") == "state" and queue.qsize() >= MAX_QUEUED_STATES:
+            continue
         queue.put_nowait(message)
 
 
@@ -247,16 +256,29 @@ async def _serve_state_socket(agent, websocket: WebSocket) -> None:
             await websocket.send_json(message)
         await websocket.close()
 
+    loop = asyncio.get_running_loop()
+    last_heard = loop.time()
+
     async def answer_pings():
+        nonlocal last_heard
         while True:
+            text = await websocket.receive_text()
+            last_heard = loop.time()
             try:
-                message = json.loads(await websocket.receive_text())
+                message = json.loads(text)
             except json.JSONDecodeError:
                 continue
             if isinstance(message, dict) and message.get("type") == "ping":
                 queue.put_nowait({"type": "pong"})
 
-    tasks = [asyncio.create_task(send_messages()), asyncio.create_task(answer_pings())]
+    async def close_if_silent():
+        """The studio pings every 2 s. Nothing for SILENT_STUDIO_CLOSE_S: it's gone (a link that died without
+        closing): close the socket, which frees its queue."""
+        while loop.time() - last_heard < SILENT_STUDIO_CLOSE_S:
+            await asyncio.sleep(min(1.0, SILENT_STUDIO_CLOSE_S / 4))
+
+    tasks = [asyncio.create_task(send_messages()), asyncio.create_task(answer_pings()),
+             asyncio.create_task(close_if_silent())]
     try:
         await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
     finally:
@@ -266,3 +288,5 @@ async def _serve_state_socket(agent, websocket: WebSocket) -> None:
         for task in tasks:
             with contextlib.suppress(asyncio.CancelledError, WebSocketDisconnect, RuntimeError):
                 await task
+        with contextlib.suppress(Exception):
+            await websocket.close()       # already closed in most cases; this ends the silent studio's socket

@@ -257,6 +257,12 @@ function render(s) {
 // the studio (baja-studio) drives this PTZ through the agent API: show what it is doing, and who
 function renderStudio(a) {
   const el = $("#studioBadge");
+  $("#releaseHold").style.display = a && a.enabled && a.mode === "hold" ? "" : "none";
+  if (a && a.error) {      // the studio's API is down (port taken, websockets missing...): impossible to miss
+    el.textContent = "API DO ESTÚDIO FORA DO AR: " + a.error;
+    el.style.background = "var(--red)"; el.style.color = "#fff"; el.style.display = "";
+    return;
+  }
   if (!a || !a.enabled) { el.style.display = "none"; return; }
   const who = a.holder ? a.holder.replace(/^studio:/, "") : "estúdio";
   let text = "Estúdio: manual", bg = "#333", fg = "var(--text)";
@@ -274,6 +280,16 @@ function renderStudio(a) {
   if (a.mode === "hold") { auto.disabled = true; auto.title = "O estúdio está segurando a câmera (HOLD): só o estúdio volta ao AUTO"; }
   else auto.title = "";
 }
+
+// "Liberar HOLD": the person at the laptop takes the camera back from a studio that holds it (a studio that is gone,
+// or a HOLD remembered across a restart). Deliberate: a confirmation first.
+$("#releaseHold").addEventListener("click", async () => {
+  const who = S && S.agent && S.agent.holder ? S.agent.holder.replace(/^studio:/, "") : "o estúdio";
+  if (!confirm(`O estúdio (${who}) está segurando esta câmera (HOLD).\n\nLiberar o HOLD? A câmera passa para manual ` +
+               "e o AUTO desta página volta a funcionar. Avise o estúdio.")) return;
+  if (await post("/api/agent/release_hold", { confirm: true })) msg("HOLD liberado: câmera em manual");
+  poll();
+});
 
 async function poll() {
   try {

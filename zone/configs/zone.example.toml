@@ -159,6 +159,7 @@ host = "0.0.0.0"                  # 0.0.0.0 = reachable from the streaming PC on
 port = 8890                       # the contract's port (the studio's subnet scan looks there)
 token = ""                        # shared X-Agent-Token; "" = no token (the contract allows it). Same value in the
                                   # studio's Agents page. GET /agent/info never needs it (the scan knows no token)
+                                  # AT THE EVENT, SET ONE in site.toml: on the event LAN anyone could move the PTZ
 agent_id = ""                     # "" = this computer's hostname
 name = ""                         # "" = "Zone laptop <hostname>"
 camera_id = "cam1"                # the PTZ's id on this agent (the studio's remote_camera_id)
