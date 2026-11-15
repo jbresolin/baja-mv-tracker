@@ -5,7 +5,10 @@ arrival time, the controller would believe the car was at that spot 0.1 s later 
 would lag behind by v * 0.1 s. So the known capture latency (`rt.capture.live_latency_s`) is taken off the arrival
 time of live frames. Recorded files have no capture latency: nothing is taken off.
 """
+import shutil
+import subprocess
 import types
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -70,3 +73,32 @@ def test_the_lookahead_covers_capture_latency_processing_and_command_latency():
     assert cmd.lookahead_s == pytest.approx(0.35)
     # so the camera is aimed where the car will be 0.35 s after the picture: s = 0.5 + 0.25 * 0.35
     assert cmd.s_ahead == pytest.approx(0.5 + 0.25 * 0.35)
+
+
+# ---------------------------------------------------------------------------------------------- ffmpeg off PATH
+FFMPEG, FFPROBE = shutil.which("ffmpeg"), shutil.which("ffprobe")    # full paths, found before PATH is hidden
+
+
+@pytest.mark.skipif(FFMPEG is None or FFPROBE is None, reason="ffmpeg/ffprobe not on PATH")
+def test_spotter_file_source_works_with_ffmpeg_only_at_its_configured_path(tmp_path, monkeypatch):
+    # The installed app's ffmpeg is in INSTALL\ffmpeg\bin, which is NOT on PATH: the launcher writes its full path
+    # into the zone config (rt.capture.ffmpeg / rt.capture.ffprobe). The zone's spotter, reading a video FILE, used
+    # to crash ("frame loop crashed: FileNotFoundError", exit code 1) because the clock overlay reader inside rt ran a
+    # bare "ffmpeg". Here PATH is emptied, so only the configured full paths can work.
+    from zone import config as C
+    from zone.spotter import rt_config
+    video = tmp_path / "spotter.mkv"
+    subprocess.run([FFMPEG, "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=320x180:rate=10", "-t", "2",
+                    "-c:v", "mpeg4", str(video)], check=True)
+    cfg = C.load(None, ["spotter.source=%s" % video.as_posix(), "spotter.loop_file=false",
+                        "spotter.realtime_file=false",
+                        "rt.capture.ffmpeg=%s" % Path(FFMPEG).as_posix(),
+                        "rt.capture.ffprobe=%s" % Path(FFPROBE).as_posix()])
+    empty = tmp_path / "empty_path_folder"
+    empty.mkdir()
+    monkeypatch.setenv("PATH", str(empty))           # a bare "ffmpeg" can no longer be found
+    assert shutil.which("ffmpeg") is None
+
+    source = SpotterSource(cfg, rt_config(cfg), log=lambda m: None)
+    frames = list(source.frames())
+    assert len(frames) >= 10                         # 2 s of a 10 fps file, processed at 10 fps

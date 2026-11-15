@@ -4,8 +4,9 @@ The roster belongs to the event, not the prova: every prova of an event uses the
 "Geral" page (<EV>_GER), which lists every registered car (26BR: 51 cars, vs 38 that ran the enduro). Falls back to
 the enduro page when Geral is missing. Stdlib only.
 
-usage: python teacher/rosters.py [EVENT ...]      (default: every event linked from the site's home page)
-writes rosters/<EVENT>.csv with columns numero,equipe,escola,fonte
+usage: python teacher/rosters.py [--out-dir DIR] [EVENT ...]   (default: every event linked from the site's home page)
+writes rosters/<EVENT>.csv (or DIR/<EVENT>.csv) with columns numero,equipe,escola,fonte
+The installed app's launcher (launcher/rosterfetch.py) calls roster() and write_roster() directly.
 """
 import csv
 import html
@@ -46,18 +47,37 @@ def parse(page):
     return out
 
 
-def roster(ev):
+def roster(ev, get_page=None, sleep=time.sleep):
+    """-> (rows, prova) for one event, or ([], None). get_page(url) -> html (default: get); tests pass fakes."""
+    get_page = get_page or get
     for prova in ("GER", "END"):
-        rows = parse(get("%s/%s/prova.php?id=%s_%s" % (BASE, ev, ev, prova)))
+        rows = parse(get_page("%s/%s/prova.php?id=%s_%s" % (BASE, ev, ev, prova)))
         if rows:
             return rows, prova
-        time.sleep(1)
+        sleep(1)
     return [], None
 
 
+def write_roster(rows, src, path):
+    """Write one roster CSV (one row per car number, sorted). Returns the number of cars written."""
+    rows = sorted({r["numero"]: r for r in rows}.values(), key=lambda r: r["numero"])
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, ["numero", "equipe", "escola", "fonte"])
+        w.writeheader()
+        for r in rows:
+            w.writerow(dict(r, fonte=src))
+    return len(rows)
+
+
 def main():
-    evs = sys.argv[1:] or events()
-    OUT.mkdir(exist_ok=True)
+    args = sys.argv[1:]
+    out_dir = OUT
+    if len(args) >= 2 and args[0] == "--out-dir":
+        out_dir, args = Path(args[1]), args[2:]
+    evs = args or events()
+    out_dir.mkdir(parents=True, exist_ok=True)
     for ev in evs:
         try:
             rows, src = roster(ev)
@@ -67,13 +87,8 @@ def main():
         if not rows:
             print(ev, "no roster", flush=True)
             continue
-        rows = sorted({r["numero"]: r for r in rows}.values(), key=lambda r: r["numero"])
-        with open(OUT / ("%s.csv" % ev), "w", newline="", encoding="utf-8") as fh:
-            w = csv.DictWriter(fh, ["numero", "equipe", "escola", "fonte"])
-            w.writeheader()
-            for r in rows:
-                w.writerow(dict(r, fonte=src))
-        print(ev, src, len(rows), "cars", flush=True)
+        n = write_roster(rows, src, out_dir / ("%s.csv" % ev))
+        print(ev, src, n, "cars", flush=True)
         time.sleep(1)
 
 

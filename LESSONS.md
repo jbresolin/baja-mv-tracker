@@ -1997,3 +1997,18 @@ and that page talks to the camera all the time. Rerun with every tab closed (`vi
   moves): no "TO MEASURE BY HAND". `--like-real-ptz` in the fake camera reproduces the page-open camera: keep it as a
   stress test, not as a model of the race PTZ. Bench rule from now on: **close the camera's web page** (and any other
   controller) before benching or racing.
+### Installer smoke test: the roles crashed on ffmpeg not on PATH (PR #8, 2026-11-15)
+
+* **Correction: the earlier green self-test (run 43725659324) was luck.** rt's file source reads the OBS clock
+  overlay first (`clock.mode = "auto"`), and `lapvision/clock.grab` ran a bare `"ffmpeg"`. Installed, ffmpeg is in
+  `INSTALL\ffmpeg\bin`, not on PATH: rt (lap line) and the zone's spotter both died with FileNotFoundError ~1-2 s
+  after start, on every run. rt serves its status page before it opens the source, and the zone serves its page
+  while the frame loop (a thread) crashes; so the self-test, which only waited for the pages, passed when a page
+  answered in that window and failed when it didn't. The zone's h11 "state=CLOSED" traceback was only the self-test
+  polling a server that was shutting down. The [Dirs] change in between had nothing to do with it (the self-test uses
+  a temporary data folder).
+* Fix: the overlay reader gets the configured `capture.ffmpeg`; the launcher also puts the bundled ffmpeg folder first
+  on its children's PATH; `rt/tests/test_ffmpeg_paths.py` scans the runtime code for bare ffmpeg/ffprobe commands
+  and runs a file source with PATH emptied. The ordinary test runs had ffmpeg on PATH, which is why nothing caught it.
+* The self-test now requires processed frames (rt `processing.frames > 0`, zone `frame.size`), not just a page, and
+  prints the last 40 lines of a failed role's own log, one per line.

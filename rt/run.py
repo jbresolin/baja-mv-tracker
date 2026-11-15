@@ -158,7 +158,8 @@ def main():
     beam = start_beam(cfg, em, board, live_camera, log, warn, config_path=a.config or C.DEFAULT)
 
     # A missing roster never stops rt (the launcher would restart it forever): run in open-set mode instead.
-    roster_info = C.load_roster(a.event, int(cfg["identity"].get("open_set_max", C.OPEN_SET_MAX)))
+    roster_info = C.load_roster(a.event, int(cfg["identity"].get("open_set_max", C.OPEN_SET_MAX)),
+                                override_dir=cfg["identity"].get("rosters_dir") or None)
     roster, teams = roster_info["numbers"], roster_info["teams"]
     if roster_info["open_set"]:
         warn("ROSTER: " + roster_info["warning"])

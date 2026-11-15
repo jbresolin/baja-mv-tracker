@@ -20,3 +20,6 @@ deploy/models/*.onnx
 !rt/tests/fixtures/*.mp4
 *.beam.toml
 *.beam.toml.tmp
+# installer build (tools/installer/build_installer.ps1): stage, download cache, output
+build/
+dist/

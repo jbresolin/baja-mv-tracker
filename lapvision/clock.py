@@ -90,24 +90,26 @@ def fmt(sec_of_day):
     return "%02d:%02d:%06.3f" % (h, m, s)
 
 
-def grab(video, t, crop_top=True):
-    """Grab a single frame at t seconds via ffmpeg (accurate seek)."""
+def grab(video, t, crop_top=True, ffmpeg="ffmpeg"):
+    """Grab a single frame at t seconds via ffmpeg (accurate seek). `ffmpeg`: the program to run. The default (a bare
+    name, looked up on PATH) is only for the offline command line below; runtime callers (rt/capture.py) must pass
+    the configured path (capture.ffmpeg): the installed app's bundled ffmpeg is not on PATH."""
     vf = "crop=iw:ih*70/1080:0:0" if crop_top else "null"
-    out = subprocess.run(["ffmpeg", "-v", "error", "-ss", str(t), "-i", str(video), "-frames:v", "1",
+    out = subprocess.run([ffmpeg, "-v", "error", "-ss", str(t), "-i", str(video), "-frames:v", "1",
                           "-vf", vf, "-f", "image2pipe", "-vcodec", "png", "-"], capture_output=True).stdout
     if not out:
         return None
     return cv2.imdecode(np.frombuffer(out, np.uint8), cv2.IMREAD_COLOR)
 
 
-def survey(video, step=60.0):
+def survey(video, step=60.0, ffmpeg="ffmpeg", ffprobe="ffprobe"):
     """Sample the clock along a file, print wall - pts offset to find jumps/freezes."""
-    dur = float(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of",
+    dur = float(subprocess.run([ffprobe, "-v", "error", "-show_entries", "format=duration", "-of",
                                 "csv=p=0", str(video)], capture_output=True, text=True).stdout)
     rows = []
     t = 0.5
     while t < dur:
-        f = grab(video, t)
+        f = grab(video, t, ffmpeg=ffmpeg)
         if f is not None:
             s, mg = read(f)
             if s is not None:

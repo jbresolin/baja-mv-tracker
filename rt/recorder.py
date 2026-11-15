@@ -561,12 +561,13 @@ class Recorder(threading.Thread):
 
 
 def software_version(root=None):
-    """`git describe` of the repo, or "unknown" (a copied folder without .git)."""
+    """`git describe` of the repo; else the RT_VERSION environment variable (the installed app's launcher sets it to
+    the build's commit), else "unknown" (a copied folder without .git)."""
     root = root or Path(__file__).resolve().parent.parent
     try:
         result = subprocess.run(["git", "-C", str(root), "describe", "--always", "--dirty", "--tags"],
                                 capture_output=True, text=True, timeout=10)
         version = result.stdout.strip()
-        return version or "unknown"
+        return version or os.environ.get("RT_VERSION", "unknown")
     except Exception:  # noqa: BLE001
         return os.environ.get("RT_VERSION", "unknown")

@@ -329,6 +329,7 @@ value shapes), so a pt-BR Windows with Portuguese labels and a cp850 console wor
 | identity | panel_conf / panel_pad / panel_rect | 0.1 / 0.05 / true | as picked on 25SU val |
 | identity | provisional* | on, every 0.5 s, 4 crops, max 16 | early reads while the car is in view (PTZ) |
 | identity | queue_max | 64 | identity backlog; provisional jobs are skipped first |
+| identity | rosters_dir | "" | extra roster folder searched first (the installed app's data folder, where the launcher's "Baixar lista de equipes" saves); "" = only `rosters/` |
 | output | csv / crops_dir | "" | CSV path (default `<out>.csv`); save each pass's selected crops (review / training data) |
 | lapapp | enabled, fonte_id, dispositivo_id, only_numbered, outbox | false, 5, 0, true, "" | LapAppSink stub |
 | beam | driver / port | off / COM5 | off, modem-line, byte-stream, fake (section "Beam input") |
