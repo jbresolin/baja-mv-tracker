@@ -122,7 +122,15 @@ document.addEventListener("keydown", (e) => {
 document.addEventListener("keyup", (e) => { if (e.key === keyDown) { keyDown = null; stopJog(); } });
 
 // ------------------------------------------------------------------ teach list
-$("#setCorridor").addEventListener("click", () => post("/api/teach/corridor", { half_width: +$("#corridor").value }));
+// The corridor box is refreshed from the program twice a second. Clicking "Aplicar" moves the focus off the box
+// first, so a refresh landing between that and the click used to put the old width (60) back and send it. Once
+// the operator types in the box, the refresh leaves it alone until "Aplicar" succeeds.
+let corridorEdited = false;
+$("#corridor").addEventListener("input", () => { corridorEdited = true; });
+$("#setCorridor").addEventListener("click", async () => {
+  const r = await post("/api/teach/corridor", { half_width: +$("#corridor").value });
+  if (r) { corridorEdited = false; msg("corredor aplicado (salve a zona para manter)"); }
+});
 $("#save").addEventListener("click", async () => {
   const r = await post("/api/teach/save");
   if (r) msg("zona salva" + (r.result ? " (backup: " + r.result.split(/[\\/]/).pop() + ")" : ""));
@@ -199,7 +207,7 @@ function render(s) {
   renderStudio(s.agent);
 
   const z = s.zone, t = s.teach;
-  if (document.activeElement !== $("#corridor")) $("#corridor").value = z.corridor;
+  if (!corridorEdited && document.activeElement !== $("#corridor")) $("#corridor").value = z.corridor;
   $("#dirty").textContent = z.dirty ? "alterações não salvas" : "salvo";
   $("#dirty").className = z.dirty ? "bad" : "good";
   $("#poseSrc").textContent = { inquiry: "consulta à câmera", commanded: "movimento absoluto",

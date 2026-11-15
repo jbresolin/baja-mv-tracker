@@ -278,3 +278,23 @@ def test_page_asks_for_the_zoom_when_the_camera_cant_tell_it(tmp_path):
     assert r.json()["result"]["keyframe"]["zoom"] == 2500
     assert client.post("/api/teach/keyframe_zoom", json={"index": 0, "zoom": 2700}).json()["ok"]
     assert app.teach.zone.points[0].keyframe.zoom == 2700
+
+
+def test_corridor_width_box_is_not_overwritten_while_the_operator_edits_it():
+    # Bug seen on the bench (2026-11-15): typing a new corridor width and clicking "Aplicar" put 60 back. Clicking
+    # the button moves the focus off the box, and the page's refresh (twice a second) rewrote the box with the
+    # stored width before the click was sent, so the old width was "applied". The page now remembers that the
+    # operator typed in the box and only refreshes it again after "Aplicar" succeeded. The page script runs in a
+    # browser, so this test checks the script's text for those two rules.
+    js = (Path(__file__).resolve().parent.parent / "static" / "app.js").read_text(encoding="utf-8")
+    assert 'addEventListener("input", () => { corridorEdited = true; })' in js      # typing marks it edited
+    assert "if (!corridorEdited &&" in js                                          # the refresh skips it then
+    assert "corridorEdited = false" in js                                          # cleared once applied
+
+
+def test_applied_corridor_width_is_what_the_state_shows(tmp_path):
+    # The server side of the same feature: after "Aplicar" with 150, the page's state says 150 (not saved yet).
+    client, app, _, _ = make(tmp_path)
+    assert client.post("/api/teach/corridor", json={"half_width": 150}).status_code == 200
+    state = client.get("/api/state").json()["zone"]
+    assert state["corridor"] == 150.0 and state["dirty"] is True
