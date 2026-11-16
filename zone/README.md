@@ -156,6 +156,29 @@ PTZ IP, report path, recording). `zone\run_zone.bat` picks `site.toml` up by its
 The first keyframe is s = 0, the last is s = 1. Teaching on a recording with the PTZ simulated also works:
 `--set spotter.source="rec.mp4" --set ptz.driver=sim`.
 
+#### Teaching keyframes: troubleshooting
+
+How a keyframe's pose is read (pose source "inquiry"): the zone stops the camera, waits 0.3 s, reads pan/tilt/zoom
+up to 6 times (within ~2 s) and keeps the pose only when 3 readings in a row agree (pan/tilt within 2 units, zoom
+within 10). Otherwise the keyframe is refused: "a câmera não respondeu uma posição estável; tente de novo". On the
+2026-11-15 bench a single reading stored P11 as pan 1764 / zoom 0 between neighbours at pan 1199..1636 / zoom
+6772..9399, and the controller drove the PTZ "way too far and too fast" to follow it.
+
+- **Close the camera's web page** (and any other program talking to the PTZ) before teaching: with the page open the
+  camera answers late, in batches, and sends position messages nobody asked for (LESSONS.md, session 3).
+- **Refused with "posição estável"**: wait until the picture is still and click again. If it keeps happening, check
+  the network / that nothing else talks to the camera.
+- **Check the keyframe list for ⚠ markers.** Each keyframe is checked against the others (`zone/keyframe_check.py`):
+  pan (and tilt) going back against the direction of the path, zoom exactly 0 while its neighbours aren't near 0,
+  and a pan jump larger than 60 % of the keyframes' whole pan range. The reason is shown on the row, above the list,
+  in the health panel ("keyframes") and in the log. It never blocks anything.
+- **"testar"** recalls the preset, waits for the camera to stop and compares the pose it reports with the stored
+  one: a difference (more than 10 units pan/tilt, 50 zoom) shows in red. A keyframe stored with a bad pose is seen
+  right there, not during a pass.
+- **Re-teach flagged keyframes**: frame it again and "re-ensinar". If the pose is really right (the track curves
+  back, or climbs then dips: tilt warnings are often this), "testar" it and click "conferido" to hide its warnings
+  (saved in zone.json as `"confirmed": true`; re-teaching clears it).
+
 ### Spotter capture latency (measure it on the bench)
 
 The webcam delivers each frame some time after the picture was taken (exposure, MJPG, USB, driver): typically

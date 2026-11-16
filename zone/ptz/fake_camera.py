@@ -27,8 +27,9 @@ Keep it as a stress test of a busy camera, not as a model of the race PTZ:
 - the sequence reset is answered to port 52381 only, so the sender never sees the answer;
 - an inquiry is answered with ACK + completion (`90 48 FF`, `90 58 FF`), and the data (`90 50 ...`) only with
   probability `answer_probability` (measured: 43 of 259, ~17 %), only at rest (none during a 3 s pan, second
-  probe), and then as a **pair**, whatever was asked: the 11-byte pan/tilt answer and a 7-byte `90 50` (zoom-sized),
-  sent in the batch of the *next* request (`data_pairs`);
+  probe), and then as a **pair**, whatever was asked: the 11-byte pan/tilt answer and a 7-byte
+  `90 50 00 00 00 00 FF` (zoom-sized, always zeros as measured: not the zoom), sent in the batch of the *next*
+  request (`data_pairs`);
 - replies wait: the first ones `first_reply_delay` (~3 s), then 0-0.5 s, they go out on a 50 ms tick, in order,
   and all the messages ready at a tick share datagrams (up to `max_batch` messages each): late and batched.
 
@@ -175,7 +176,9 @@ class FakeViscaCamera:
                 if answer is not None and not self.sim.is_moving():
                     pan_tilt, zoom = self.sim.inquire_pan_tilt(), self.sim.inquire_zoom()
                     if pan_tilt is not None and zoom is not None:
-                        pair = [packets.encode_pan_tilt_answer(*pan_tilt), packets.encode_zoom_answer(zoom)]
+                        # The pair's second half is always `90 50 00 00 00 00 FF` on the real PTZ (the probe's
+                        # value at every zoom): it looks like "zoom 0" but says nothing about the zoom.
+                        pair = [packets.encode_pan_tilt_answer(*pan_tilt), packets.encode_zoom_answer(0)]
                         self.answers_sent += 1
                 answer = None
             if self.inquiry_ack:

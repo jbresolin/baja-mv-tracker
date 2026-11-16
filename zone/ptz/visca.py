@@ -51,7 +51,10 @@ So in "no echo" mode:
   for zoom). ACKs, completions, errors and answers of the wrong length are ignored (`stats["ignored_replies"]`).
   No data within the timeout is a TIMEOUT of that inquiry, as for any other camera: not an error;
 - a command is answered by the first ACK, completion or error, whatever its number (nothing better is possible);
-- whatever is already waiting when a request is sent is read and dropped first: it can't be that request's reply.
+- whatever is already waiting when a request is sent is read and dropped first: it can't be that request's reply
+  (inquiries do this also while the driver doesn't know yet whether the camera echoes);
+- while a zoom inquiry waits, a 7-byte answer glued right behind a pan/tilt answer in the same datagram is the
+  second half of an earlier data pair, not our zoom: ignored.
 
 `last_reply_at` is when anything last came from the camera: a camera that ACKs an inquiry but sends no data is
 still there (the zone's health probe uses it).
@@ -461,9 +464,13 @@ class ViscaPtz:
             deadline = self.clock.monotonic() + self.timeout
         if self._needs_reset:
             self._reset_sequence_locked(deadline)
-        if self.sequence_echo is False:
+        is_inquiry = payload_type == packets.PAYLOAD_INQUIRY
+        if self.sequence_echo is False or (self.sequence_echo is None and is_inquiry):
             # Without sequence numbers to tell replies apart, whatever already waits is an earlier request's reply
-            # (a late batch): read it now so it can't be taken for this request's.
+            # (a late batch, or a message the camera sent on its own): read it now so it can't be taken for this
+            # request's. While we don't know yet whether the camera echoes (right after connecting), inquiries do
+            # this too: a stray `90 50 00 00 00 00 FF` numbered 0 would otherwise switch the driver to "no echo"
+            # mode AND be taken as the answer "zoom 0" (2026-11-15 bench: a keyframe was stored with zoom 0).
             self._drop_waiting_locked()
         sequence = self._sequence
         self._sequence = ((self._sequence + 1) & 0xFFFFFFFF) or 1
@@ -477,8 +484,7 @@ class ViscaPtz:
         self._transport.send(datagram)
         self.stats["sent"] += 1
         self._log("tx", datagram, sent_at, what=what, seq=sequence)
-        return self._await_reply(sequence, sent_at, payload_type == packets.PAYLOAD_INQUIRY, parser,
-                                 wait_for_completion, deadline)
+        return self._await_reply(sequence, sent_at, is_inquiry, parser, wait_for_completion, deadline)
 
     def _await_reply(
         self,
@@ -501,6 +507,9 @@ class ViscaPtz:
             self._log("rx", datagram, now)
             replies = packets.parse_replies(datagram)
             for index, reply in enumerate(replies):
+                if index > 0 and self._is_second_half_of_a_pair(replies[index - 1], reply, is_inquiry, parser):
+                    self._ignore(reply, sequence, "7-byte answer right behind a pan/tilt answer (a data pair)")
+                    continue
                 result = self._match_reply(reply, sequence, sent_at, now, is_inquiry, parser)
                 if result is None:
                     continue
@@ -583,6 +592,21 @@ class ViscaPtz:
         if no_echo and kind == packets.ANSWER:
             return self._ignore(reply, sequence, "inquiry data while waiting for a command")
         return None
+
+    def _is_second_half_of_a_pair(self, previous: packets.Reply, reply: packets.Reply, is_inquiry: bool,
+                                  parser: Callable[[bytes], object] | None) -> bool:
+        """True for a 7-byte answer that comes right behind an 11/12-byte pan/tilt answer in the same datagram, while
+        a ZOOM inquiry is waiting, in "no echo" mode.
+
+        Why: a camera that doesn't echo our numbers sometimes sends its data as a pair, the pan/tilt answer then a
+        7-byte `90 50 ...` (often `90 50 00 00 00 00 FF`), also when no zoom was asked (LESSONS.md, session 3). We
+        send one request at a time, so while our zoom inquiry waits, a pan/tilt answer can only be a late answer to
+        an EARLIER pan/tilt inquiry, and the 7-byte message glued behind it belongs to that same earlier pair. Taking
+        it as the zoom made the teach store "zoom 0" on the 2026-11-15 bench. If that was by bad luck our real zoom
+        answer, we lose one reading (a TIMEOUT); the teach reads several times anyway."""
+        return (self.sequence_echo is False and is_inquiry and parser is packets.parse_zoom_position
+                and previous.kind == packets.ANSWER and len(previous.payload) in (11, 12)
+                and reply.kind == packets.ANSWER and len(reply.payload) == 7)
 
     def _ignore(self, reply: packets.Reply, sequence: int, why: str) -> None:
         """"No echo" mode: a reply that can't be the answer to request `sequence`. Counted, logged, skipped."""

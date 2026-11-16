@@ -2081,3 +2081,32 @@ to ~0.2 s/s, for 1.5 s; the camera followed the prediction far ahead; the car wa
   rule: `lost` at 1.5 s); the bench sequence above (lone detection, then a new id at +1.7 s) is followed to the exit;
   a car really gone is released `lost` 3.0-3.1 s after its last detection. Not yet checked on the real bench.
 * `test_stopped_rule`'s hand-held dropout case was 2 s (now kept by the race rules); it is 3.5 s now.
+
+## Session 3: a keyframe stored with a bad pose (zone-teach-pose-capture, 2026-11-15)
+
+João's bench (Windows XPS, installed app, real SMTAV, pose source "inquiry"): the taught zone.json had, in path
+order, P10 pan 1199 tilt 136 zoom 8724, **P11 pan 1764 tilt -4 zoom 0**, P12 1448 / 176 / 6772, P13 1636 / 100 /
+9399. He jogged steadily left to right, so P11's pan (beyond P12 and P13) and zoom 0 are wrong; the control log shows
+the controller faithfully followed that curve (target pan 1764, zoom 0, steps up to 15): "way too far and too fast".
+
+* **Cause: one reading per keyframe.** `InquirySource.read()` asked pan/tilt once and zoom once. Ways one reading
+  goes wrong on this camera: still coasting after the jog (~0.3 s); a late answer to an earlier inquiry arriving
+  first; a 7-byte `90 50 00 00 00 00 FF` that looks like "zoom 0" but isn't one (the second half of a data pair, or
+  sent unprompted). Which one hit P11 can't be told without the VISCA log (P11 had both a wrong pan and zoom 0).
+* **Driver holes found:** (1) while `sequence_echo` was still undecided (right after connecting) nothing waiting was
+  dropped before an inquiry, and a waiting `90 50 00 00 00 00 FF` numbered 0 both switched the driver to "no echo"
+  and was taken as "zoom 0". Now inquiries drop what is waiting in that state too. (2) In "no echo" mode a 7-byte
+  answer glued right behind a pan/tilt answer in the same datagram was taken as the zoom while a zoom inquiry waited;
+  that is an earlier data pair. Now ignored (`reply_ignored`).
+* **Correction of the fake camera (`like_real_ptz`):** its data pair carried the REAL zoom in the 7-byte half; the
+  probe measured `90 50 00 00 00 00 FF` at every zoom. The fake now sends zeros, and the two tests that expected a
+  zoom answer from those pairs now expect none (they were asserting the bug).
+* **Fix in the teach:** stop + zoom stop (until ACKed, 3 tries), 0.3 s settle, up to 6 readings in ≤ 2 s, keep the
+  pose only when 3 in a row agree (pan/tilt ±2, zoom ±10), else refuse with "a câmera não respondeu uma posição
+  estável; tente de novo". `zone/keyframe_check.py` flags suspicious keyframes (pan/tilt out of one-way order via
+  the longest one-way run, zoom 0 between non-wide neighbours, a pan jump > 60 % of the keyframes' pan range); shown
+  on the row, above the list, in the health panel and logged; "conferido" hides them. "testar" now waits for the
+  camera to stop and compares the reported pose with the stored one (±10 pan/tilt, ±50 zoom). The bench set above
+  flags P11 for all three reasons; P12 gets a soft tilt warning (136 -> 176 -> 100 can be a real dip).
+* Control behaviour unchanged (the controller still follows whatever keyframes it is given).
+
