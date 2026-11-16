@@ -208,7 +208,8 @@ Branch A also checks it live: inquiries showing the camera turning against the s
 
 ### Drop rules, and the `bench_hand` profile
 
-A locked car is let go at the exit (`exit`) or dropped: `lost` (no detection for `lost_timeout_s` = 1.5 s),
+A locked car is let go at the exit (`exit`) or dropped: `lost` (no detection for `lost_timeout_s` = 3 s; see
+"Detection dropouts" below),
 `off_corridor` (outside the corridor for more than `off_corridor_frames` = 3 frames), `stopped` (below),
 `gone` (the tracker ended the track), `diverged` (camera > `divergence_deg` from the target for more than
 `divergence_cycles` cycles), `wrong_direction` (above). The page header shows the last one ("último: ..."), the
@@ -223,10 +224,44 @@ lock accepts `v >= v_min`, or a forward car whose ground point moves >= `lock_px
 put the entry on a head-on stretch (the approach speed is what the camera's feed-forward starts from).
 
 **Hand-held bench test** (a printed car moved by hand): with the race rules the first drop is usually `off_corridor`
-(the picture's bottom edge leaves the taught line for 0.3 s), then `lost` (1.5 s without a detection: blur, the hand
-covering it), then `stopped` (a pause over 3 s). `--set profile=bench_hand` loosens all of them (and the divergence
+(the picture's bottom edge leaves the taught line for 0.3 s), then `lost` (3 s without a detection: blur, the hand
+covering it; `bench_hand` waits 4.5 s), then `stopped` (a pause over 3 s). `--set profile=bench_hand` loosens all of them (and the divergence
 guard a little) so the test is about the PTZ's direction and following. It doesn't change the detector: add
 `--set spotter.detector=coco` if the Baja detector doesn't see the picture.
+
+### Detection dropouts (prediction, re-acquisition, zoom)
+
+At the race the followed car goes undetected now and then: dust, another car in front of it, a few bad frames. The
+2026-11-15 bench showed how the old rules failed: the prediction ran off with a speed that had just jumped, the camera
+followed it far ahead, and the car was dropped as `lost` at 1.5 s, just before it was detected again at 2.7 s. Now:
+
+* **Prediction** (`zone/progress.py`, `ProgressTracker.prediction`): the speed is frozen at the last measured value
+  (prediction steps never change it), clamped to `progress.speed_band` (0.5-1.5) x the car's mean speed over its last
+  `speed_band_window_s` (1 s) of detections. Once the speed profile has learned, the predicted speed blends from that
+  to the typical speed v_typ(s) over `typ_blend_s` (1 s): cars follow the typical profile.
+* **Cap**: the prediction never runs more than `progress.max_predict_s_ahead` (0.25 of the zone) past the last
+  measured s. There it holds (v = 0): the camera waits at that framing for the car instead of running ahead of it.
+* **Timeout**: `director.lost_timeout_s` = 3 s (was 1.5; `bench_hand` 4.5). `progress.finish_after_s` and
+  `max_prediction_s` are raised to match automatically. The `stopped` rule is not evaluated on predicted cycles.
+* **Zoom**: after `director.loosen_after_s` (0.5 s) of dropout the zoom opens gradually, up to `loosen_max` (30 %
+  of the zoom-in) wider at `lost_timeout_s`, so a car that reappears off the prediction is still in the picture; it
+  closes again over `loosen_restore_s` (1 s) once the car is seen. Pan/tilt control is unchanged.
+* **Re-acquisition**: a detection near the prediction re-attaches to the followed car. Under the same tracker id
+  this is the projection window (widened by `window_sigmas` x the prediction's s_std, as before). ByteTrack often
+  gives a reappearing car a NEW id (the lost track's IoU match fails after a long gap or when the car moved
+  differently than its pixel Kalman expected): a new track born during the dropout, inside the gate (within
+  `window_sigmas` x s_std of the prediction, clamped to `reacquire_gate_s`..`reacquire_gate_max_s`, or anywhere
+  between the last measured s and the prediction) and not going backwards, is adopted; the followed track keeps
+  its filter and takes the new id. ByteTrack doesn't report a new track at all until its second detection, so a
+  lone raw detection in the gate that matches no tracker box updates the followed car too. Tracks that existed
+  before the dropout are other cars and are never adopted. Each re-acquisition after a gap of > 0.25 s is an
+  event `reacquired` (`dropout_s`, `how`: `same_id` / `new_id` / `raw_detection`, `old_id`) in the control log and
+  on the page ("reencontrado após X.X s sem detecção").
+* **Page**: while predicting, the followed car's line reads "prevendo (sem detecção) X.X s", plus "aguardando no
+  limite" at the cap and the zoom opening. The control log's track entries have `held`, the command has `zoom_extra`.
+
+Risk accepted: a different car that appears for the first time inside the gate during a dropout is adopted as the
+followed one (the camera would then follow it; it is still a car in the zone).
 
 ### Diagnosing a wrong direction from a run
 

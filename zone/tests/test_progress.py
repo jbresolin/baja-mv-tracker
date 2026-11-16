@@ -139,10 +139,15 @@ def test_prediction_rides_the_learned_profile():
     pt = ProgressTracker(path, ProgressSettings(), prof)
     drive(pt, 1, 360, 320, 0.0, 0.5)               # 320 px/s = 0.4 /s, ends near s = 0.4
     tp = pt.tracks[1]
-    s_pred, v_pred, _, _ = pt.predict_s_v(tp, 1.5)  # one second with no detection
-    # constant speed would put it at ~0.8; riding the profile it slows down past 0.5
-    assert v_pred == pytest.approx(0.1, abs=0.03)
-    assert 0.5 < s_pred < 0.65
+    p = pt.prediction(tp, 1.5)                      # one second with no detection
+    # constant speed would put it at ~0.8; riding the profile (the speed blends from the last measured 0.4 to the
+    # typical speed over typ_blend_s = 1 s) it slows down past 0.5
+    assert p.v_free == pytest.approx(0.1, abs=0.03)
+    assert 0.5 < p.s_free < 0.7
+    # what the director / controller get is also capped at 0.25 past the last measured s (~0.4): held there
+    s_pred, v_pred, _, _ = pt.predict_s_v(tp, 1.5)
+    assert s_pred <= tp.filt.s + 0.25 + 1e-9
+    assert p.held == (p.s_free > tp.filt.s + 0.25)
 
 
 # ------------------------------------------------------------------------------------------------ speed profile

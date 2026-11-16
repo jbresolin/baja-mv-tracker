@@ -206,6 +206,12 @@ function renderPoints(z, t) {
   });
 }
 
+// a "reacquired" event (zone/director.py): the followed car was seen again after a dropout
+function reacquiredText(e) {
+  const how = { same_id: "mesmo id", new_id: `novo id (era ${e.old_id})`, raw_detection: "detecção avulsa" }[e.how] || e.how;
+  return `reencontrado após ${Number(e.dropout_s).toFixed(1)} s sem detecção (${how})`;
+}
+
 // ------------------------------------------------------------------ state
 function kv(el, rows) {
   el.innerHTML = rows.map(([k, v, cls]) => `<div>${k}</div><div class="${cls || ""}">${v}</div>`).join("");
@@ -220,7 +226,12 @@ function render(s) {
   $("#subState").textContent = d.sub ? ({ waiting: "aguardando carro", tracking: "seguindo",
                                            returning: "voltando à entrada" }[d.sub] || d.sub) : "";
   const L = s.runtime.locked;
-  $("#locked").textContent = L ? `carro ${L.id}  s=${L.s.toFixed(2)}  v=${L.v.toFixed(2)}/s${L.predicted ? " (previsto)" : ""}` : "";
+  // while the car isn't detected its position is predicted (zone/progress.py): say for how long, whether the
+  // prediction is holding at its cap (the camera waits there), and how much the zoom was opened meanwhile
+  const pred = L && L.predicted ? `  prevendo (sem detecção) ${(L.age || 0).toFixed(1)} s` +
+    (L.held ? ", aguardando no limite" : "") + (L.zoom_extra > 0 ? `, zoom +${Math.round(L.zoom_extra * 100)}% aberto` : "") : "";
+  $("#locked").textContent = L ? `carro ${L.id}  s=${L.s.toFixed(2)}  v=${L.v.toFixed(2)}/s${pred}` : "";
+  $("#locked").className = L && L.predicted ? "warn" : "";
   const ld = d.last_drop, ldEl = $("#lastDrop");
   ldEl.textContent = ld ? `último: ${dropText(ld.reason)} (s=${ld.s === null ? "?" : ld.s.toFixed(2)}, seguido ${ld.held_s} s)` : "";
   ldEl.className = ld && !(DROP_REASONS[ld.reason] || [0, false])[1] ? "bad" : "";
@@ -286,6 +297,7 @@ function render(s) {
     `<div class="${e.event === "release" && e.reason !== "exit" || e.type === "direction_mismatch" || e.type === "divergence" ? "bad" : ""}">${e.wall_iso} ${e.event || e.type} ${e.event === "release" ? dropText(e.reason) : (e.reason || e.why || "")} ${e.track_id !== undefined ? "carro " + e.track_id : ""}
      ${e.s !== undefined && e.s !== null ? "s=" + e.s : ""} ${e.held_s !== undefined ? "após " + e.held_s + " s" : ""}
      ${e.type === "divergence" ? `gap pan ${e.gap_pan} tilt ${e.gap_tilt}` : ""}
+     ${e.event === "reacquired" ? reacquiredText(e) : ""}
      ${e.new ? "→ " + e.new : ""} ${e.msg || ""}</div>`).join("");
 }
 

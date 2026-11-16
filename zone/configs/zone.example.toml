@@ -97,9 +97,23 @@ window_ahead_px = 400.0           # ... and ahead of it
 window_sigmas = 3.0               # after a dropout, the window is at least +- this many standard deviations of the
                                   # predicted s (so a car that braked while unseen is still found)
 corridor_factor = 1.0             # detections farther than factor * corridor half-width don't update the track
-finish_after_s = 3.0              # a track unseen for this long is finished (and teaches the speed profile)
+finish_after_s = 3.0              # a track unseen for this long is finished (and teaches the speed profile); raised
+                                  # automatically to director.lost_timeout_s + 0.5 (the followed car must outlive it)
 profile_min_span = 0.3            # ... if it covered at least this much s
-max_prediction_s = 3.0            # cap on predicting a lost car ahead
+max_prediction_s = 3.0            # cap (seconds) on predicting a lost car ahead; at least director.lost_timeout_s
+# Dropouts (no detection for a while: dust, a car in front, a few bad frames). The prediction keeps the speed FROZEN at
+# the last measured value (clamped to speed_band x the car's mean speed over its last speed_band_window_s); once the
+# speed profile has learned, it blends to the typical speed v_typ(s) over typ_blend_s. It never runs more than
+# max_predict_s_ahead past the last measured s: there it holds (v = 0) and the camera waits for the car.
+max_predict_s_ahead = 0.25        # in s (zone fraction); 0 = no cap
+typ_blend_s = 1.0                 # seconds of dropout to go from the frozen speed to v_typ(s) (profile learned only)
+speed_band = [0.5, 1.5]           # clamp of the frozen speed, x the mean speed over ...
+speed_band_window_s = 1.0         # ... the last this-many seconds of detections
+reacquire_gate_s = 0.10           # the car reappearing under a NEW tracker id (or as a lone raw detection the tracker
+reacquire_gate_max_s = 0.35       # doesn't report yet) is re-attached to the followed car when it is within
+                                  # window_sigmas x s_std of the prediction (at least gate_s, at most gate_max_s, in
+                                  # s) or between the last measured s and the prediction. Only tracks born during the
+                                  # dropout: a car that was already there is another car
 ground_window_s = 1.0             # the ground point's image speed (px/s, director.lock_px_s, "gpx" in the log) is
                                   # measured over this
 
@@ -146,7 +160,13 @@ s_lock = -0.08                    # lock the first car that reaches this s (= -z
 lock_window = 0.15                # ... but not one already beyond s_lock + lock_window (too late to catch) ...
 v_min = 0.05                      # ... moving forward at least this fast (s/s) (or see lock_px_s) ...
 min_updates = 3                   # ... with at least this many detections
-lost_timeout_s = 1.5              # drop the car after this long without a detection
+lost_timeout_s = 3.0              # drop the car after this long without a detection (1.5 until 2026-11-15: the
+                                  # bench lost a car that came back at 2.7 s). Meanwhile it is predicted (see
+                                  # [progress] max_predict_s_ahead) and re-acquired if it reappears near the prediction
+loosen_after_s = 0.5              # a dropout longer than this loosens the zoom gradually ...
+loosen_max = 0.3                  # ... up to 30 % wider (of the zoom-in) at lost_timeout_s, so a car that reappears
+                                  # off the prediction is still in the frame. 0 = off
+loosen_restore_s = 1.0            # ... and back to normal over this long once the car is seen again
 lock_px_s = 15.0                  # ... or forward and its ground point moving >= this many px/s in the image (an
                                   # entry the spotter sees head-on, where s grows slowly). 0 = v_min only. Still,
                                   # don't put the entry on a head-on stretch: the approach speed feeds the camera
@@ -237,7 +257,7 @@ k_quant = 0.0
 lock_window = 0.3                 # the picture may enter the lock window between two detections
 v_min = 0.02                      # a slow hand still locks...
 lock_px_s = 8.0                   # ... or a hand that visibly moves it forward
-lost_timeout_s = 3.0              # the detector misses a blurred / covered picture for a while (race: 1.5)
+lost_timeout_s = 4.5              # the detector misses a blurred / covered picture for a while (race: 3)
 stopped_timeout_s = 6.0           # the hand pauses (race: 3)
 stopped_px_s = 4.0
 off_corridor_frames = 10          # the bottom edge of a hand-held picture wanders off the taught line (race: 3)

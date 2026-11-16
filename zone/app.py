@@ -354,7 +354,8 @@ class ZoneApp:
         lines = ["%s%s" % (st["mode"], (" / " + st["sub"]) if st["sub"] else "")]
         if st["locked_id"] is not None and st["locked_id"] in res.views:
             v = res.views[st["locked_id"]]
-            lines.append("carro %d  s=%.2f  v=%.2f/s" % (v.track_id, v.s, v.v))
+            lines.append("carro %d  s=%.2f  v=%.2f/s" % (v.track_id, v.s, v.v)
+                         + ("  prevendo %.1f s" % v.since_update_s if v.predicted else ""))
         draw.draw_status(img, lines)
         mw = int(self.cfg["web"]["frame_max_width"])
         if mw and img.shape[1] > mw:

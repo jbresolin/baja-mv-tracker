@@ -243,6 +243,7 @@ class CycleCommand:
     diverged: bool = False               # the gap was over the limit for more than divergence_cycles cycles
     wrong_direction: Optional[dict] = None  # Branch A: the camera turns against the sign we believe in (see
                                             # Controller._check_direction): {"axis", "sign", "observed", "cycles"}
+    zoom_extra: float = 0.0              # the director's dropout loosening applied to the zoom this cycle
 
     def to_log(self):
         pn = self.pose_now
@@ -259,7 +260,8 @@ class CycleCommand:
                                  source=pn.source, trusted=pn.trusted), ok=self.result_ok,
                     gap=dict(pan=None if self.gap_pan is None else round(self.gap_pan, 1),
                              tilt=None if self.gap_tilt is None else round(self.gap_tilt, 1)),
-                    diverged=self.diverged, wrong_direction=self.wrong_direction)
+                    diverged=self.diverged, wrong_direction=self.wrong_direction,
+                    zoom_extra=round(self.zoom_extra, 3))
 
 
 class Controller:
@@ -289,13 +291,18 @@ class Controller:
     def set_curve(self, curve: PoseCurve):
         self.curve = curve
 
-    def zoom_for(self, taught_zoom):
+    def zoom_for(self, taught_zoom, extra=0.0):
+        """Raw zoom to send for a taught zoom: `zoom_loosen` of the way from the widest angle to the taught zoom, and
+        `extra` (0..1, the director's dropout loosening) less of that again: extra = 0.3 frames 30 % wider."""
         c = self.cfg
-        z = c.zoom_wide + c.zoom_loosen * (taught_zoom - c.zoom_wide)
+        f = c.zoom_loosen * (1.0 - min(max(float(extra), 0.0), 1.0))
+        z = c.zoom_wide + f * (taught_zoom - c.zoom_wide)
         return int(round(min(max(z, c.zoom_limits[0]), c.zoom_limits[1])))
 
     # ----------------------------------------------------------------------------------- one cycle of following
-    def follow(self, s, v, t_grab) -> CycleCommand:
+    def follow(self, s, v, t_grab, zoom_extra=0.0) -> CycleCommand:
+        """One cycle of following the car at (s, v). `zoom_extra` (director, during a detection dropout) only widens
+        the zoom; pan and tilt are computed exactly the same way with or without it."""
         c = self.cfg
         now = self.clock.monotonic()
         if c.branch == "A":
@@ -348,9 +355,10 @@ class Controller:
         self.pan_step = self.pan_map.next_step(c.pan_sign * (want_pan + q_pan), self.pan_step)
         self.tilt_step = self.tilt_map.next_step(c.tilt_sign * (want_tilt + q_tilt), self.tilt_step)
         ok = self._send_velocity()
-        zoom_sent = self._maybe_zoom(target.zoom, now)
+        zoom_sent = self._maybe_zoom(target.zoom, now, zoom_extra)
         return CycleCommand(s, v, s_ahead, lookahead, target, ff_pan, ff_tilt, fb_pan, fb_tilt, self.pan_step,
-                            self.tilt_step, zoom_sent, pn, ok, gap_pan, gap_tilt, diverged, wrong_direction)
+                            self.tilt_step, zoom_sent, pn, ok, gap_pan, gap_tilt, diverged, wrong_direction,
+                            float(zoom_extra))
 
     def _check_divergence(self, gap_pan, gap_tilt):
         """Divergence guard (mostly for Branch B, where nothing else notices). The camera's estimated position (dead
@@ -416,11 +424,11 @@ class Controller:
         self._note_direction()
         return ok
 
-    def _maybe_zoom(self, taught_zoom, now):
+    def _maybe_zoom(self, taught_zoom, now, extra=0.0):
         c = self.cfg
         if not c.zoom_enabled or not c.zoom_direct_supported:
             return None          # off, or the camera can't do zoom_direct: the presets' own zoom is all we get
-        z = self.zoom_for(taught_zoom)
+        z = self.zoom_for(taught_zoom, extra)
         if now - self.t_last_zoom < c.zoom_min_interval_s:
             return None
         if self.last_zoom_sent is not None and abs(z - self.last_zoom_sent) <= c.zoom_threshold:

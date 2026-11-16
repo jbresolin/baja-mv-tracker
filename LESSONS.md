@@ -2050,3 +2050,34 @@ against the fake camera, taught through the page API, `zone/tests/test_direction
   the bench and set `director.settle_s` above it. (2) A camera that reports pan in an unsigned frame crossing
   0x7FFF/0x8000 would make keyframes jump by 65536 after the signed decoding; the SMTAV's values (~0x01A5, 1070) look
   signed around home, so not a concern unless keyframes show huge values.
+
+## Session 3: tolerant to detection loss (zone-lenient-loss, 2026-11-15)
+
+Bench evidence (hand-moved printed picture, control log): after the lock the picture was detected every frame for
+1.0 s, then almost never; the track was predicted forward with its last velocity, which had just jumped from ~0.09
+to ~0.2 s/s, for 1.5 s; the camera followed the prediction far ahead; the car was released as `lost`
+(`lost_timeout_s` 1.5). One detection at 1.2 s was not used, and detections came back at 2.7 s, just too late.
+
+* **Where the speed "grew while predicting".** The Kalman filter itself never changes v without a measurement (its
+  constant-velocity prediction keeps v). The old `predict_s_v` did: once the profile had learned, it rode v_typ(s) x
+  the car's speed ratio, so v followed the profile (and the ratio could be up to 2.5). Plus the last updates can
+  carry a noisy jump. Now the speed is frozen at the last measured value, clamped to 0.5-1.5 x the mean speed over the
+  last second of detections (line fit on the raw s), and blends to v_typ(s) over `typ_blend_s` once learned. The
+  per-car `ratio` is gone.
+* **Cap**: the prediction holds at `max_predict_s_ahead` (0.25) past the last measured s, with v = 0 (no
+  feed-forward: the camera waits). The search window for the same id still uses the uncapped prediction.
+* **Why the 1.2 s detection was lost**: ByteTrack (`rt/tracker.py`) reports a new track only from its second
+  detection (an unconfirmed track is removed when the next frame doesn't match it), and a lost track is re-found only
+  by IoU with its pixel-Kalman prediction. A lone detection away from that is invisible to the zone. Now the runtime
+  passes the frame's raw detections (score >= ByteTrack's high threshold) to progress, which attaches one in the gate
+  that overlaps no tracker box. A new ByteTrack id born during the dropout, in the gate, is adopted by the followed
+  track (`reacquired`, `how=new_id`). Tracks older than the dropout are never adopted.
+* **Timeout** 1.5 -> 3 s (`bench_hand` 4.5); progress `finish_after_s` / `max_prediction_s` raised to match (else
+  a 4.5 s timeout would have released as `gone` at 3 s). Zoom opens up to 30 % during a long dropout and closes over 1 s.
+  The stopped rule ignores predicted cycles (a held prediction has v = 0 by design).
+* After a dropout, the next update starts from the dropout prediction (`SVFilter.reseed`), not from the filter's own
+  constant-speed guess, so the innovation is measured against what was actually predicted.
+* Synthetic checks (`zone/tests/test_dropout.py`): 2.5 s dropouts at 0.08 and 0.2 s/s are followed to the exit (old
+  rule: `lost` at 1.5 s); the bench sequence above (lone detection, then a new id at +1.7 s) is followed to the exit;
+  a car really gone is released `lost` 3.0-3.1 s after its last detection. Not yet checked on the real bench.
+* `test_stopped_rule`'s hand-held dropout case was 2 s (now kept by the race rules); it is 3.5 s now.

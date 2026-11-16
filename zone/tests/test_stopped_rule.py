@@ -157,7 +157,8 @@ def test_a_hand_moved_picture_trips_the_race_rules_but_not_the_bench_hand_profil
     # What drops a picture moved by hand first, with the race defaults, and that `--set profile=bench_hand` keeps it
     # to the exit. Each case is one way a hand differs from a car.
     cases = [(dict(wobble_px=80), "off_corridor"),      # the bottom edge wanders 80 px off the line (corridor 60)
-             (dict(dropout=(3, 5)), "lost"),            # 2 s without a detection (race limit 1.5 s)
+             (dict(dropout=(1.5, 5)), "lost"),          # 3.5 s without a detection (race limit 3 s, 1.5 s
+                                                         # before 2026-11-15; bench_hand 4.5 s)
              (dict(pause_s=3.5), "stopped")]            # the hand stops for 3.5 s (race limit 3 s)
     for kwargs, race_reason in cases:
         prog, director, _ = make(length_px=600)

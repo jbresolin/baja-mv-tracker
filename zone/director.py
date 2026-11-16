@@ -13,7 +13,8 @@ Modes (chosen on the page):
       is deep in the zone when the camera gets back to the entry can't be caught from there: it's skipped).
       Other cars are ignored (overtakes too, for this test).
       The car is let go when it reaches s >= s_exit (normally 1), or dropped when:
-        * lost: no detection for longer than `lost_timeout_s` (meanwhile it's predicted ahead on the speed profile),
+        * lost: no detection for longer than `lost_timeout_s` (meanwhile it's predicted ahead: zone/progress.py,
+          frozen speed, typical profile, held at most `progress.max_predict_s_ahead` past the last measured s),
         * stopped: for longer than `stopped_timeout_s`, BOTH slow along the path (|v| below `stopped_ratio` x the
           learned typical speed at its s, or below `stopped_v` before the profile has learned) AND still in the
           image (its ground point moved less than `stopped_px_s` pixels per second over that time). `s` is arc length in the image, so where the
@@ -24,10 +25,16 @@ Modes (chosen on the page):
         * diverged: the camera stayed too far from the target for too many cycles (the controller's divergence
           guard; the runtime calls `drop()`).
       Either way: back to `returning`.
+      During a dropout (no detection) longer than `loosen_after_s`, the zoom is loosened gradually (up to
+      `loosen_max` wider by `lost_timeout_s`: `Decision.zoom_extra`), so a car that reappears off the prediction is
+      still in the picture; it comes back over `loosen_restore_s` once the car is seen again. When the car reappears,
+      `reacquired()` logs it (with the dropout's length) and, if the tracker gave it a new id that progress
+      re-attached to the followed track, follows the new id.
 
 The director never talks to the PTZ itself. `step()` returns a `Decision` and the runtime acts on it, which keeps
 this module easy to test: feed it fake tracks and a time, check the decision.
 """
+import math
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional
 
@@ -51,7 +58,10 @@ class DirectorSettings:
                                     # zone when the PTZ gets back to the entry is skipped: the camera couldn't catch it)
     v_min: float = 0.05             # s per second; a car crossing the zone in 20 s has 0.05
     min_updates: int = 3
-    lost_timeout_s: float = 1.5
+    lost_timeout_s: float = 3.0     # race: dust, another car in front, a few bad frames (was 1.5 before 2026-11-15)
+    loosen_after_s: float = 0.5     # a dropout longer than this starts loosening the zoom ...
+    loosen_max: float = 0.3         # ... up to this much wider (fraction of the zoom-in) at lost_timeout_s ...
+    loosen_restore_s: float = 1.0   # ... and back to normal over this long once the car is seen again
     stopped_v: float = 0.02         # "slow" before the speed profile has learned anything (s per second)
     stopped_timeout_s: float = 3.0
     stopped_ratio: float = 0.15     # once learned: "slow" = below this fraction of the typical speed at that s
@@ -68,6 +78,7 @@ class Decision:
     action: str
     track: Optional[TrackView] = None
     reason: str = ""
+    zoom_extra: float = 0.0         # FOLLOW: frame this much wider than usual (0..loosen_max), see Controller.follow
 
 
 class Director:
@@ -84,6 +95,8 @@ class Director:
         self.last_drop_reason = ""
         self.last_drop = None                 # {"reason", "s", "held_s", "t"} of the last release (for the page)
         self.passes_followed = 0
+        self.zoom_extra = 0.0                 # current extra zoom-out (dropout loosening), 0 = normal framing
+        self._t_zoom = None                   # time of the last zoom_extra update
         self._pending: Optional[str] = None   # an action requested by set_mode, delivered on the next step
 
     # ------------------------------------------------------------------------------------------- mode changes
@@ -113,7 +126,7 @@ class Director:
     def state(self):
         return dict(mode=self.mode, sub=self.sub if self.mode == AUTO else None, locked_id=self.locked_id,
                     last_drop_reason=self.last_drop_reason, last_drop=self.last_drop,
-                    passes_followed=self.passes_followed)
+                    passes_followed=self.passes_followed, zoom_extra=round(self.zoom_extra, 3))
 
     # ------------------------------------------------------------------------------------------- one cycle
     def step(self, t, tracks: Dict[int, TrackView]) -> Decision:
@@ -142,7 +155,36 @@ class Director:
         reason = self._drop_reason(t, tr)
         if reason:
             return self._release(t, reason, tr)
-        return Decision(FOLLOW, tr)
+        return Decision(FOLLOW, tr, zoom_extra=self._loosen(t, tr))
+
+    def reacquired(self, t, ev):
+        """Progress found the followed car again after a dropout (ev: old_id, new_id, dropout_s, how, s; see
+        ProgressTracker._reacquire). With a new id (ByteTrack started a new track for the reappearing car and progress
+        re-attached it), the new id is followed from now on. Logged as a `reacquired` event either way. Ignored unless
+        it is the car being followed right now."""
+        if self.mode != AUTO or self.sub != TRACKING or ev.get("old_id") != self.locked_id:
+            return
+        self.locked_id = ev.get("new_id", self.locked_id)
+        self._event(t, "reacquired", track_id=self.locked_id, old_id=ev.get("old_id"),
+                    dropout_s=ev.get("dropout_s"), how=ev.get("how"), s=ev.get("s"))
+
+    def _loosen(self, t, tr: TrackView):
+        """Extra zoom-out for this cycle. Grows linearly from 0 at `loosen_after_s` of dropout to `loosen_max` at
+        `lost_timeout_s`; once the car is seen again it goes back down at loosen_max per `loosen_restore_s` (never a
+        jump: the zoom is an absolute position, a jump would be a visible snap)."""
+        c = self.cfg
+        span = max(1e-6, c.lost_timeout_s - c.loosen_after_s)
+        want = 0.0
+        if c.loosen_max > 0 and tr.since_update_s > c.loosen_after_s:
+            want = c.loosen_max * min(1.0, (tr.since_update_s - c.loosen_after_s) / span)
+        dt = 0.0 if self._t_zoom is None else max(0.0, t - self._t_zoom)
+        self._t_zoom = t
+        if want >= self.zoom_extra:
+            self.zoom_extra = want
+        else:
+            rate = c.loosen_max / c.loosen_restore_s if c.loosen_restore_s > 0 else math.inf
+            self.zoom_extra = max(want, self.zoom_extra - rate * dt)
+        return self.zoom_extra
 
     def drop(self, t, reason, tr: Optional[TrackView] = None) -> Optional[Decision]:
         """Let the locked car go for a reason found outside the director (the controller's divergence guard).
@@ -187,6 +229,10 @@ class Director:
             return "lost"
         if tr.off_corridor_frames > c.off_corridor_frames:
             return "off_corridor"
+        if tr.predicted:
+            # no detection this cycle: a prediction says nothing about stopping (and one held at the cap has v = 0
+            # by design). The stopped timer neither starts nor resets; `lost` covers a car that never comes back.
+            return ""
         if self.is_slow(tr):
             if self.stopped_since is None:
                 self.stopped_since, self.stopped_anchor = t, tr.ground
@@ -224,6 +270,7 @@ class Director:
 
     def _unlock(self):
         self.locked_id = self.lock_t = self.stopped_since = None
+        self.zoom_extra, self._t_zoom = 0.0, None
 
     def _event(self, t, kind, **kw):
         self.on_event(dict(type="director", event=kind, t=round(t, 3), mode=self.mode,
