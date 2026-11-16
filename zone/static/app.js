@@ -158,8 +158,23 @@ $("#save").addEventListener("click", async () => {
 
 async function act(url, index, confirmText) {
   if (confirmText && !confirm(confirmText)) return;
-  await post(url, { index, zoom: typedZoom() });
+  const r = await post(url, { index, zoom: typedZoom() });
   poll();
+  return r;
+}
+
+// "testar": the program recalls the preset, waits for the camera to stop and compares the pose it reports with the
+// stored one. A difference means the keyframe was stored with a bad pose: shown in red.
+async function testKeyframe(index) {
+  msg("testando: esperando a câmera chegar ao preset...");
+  const r = await act("/api/teach/goto", index);
+  const c = r && r.result;
+  if (c) msg(c.message, c.checked && !c.ok);
+}
+
+// escape text from the program before putting it in HTML
+function esc(t) {
+  return String(t).replace(/[&<>"]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[ch]));
 }
 
 // cameras without a zoom inquiry: the operator types the zoom of each keyframe (null = not typed)
@@ -176,7 +191,18 @@ function renderPoints(z, t) {
     if (t.selected === p.i) tr.className = "sel";
     const kf = p.keyframe;
     const kind = kf ? `keyframe P${kf.preset}${kf.approximate ? " ~" : ""}` : "caminho";
-    tr.innerHTML = `<td>${p.i}</td><td title="${kf ? `pan ${kf.pan} tilt ${kf.tilt} zoom ${kf.zoom}` : ""}">${kind}</td>
+    // the keyframe sanity check (zone/keyframe_check.py) and the last "testar": a visible marker with the reason
+    const warns = (kf && p.warnings) || [];
+    const test = kf && p.test && p.test.checked && !p.test.ok ? p.test : null;
+    let notes = "";
+    if (warns.length) {
+      notes += `<div class="bad" style="font-weight:400">⚠ suspeito: ${warns.map((w) => esc(w.text)).join("; ")}
+        — confira com "testar"; se estiver errado, enquadre de novo e clique "re-ensinar"</div>`;
+    }
+    if (test) notes += `<div class="bad" style="font-weight:400">⚠ ${esc(test.message)}</div>`;
+    if (kf && kf.confirmed) notes += `<div class="good" style="font-weight:400">conferido pelo operador</div>`;
+    tr.innerHTML = `<td>${p.i}</td><td title="${kf ? `pan ${kf.pan} tilt ${kf.tilt} zoom ${kf.zoom}` : ""}">${warns.length || test ? "⚠ " : ""}${kind}
+      ${kf ? `<div style="font-size:11px;color:var(--dim)">pan ${kf.pan} tilt ${kf.tilt} zoom ${kf.zoom}</div>` : ""}${notes}</td>
       <td>${Math.round(p.x)},${Math.round(p.y)}</td><td></td>`;
     const cell = tr.lastElementChild;
     const add = (label, fn, title) => {
@@ -186,10 +212,16 @@ function renderPoints(z, t) {
     add("↑", () => post("/api/teach/reorder", { index: p.i, delta: -1 }).then(poll), "subir");
     add("↓", () => post("/api/teach/reorder", { index: p.i, delta: 1 }).then(poll), "descer");
     if (kf) {
-      add("testar", () => act("/api/teach/goto", p.i), "chamar o preset deste keyframe");
+      add("testar", () => testKeyframe(p.i), "chamar o preset deste keyframe e conferir a posição");
       add("re-ensinar", () => act("/api/teach/reteach", p.i, "Gravar o enquadramento atual neste keyframe?"),
           "gravar o enquadramento atual");
       add("→caminho", () => act("/api/teach/unkeyframe", p.i), "virar ponto de caminho");
+      if (warns.length || kf.confirmed) {
+        add(kf.confirmed ? "desfazer conferido" : "conferido", async () => {
+          if (!kf.confirmed && !confirm(`Você testou o P${kf.preset} e a posição está certa? Os avisos dele somem.`)) return;
+          await post("/api/teach/confirm_keyframe", { index: p.i, confirmed: !kf.confirmed }); poll();
+        }, "a posição está certa (ex.: a pista volta mesmo): esconder os avisos deste keyframe");
+      }
       if (t.zoom_unknown || (kf.pose_source || "").includes("zoom_manual")) {
         add("zoom", async () => {
           const v = prompt(`Zoom do keyframe P${kf.preset} (${t.zoom_limits[0]}..${t.zoom_limits[1]})`, kf.zoom);
@@ -249,6 +281,9 @@ function render(s) {
   $("#zoomWarn").style.display = t.zoom_unknown ? "flex" : "none";
   $("#kfZoom").min = t.zoom_limits[0]; $("#kfZoom").max = t.zoom_limits[1];
   renderPoints(z, t);
+  const kw = z.keyframe_warnings || [];
+  $("#kfWarn").style.display = kw.length ? "" : "none";
+  $("#kfWarn").innerHTML = kw.length ? "⚠ Keyframes suspeitos (re-ensine ou marque 'conferido'):<br>" + kw.map(esc).join("<br>") : "";
 
   const h = s.health;
   const gb = h.disk_free_gb;
@@ -270,6 +305,9 @@ function render(s) {
     ["sinal pan / tilt", h.ptz_signs ? ["pan", "tilt"].map((a) => `${a} ${h.ptz_signs[a].sign > 0 ? "+1" : "-1"} (${SIGN_HOW[h.ptz_signs[a].how] || h.ptz_signs[a].how})`).join(" · ")
                          + (h.sign_warnings && h.sign_warnings.length ? " · " + h.sign_warnings.join(" · ") : "") : "–",
      h.sign_warnings && h.sign_warnings.length ? "bad" : ""],
+    ["keyframes", h.keyframe_warnings && h.keyframe_warnings.length
+                  ? `${h.keyframe_warnings.length} suspeito(s): ` + h.keyframe_warnings.map(esc).join(" · ") : "ok",
+     h.keyframe_warnings && h.keyframe_warnings.length ? "bad" : ""],
     ["relógio (NTP)", h.ntp_server ? (h.ntp_offset_s === null ? "sem resposta de " + h.ntp_server
                                      : `${h.ntp_offset_s >= 0 ? "+" : ""}${h.ntp_offset_s} s vs ${h.ntp_server}`)
                                   : (h.clock_warnings.length ? h.clock_warnings.join(" ") : "não configurado"),
