@@ -36,8 +36,18 @@ class PoseSource:
         self.lock = threading.Lock()
 
     def read(self):
-        """-> (pan, tilt, zoom) or None when the pose can't be known right now."""
+        """-> (pan, tilt, zoom) or None when the pose can't be known right now. One quick look (the page's
+        status polls it)."""
         raise NotImplementedError
+
+    def capture(self):
+        """The pose to STORE in a keyframe. By default the same as `read()`; `InquirySource` is more careful."""
+        return self.read()
+
+    def read_after_recall(self, max_wait_s=8.0):
+        """After 'testar' recalled a preset: wait for the camera to stop, then -> its pose as the camera reports it.
+        None when this source can't ask the camera (its pose is known by construction, nothing to compare)."""
+        return None
 
     def jog(self, pan_step, tilt_step, zoom_step):
         """Press-and-hold jog (the page repeats it every ~150 ms while a button is held; the TTL stops the camera
@@ -128,13 +138,105 @@ class InquirySource(PoseSource):
 
     def read(self):
         """-> (pan, tilt, zoom), with zoom None when the camera doesn't answer the zoom inquiry (some don't). The
-        teach session then asks the operator for the zoom instead of silently storing a made-up value."""
+        teach session then asks the operator for the zoom instead of silently storing a made-up value.
+
+        One single reading: fine for showing the pose on the page, NOT for storing a keyframe (see `capture`)."""
         pt = self.ptz.inquire_pan_tilt()
         if pt is None:
             return None
         z = self.ptz.inquire_zoom()
         self.zoom_readable = z is not None
         return int(pt[0]), int(pt[1]), int(z) if z is not None else None
+
+    # --- careful reading for a keyframe ----------------------------------------------------------------------------
+    # Why so careful (2026-11-15 bench, the real SMTAV PTZ): ONE reading was stored per keyframe, and one keyframe
+    # came out as pan 1764 / zoom 0 while its neighbours were pan 1199..1636 / zoom 6772..9399. A single answer can
+    # be wrong: the camera may still be coasting after the jog, a late answer to an earlier question can arrive
+    # first, and that camera sometimes sends a 7-byte `90 50 00 00 00 00 FF` on its own that looks like "zoom 0".
+    # The controller then faithfully drove the camera to that bad pose ("way too far and too fast").
+    # So now: stop the camera, wait a moment, read several times, and only keep a pose that the camera reported the
+    # same way at least 3 times in a row. Otherwise refuse the keyframe and let the operator try again.
+    SETTLE_S = 0.3              # after the stop: the SMTAV coasts for up to ~0.3 s (LESSONS.md, session 3)
+    MAX_READS = 6               # at most this many readings per keyframe...
+    READ_BUDGET_S = 2.0         # ...and no new reading started after this many seconds
+    GAP_S = 0.1                 # pause between two readings (so "the same 3 times" spans a little time)
+    AGREE_IN_A_ROW = 3          # this many readings in a row must agree
+    PAN_TILT_TOLERANCE = 2      # raw units: two readings "agree" when pan and tilt differ by at most this...
+    ZOOM_TOLERANCE = 10         # ...and the zoom by at most this
+    UNSTABLE = "a câmera não respondeu uma posição estável; tente de novo"
+
+    def capture(self):
+        """-> (pan, tilt, zoom) to store in a keyframe, zoom None when the camera never tells its zoom.
+        None when the camera answered nothing at all. Raises TeachError when it answered, but not the same way
+        AGREE_IN_A_ROW times in a row (the operator is told to try again: a doubtful pose is never stored)."""
+        with self.lock:
+            self._close_segment()             # a jog still "held" ends here (it also gives a sign vote)
+        self._stop_and_settle()
+        return self._stable_reading(max_reads=self.MAX_READS, budget_s=self.READ_BUDGET_S)
+
+    def read_after_recall(self, max_wait_s=8.0):
+        """'Testar': the preset was just recalled and the camera is travelling there. Keep reading until it reports
+        the same pose 3 times in a row (it arrived and stopped), for at most `max_wait_s`. -> pose or None."""
+        self.clock.sleep(self.SETTLE_S)
+        try:
+            return self._stable_reading(max_reads=10 ** 6, budget_s=max_wait_s, gap_s=0.25)
+        except TeachError:
+            return None                       # still moving (or answering nonsense) after max_wait_s
+
+    def _stop_and_settle(self):
+        """Make sure the camera stands still: send stop (pan/tilt) and zoom stop until the camera acknowledges both
+        (at most 3 tries; the driver itself keeps re-sending an unacknowledged stop), then wait SETTLE_S.
+        Even if the acknowledgement never comes we go on: the 3-equal-readings rule below would still catch a
+        camera that keeps moving."""
+        for _ in range(3):
+            pan_tilt_stop, zoom_stop = self.ptz.stop(), self.ptz.zoom_stop()
+            if _acknowledged(pan_tilt_stop) and _acknowledged(zoom_stop):
+                break
+        self.clock.sleep(self.SETTLE_S)
+
+    def _one_reading(self):
+        """One (pan, tilt, zoom-or-None) reading, or None when pan/tilt didn't answer. Replies that were already
+        waiting before we ask are thrown away first: they answer an earlier question, not this one."""
+        drain = getattr(self.ptz, "drain_replies", None)
+        if drain is not None:
+            drain()
+        try:
+            return self.read()
+        except Exception:  # noqa: BLE001 (a failed reading is just a missing one; the rule below decides)
+            return None
+
+    def _stable_reading(self, max_reads, budget_s, gap_s=None):
+        """Read up to `max_reads` times, starting no new reading after `budget_s` seconds, and return the last
+        reading as soon as AGREE_IN_A_ROW readings in a row agree. Raises TeachError if that never happens, or
+        returns None if the camera never answered a single time."""
+        gap_s = self.GAP_S if gap_s is None else gap_s
+        readings = []
+        give_up_at = self.clock.monotonic() + budget_s
+        while len(readings) < max_reads:
+            if readings and self.clock.monotonic() >= give_up_at:
+                break
+            readings.append(self._one_reading())
+            last_few = readings[-self.AGREE_IN_A_ROW:]
+            if len(last_few) == self.AGREE_IN_A_ROW and all(
+                    self._agree(last_few[0], other) for other in last_few[1:]):
+                # Zoom: if the camera answered the zoom at all, it answered it in these readings (they agree).
+                self.zoom_readable = last_few[-1][2] is not None
+                return last_few[-1]
+            self.clock.sleep(gap_s)
+        if all(r is None for r in readings):
+            return None                       # nothing at all: the caller says "não consegui ler a posição"
+        raise TeachError(self.UNSTABLE)
+
+    def _agree(self, a, b):
+        """Do two readings describe the same pose? A missing reading (None) agrees with nothing. A missing zoom
+        only agrees with another missing zoom (a camera that never tells its zoom)."""
+        if a is None or b is None:
+            return False
+        if abs(a[0] - b[0]) > self.PAN_TILT_TOLERANCE or abs(a[1] - b[1]) > self.PAN_TILT_TOLERANCE:
+            return False
+        if a[2] is None or b[2] is None:
+            return a[2] is None and b[2] is None
+        return abs(a[2] - b[2]) <= self.ZOOM_TOLERANCE
 
 
 class CommandedSource(PoseSource):
@@ -267,6 +369,7 @@ class TeachSession:
         self.on_change = on_change or (lambda z: None)
         self.dirty = False
         self.lock = threading.RLock()
+        self.tests = {}                  # preset -> result of the last 'testar' of that keyframe (see goto)
 
     def _changed(self):
         self.dirty = True
@@ -285,7 +388,7 @@ class TeachSession:
     def _capture_keyframe(self, preset, zoom=None):
         """Read the current pose and store it in `preset`. `zoom`: the operator's zoom value, used only when the
         camera can't tell its zoom (no zoom inquiry); then it is required, never guessed."""
-        pose = self.source.read()
+        pose = self.source.capture()
         if pose is None:
             raise TeachError("não consegui ler a posição da PTZ (modo %s)" % self.source.name)
         pan, tilt, z = pose
@@ -299,6 +402,7 @@ class TeachSession:
         r = self.ptz.preset_store(int(preset))
         if r is not None and not getattr(r, "ok", True):
             raise TeachError("a PTZ não confirmou a gravação do preset %d" % preset)
+        self.tests.pop(int(preset), None)     # an old 'testar' result was about the old pose of this preset
         return Keyframe(pan, tilt, z, int(preset), self.source.approximate, how)
 
     def add_point(self, x, y, keyframe=False, insert_at=None, zoom=None):
@@ -374,8 +478,16 @@ class TeachSession:
                 kf.pose_source += "+zoom_manual"
             self._changed()
 
+    # 'testar': how far the pose read after the recall may be from the stored one before the page warns (raw units).
+    # Generous on purpose: a preset recall lands within a few units; a wrong stored pose is hundreds off.
+    TEST_PAN_TILT_TOLERANCE = 10
+    TEST_ZOOM_TOLERANCE = 50
+
     def goto(self, i):
-        """'Testar keyframe': recall its preset so the operator can check (or re-teach) the framing."""
+        """'Testar keyframe': recall its preset so the operator can check (or re-teach) the framing. Then, when the
+        pose source can ask the camera, wait for it to stop there and compare the pose it reports with the stored
+        one: a keyframe stored with a bad pose (2026-11-15 bench) shows up right away instead of during a pass.
+        -> the check (also kept in `self.tests[preset]` for the page), see `_compare_with_stored`."""
         with self.lock:
             i = self._check_index(i)
             kf = self.zone.points[i].keyframe
@@ -383,6 +495,52 @@ class TeachSession:
                 raise TeachError("o ponto %d não é keyframe" % i)
             self.ptz.preset_recall(kf.preset)
             self.source.recalled(kf)
+            check = self._compare_with_stored(kf, self.source.read_after_recall())
+            self.tests[kf.preset] = check
+            return check
+
+    def _compare_with_stored(self, kf: Keyframe, now):
+        """-> dict(checked, ok, read, stored, message). `now`: the pose the camera reports after the recall, or None
+        (this source can't ask, or the camera didn't settle)."""
+        stored = [kf.pan, kf.tilt, kf.zoom]
+        if now is None:
+            msg = ("preset P%d chamado (esta fonte de pose não confere a posição)" % kf.preset
+                   if self.source.name != "inquiry" else
+                   "preset P%d chamado, mas a câmera não informou uma posição estável para conferir" % kf.preset)
+            return dict(checked=False, ok=None, read=None, stored=stored, message=msg)
+        differences = []
+        for name, read_value, stored_value, tolerance in (
+                ("pan", now[0], kf.pan, self.TEST_PAN_TILT_TOLERANCE),
+                ("tilt", now[1], kf.tilt, self.TEST_PAN_TILT_TOLERANCE),
+                ("zoom", now[2], kf.zoom, self.TEST_ZOOM_TOLERANCE)):
+            if read_value is None:
+                continue                      # a camera that doesn't tell its zoom: nothing to compare
+            if abs(int(read_value) - int(stored_value)) > tolerance:
+                differences.append("%s lido %d, gravado %d" % (name, read_value, stored_value))
+        if differences:
+            msg = ("ATENÇÃO P%d: a câmera parou numa posição diferente da gravada (%s). O keyframe pode ter sido "
+                   "gravado com uma posição errada: enquadre de novo e use 're-ensinar'." % (
+                       kf.preset, "; ".join(differences)))
+            return dict(checked=True, ok=False, read=list(now), stored=stored, message=msg)
+        return dict(checked=True, ok=True, read=list(now), stored=stored,
+                    message="P%d conferido: a câmera está na posição gravada" % kf.preset)
+
+    def confirm_keyframe(self, i, confirmed=True):
+        """The operator checked keyframe i ('testar') and says its pose is right even though the sanity check flags
+        it (e.g. the track really curves back): its warnings are hidden. Re-teaching it clears this."""
+        with self.lock:
+            i = self._check_index(i)
+            kf = self.zone.points[i].keyframe
+            if kf is None:
+                raise TeachError("o ponto %d não é keyframe" % i)
+            kf.confirmed = bool(confirmed)
+            self._changed()
+
+    def keyframe_warnings(self, zoom_max=None):
+        """The sanity check of all keyframes (zone/keyframe_check.py): {point index: [warning, ...]}."""
+        from zone.keyframe_check import check_keyframes
+        with self.lock:
+            return check_keyframes(self.zone.points, zoom_max=zoom_max)
 
     def set_corridor(self, half_width_px):
         with self.lock:
@@ -408,6 +566,11 @@ class TeachSession:
 
 def _sgn(x):
     return (x > 0) - (x < 0)
+
+
+def _acknowledged(result):
+    """Did the camera accept this command? A driver without results (returns None) counts as yes."""
+    return result is None or bool(getattr(result, "ok", True))
 
 
 def _zoom_value(zoom):

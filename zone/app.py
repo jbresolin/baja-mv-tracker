@@ -103,6 +103,7 @@ class ZoneApp:
         self.health = dict(disk_free_gb=None, ntp_offset_s=None, ntp_server=None, clock_warnings=[],
                            ptz_reachable=None, ptz_reachable_how=None, ptz_probe_wall=None)
         self._probe_answered_once = False    # has this camera ever answered the health probe?
+        self._logged_keyframe_warnings = None    # the keyframe warnings last written to the log (logged on change)
         self.stop_ev = threading.Event()
         self.exit_code = 0
         self._log("zone app start: branch %s (%s), pose source %s, pan_sign %+d (%s), tilt_sign %+d (%s), zone %s "
@@ -113,6 +114,7 @@ class ZoneApp:
                       self.zone_path, len(zone.points)))
         for w in self.runtime.sign_warnings:
             self._log("WARNING: " + w, "warning")
+        self.keyframe_warnings()                 # a zone loaded with suspicious keyframes is logged right away
 
     # ------------------------------------------------------------------------------------------- logging
     def _log(self, msg, kind="info"):
@@ -305,6 +307,26 @@ class ZoneApp:
         if self.control_log:
             self.control_log.close()
 
+    # ------------------------------------------------------------------------------------------- keyframe check
+    def keyframe_warnings(self):
+        """-> (warnings by point index, summary lines) of the keyframe sanity check (zone/keyframe_check.py).
+        Logged whenever the set of warnings changes (after a teach edit, or at start for a loaded zone)."""
+        from zone import keyframe_check
+        try:
+            zoom_max = self.settings.report.model.zoom_limits[1]
+        except Exception:  # noqa: BLE001
+            zoom_max = None
+        warnings = self.teach.keyframe_warnings(zoom_max=zoom_max)
+        lines = keyframe_check.summary(self.teach.zone.points, warnings)
+        if lines != self._logged_keyframe_warnings:
+            if lines:
+                for line in lines:
+                    self._log("WARNING: keyframe suspeito: %s (%s)" % (line, keyframe_check.HINT), "warning")
+            elif self._logged_keyframe_warnings:
+                self._log("keyframes: nenhum aviso agora")
+            self._logged_keyframe_warnings = lines
+        return warnings, lines
+
     # ------------------------------------------------------------------------------------------- page data
     def state(self):
         snap = self.runtime.snapshot()
@@ -312,11 +334,19 @@ class ZoneApp:
         path = self.runtime.path
         with self.frame_lock:
             fr = self.latest[0] if self.latest else None
+        kf_warnings, kf_warning_lines = self.keyframe_warnings()
+        points = []
+        for i, p in enumerate(z.points):
+            d = dict(i=i, **p.to_dict())
+            if p.keyframe is not None:
+                d["warnings"] = kf_warnings.get(i, [])                 # the sanity check's reasons (pt-BR)
+                d["test"] = self.teach.tests.get(p.keyframe.preset)    # the last 'testar' of this keyframe
+            points.append(d)
         return dict(
             runtime=snap, events=self.events[-15:],
             agent=(self.agent.page_state() if self.agent is not None
                    else dict(enabled=False, error=self.agent_error)),
-            zone=dict(points=[dict(i=i, **p.to_dict()) for i, p in enumerate(z.points)],
+            zone=dict(points=points, keyframe_warnings=kf_warning_lines,
                       corridor=z.corridor_half_width_px, entry_preset=z.entry_preset, dirty=self.teach.dirty,
                       file=str(self.zone_path), keyframe_s=path.keyframe_s() if path else None),
             teach=dict(pose_source=self.pose_source.name, approximate=self.pose_source.approximate,
@@ -336,6 +366,8 @@ class ZoneApp:
                         # pan/tilt sign and where it came from (zone/direction.py), + warnings ("não medido"...)
                         ptz_signs=direction.summary(self.settings) if self.settings.sign_how else None,
                         sign_warnings=list(self.runtime.sign_warnings),
+                        # keyframes that look wrong (zone/keyframe_check.py): a red line in the health panel
+                        keyframe_warnings=kf_warning_lines,
                         source=getattr(self.source, "description", ""),
                         # which car detector runs; bench=True (COCO) makes the page show a "bench detector" warning
                         detector=getattr(self.spotter, "detector_info", None)))
@@ -354,7 +386,8 @@ class ZoneApp:
         lines = ["%s%s" % (st["mode"], (" / " + st["sub"]) if st["sub"] else "")]
         if st["locked_id"] is not None and st["locked_id"] in res.views:
             v = res.views[st["locked_id"]]
-            lines.append("carro %d  s=%.2f  v=%.2f/s" % (v.track_id, v.s, v.v))
+            lines.append("carro %d  s=%.2f  v=%.2f/s" % (v.track_id, v.s, v.v)
+                         + ("  prevendo %.1f s" % v.since_update_s if v.predicted else ""))
         draw.draw_status(img, lines)
         mw = int(self.cfg["web"]["frame_max_width"])
         if mw and img.shape[1] > mw:
@@ -572,6 +605,11 @@ def create_web(zapp: ZoneApp):
     @web.post("/api/teach/goto")
     def goto(body: dict = Body(...)):
         return guard(lambda: zapp.teach.goto(int(body["index"])), teach=True, moves_ptz=True)
+
+    @web.post("/api/teach/confirm_keyframe")
+    def confirm_keyframe(body: dict = Body(...)):
+        return guard(lambda: zapp.teach.confirm_keyframe(int(body["index"]), bool(body.get("confirmed", True))),
+                     teach=True)
 
     @web.post("/api/teach/select")
     def select(body: dict = Body(...)):

@@ -46,3 +46,15 @@ def test_newer_format_is_refused(tmp_path):
     f.write_text(json.dumps({"format_version": 99, "points": []}))
     with pytest.raises(ValueError):
         zonefile.load(f)
+
+
+def test_a_confirmed_keyframe_survives_save_and_load(tmp_path):
+    # "conferido" (the operator checked a keyframe the sanity check flags) is saved with the zone; an unconfirmed
+    # keyframe writes nothing extra, so older zone files and newer ones look the same
+    from zone import zonefile
+    from zone.zonefile import Keyframe, PathPoint, Zone
+    z = Zone(points=[PathPoint(1, 2, Keyframe(10, 20, 30, 10, confirmed=True)), PathPoint(3, 4, Keyframe(1, 2, 3, 11))])
+    zonefile.save(z, tmp_path / "z.json")
+    back = zonefile.load(tmp_path / "z.json")
+    assert back.points[0].keyframe.confirmed and not back.points[1].keyframe.confirmed
+    assert "confirmed" not in z.points[1].keyframe.to_dict()

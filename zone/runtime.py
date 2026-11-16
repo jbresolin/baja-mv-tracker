@@ -277,11 +277,18 @@ class ZoneRuntime:
             if frame.img is not None:
                 self.frame_size = (frame.img.shape[1], frame.img.shape[0])
             n_dets, det_ms = 0, 0.0
+            frame_had_detection = tracker_out is None    # raw detections of THIS frame exist (not a cached replay)
             if tracker_out is None:
                 tracker_out = self.spotter.process(frame.img) if self.spotter else []
                 if self.spotter:
                     n_dets, det_ms = len(self.spotter.last_dets[0]), self.spotter.last_ms
-            views = self.progress.update(frame.t, tracker_out) if self.progress else {}
+            # the followed car (if any): while it is in a dropout, progress re-attaches a car reappearing near its
+            # prediction to it, also under a new ByteTrack id or as a lone raw detection ByteTrack holds back
+            focus = (self.director.locked_id
+                     if self.director.mode == D.AUTO and self.director.sub == D.TRACKING else None)
+            raw = self._raw_boxes() if frame_had_detection else None
+            views = self.progress.update(frame.t, tracker_out, focus, raw) if self.progress else {}
+            reacquired = list(self.progress.reacquired) if self.progress else []
         # ---- control: short, under the lock the big STOP takes
         with self.lock:
             if self.handover_requested is not None:
@@ -291,11 +298,13 @@ class ZoneRuntime:
             if hasattr(self.ptz, "tick"):
                 self.ptz.tick()                      # the simulator integrates its motion up to now
             now = self.clock.monotonic()
+            for ev in reacquired:
+                self.director.reacquired(now, ev)    # logs it; follows the new id if progress adopted one
             decision = self.director.step(now, views)
             command = None
             if decision.action == D.FOLLOW and decision.track is not None:
                 tr = decision.track
-                command = self.controller.follow(tr.s, tr.v, frame.t)
+                command = self.controller.follow(tr.s, tr.v, frame.t, decision.zoom_extra)
                 if command.wrong_direction:
                     # Branch A saw the camera turn against the pan/tilt sign we use (zone/direction.py): every
                     # correction would push it further from the car. Give the car up and say what to fix.
@@ -331,6 +340,18 @@ class ZoneRuntime:
                 self.log.write(self._record(frame, res))
             return res
 
+    def _raw_boxes(self):
+        """This frame's raw detections (xyxy) confident enough to start a track in ByteTrack (its high threshold),
+        for re-attaching a lone detection to the followed car. None without a spotter."""
+        if self.spotter is None:
+            return None
+        dets = tuple(getattr(self.spotter, "last_dets", ()) or ())
+        if len(dets) < 2:                         # a spotter without scores (test fakes): no raw re-attachment
+            return None
+        boxes, scores = dets[0], dets[1]
+        high = float(getattr(getattr(self.spotter, "tracker", None), "high", 0.0) or 0.0)
+        return [b for b, s in zip(boxes, scores) if s >= high]
+
     def _stats(self, now):
         if self._t_prev is not None and now > self._t_prev:
             inst = 1.0 / (now - self._t_prev)
@@ -358,7 +379,9 @@ class ZoneRuntime:
             if self.last and st["locked_id"] is not None:
                 tr = self.last.views.get(st["locked_id"])
                 if tr:
-                    locked = dict(id=tr.track_id, s=round(tr.s, 3), v=round(tr.v, 3), predicted=tr.predicted)
+                    locked = dict(id=tr.track_id, s=round(tr.s, 3), v=round(tr.v, 3), predicted=bool(tr.predicted),
+                                  age=round(float(tr.since_update_s), 2), held=bool(tr.held),
+                                  zoom_extra=round(float(self.director.zoom_extra), 3))
             cmd = self.last.command.to_log() if (self.last and self.last.command) else None
             return dict(director=st, locked=locked, command=cmd, fps=round(self.fps, 1), cycles=self.cycles,
                         tracks=[v.to_log() for v in self.last.views.values()] if self.last else [],

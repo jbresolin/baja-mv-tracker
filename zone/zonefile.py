@@ -31,15 +31,22 @@ class Keyframe:
     preset: int                 # PTZ preset number this framing is stored in
     approximate: bool = False   # True when the pose was dead-reckoned (no inquiry, no absolute moves)
     pose_source: str = ""       # "inquiry" | "commanded" | "dead_reckoning"
+    # The operator looked at this keyframe ('testar') and said its pose is right although the sanity check flags it
+    # (zone/keyframe_check.py: e.g. the track really curves back). Hides its warnings. Re-teaching clears it.
+    confirmed: bool = False
 
     def to_dict(self):
-        return dict(pan=int(self.pan), tilt=int(self.tilt), zoom=int(self.zoom), preset=int(self.preset),
-                    approximate=bool(self.approximate), pose_source=self.pose_source)
+        d = dict(pan=int(self.pan), tilt=int(self.tilt), zoom=int(self.zoom), preset=int(self.preset),
+                 approximate=bool(self.approximate), pose_source=self.pose_source)
+        if self.confirmed:
+            d["confirmed"] = True
+        return d
 
     @classmethod
     def from_dict(cls, d):
         return cls(pan=int(d["pan"]), tilt=int(d["tilt"]), zoom=int(d["zoom"]), preset=int(d["preset"]),
-                   approximate=bool(d.get("approximate", False)), pose_source=str(d.get("pose_source", "")))
+                   approximate=bool(d.get("approximate", False)), pose_source=str(d.get("pose_source", "")),
+                   confirmed=bool(d.get("confirmed", False)))
 
 
 @dataclass

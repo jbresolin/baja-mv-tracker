@@ -37,7 +37,7 @@
   td button { padding:2px 6px; font-size:12px; }
   .kv { display:grid; grid-template-columns: 150px 1fr; gap:2px 8px; font-size:13px; }
   .kv div:nth-child(odd) { color:var(--dim); }
-  .bad { color:#ff6b5e; font-weight:700; } .good { color:#5bd77b; }
+  .bad { color:#ff6b5e; font-weight:700; } .good { color:#5bd77b; } .warn { color:#f0b93a; }
   #msg { min-height:20px; color:var(--amber); font-weight:600; }
   #events { font-size:12px; color:var(--dim); max-height:180px; overflow:auto; }
   input[type=number] { width:80px; background:#111; color:var(--text); border:1px solid var(--line); padding:6px; border-radius:4px; }
@@ -99,6 +99,7 @@
       </div>
       <div style="font-size:12px;color:var(--dim)">Fonte da pose: <b id="poseSrc"></b> · pose atual: <span id="poseNow">–</span>
         · arquivo <span id="zoneFile"></span></div>
+      <div id="kfWarn" class="bad" style="display:none;font-size:12px;font-weight:400"></div>
       <table id="points"><thead><tr><th>#</th><th>tipo</th><th>x,y</th><th></th></tr></thead><tbody></tbody></table>
     </section>
     <section>

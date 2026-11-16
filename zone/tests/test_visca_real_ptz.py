@@ -228,6 +228,29 @@ def test_replies_already_waiting_when_a_request_goes_out_are_dropped():
     assert rig.ptz.stats["dropped_waiting"] == 1
 
 
+def test_a_stray_zoom_zero_numbered_0_waiting_before_the_first_inquiry_is_not_taken():
+    # Right after connecting, the driver doesn't know yet whether the camera copies our sequence numbers. A stray
+    # `90 50 00 00 00 00 FF` numbered 0 is already waiting in the socket (the camera sent it on its own). Before the
+    # fix it both switched the driver to "no echo" mode (a 0 is never one of our numbers) AND was taken as the
+    # answer "zoom 0" (2026-11-15 bench: a keyframe stored with zoom 0). It arrived BEFORE we asked: dropped.
+    rig = make_scripted_rig(sequence_echo=None)
+    rig.transport.inject(reply(ZOOM_DATA_HEX, 0), delay=0.0)
+    assert rig.ptz.inquire_zoom() is None  # the camera says nothing new, so: no answer (and certainly not 0)
+    assert rig.ptz.stats["dropped_waiting"] == 1
+
+
+def test_a_7_byte_message_glued_behind_a_pan_tilt_answer_is_not_the_zoom():
+    # While our zoom question waits, a datagram arrives with a pan/tilt answer and right behind it a 7-byte
+    # `90 50 00 00 00 00 FF`: that is a data PAIR answering an earlier pan/tilt question (we ask one thing at a
+    # time). Its second half looks like "zoom 0" but is not our zoom: ignored.
+    rig = make_scripted_rig()
+    rig.transport.inject(reply(PAN_TILT_DATA_HEX, 43000) + reply(ZOOM_DATA_HEX, 43001), delay=0.02)
+    assert rig.ptz.inquire_zoom() is None
+    # ...while a 7-byte answer on its own is still a zoom answer
+    rig.transport.inject(reply("90 50 00 02 00 00 FF", 43002), delay=0.02)
+    assert rig.ptz.inquire_zoom() == 0x200
+
+
 def test_last_reply_at_notes_a_reply_without_data():
     # The zone's health checks use it: an inquiry that got only ACK + completion still shows the camera is there.
     rig = make_scripted_rig()
@@ -244,6 +267,9 @@ def test_against_the_real_like_camera_every_answer_is_the_right_one():
     # The camera sits still at pan -321, tilt 45, zoom 9999 (all different, so a mix-up would show). We ask pan/tilt
     # and zoom alternately, 200 times each. Many get no answer (that's this camera), but every answer we DO get must
     # be the right value of the right kind, and nothing is reported as an error.
+    # Zoom: this camera's only zoom-sized message is the second half of a data pair, `90 50 00 00 00 00 FF` whatever
+    # the zoom (the probe). The driver must never take it as "zoom 0" (2026-11-15 bench: a keyframe got zoom 0), so
+    # here the zoom inquiry is simply never answered.
     rig = make_rig()
     rig.sim.pan.position, rig.sim.tilt.position, rig.sim.zoom.position = -321.0, 45.0, 9999.0
     pan_tilt_answers, zoom_answers, statuses = [], [], set()
@@ -255,9 +281,9 @@ def test_against_the_real_like_camera_every_answer_is_the_right_one():
         pan_tilt_answers += [pan_tilt] if pan_tilt is not None else []
         zoom_answers += [zoom] if zoom is not None else []
         rig.clock.advance(0.1)
-    assert pan_tilt_answers and zoom_answers  # some came through...
+    assert pan_tilt_answers  # some came through...
     assert set(pan_tilt_answers) == {(-321, 45)}  # ...and every one is right
-    assert set(zoom_answers) == {9999}
+    assert zoom_answers == []  # never the pair's fake "zoom 0"
     assert statuses <= {ANSWERED, TIMEOUT}  # never ERROR
     assert rig.ptz.sequence_echo is False
 
@@ -388,8 +414,10 @@ def test_the_real_like_fake_over_real_udp():
         try:
             assert ptz.stop().ok
             # An inquiry's data rides with the NEXT request's replies: the 2nd or 3rd inquiry gets it.
-            assert 0 in [ptz.inquire_zoom() for _ in range(3)]
+            assert (0, 0) in [ptz.inquire_pan_tilt() for _ in range(3)]
             assert ptz.sequence_echo is False
+            # The pair's 7-byte half (`90 50 00 00 00 00 FF`) looks like "zoom 0" but is not the zoom: never taken.
+            assert [ptz.inquire_zoom() for _ in range(3)] == [None, None, None]
         finally:
             ptz.close()
 

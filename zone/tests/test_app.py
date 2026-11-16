@@ -298,3 +298,55 @@ def test_applied_corridor_width_is_what_the_state_shows(tmp_path):
     assert client.post("/api/teach/corridor", json={"half_width": 150}).status_code == 200
     state = client.get("/api/state").json()["zone"]
     assert state["corridor"] == 150.0 and state["dirty"] is True
+
+
+# ---------------------------------------------------------------------------- keyframe sanity check and "testar"
+def bench_zone():
+    """The four keyframes taught on the 2026-11-15 bench, in path order. P11 (pan 1764, zoom 0) is the bad one."""
+    from zone.zonefile import Keyframe, PathPoint
+    poses = [(1199, 136, 8724), (1764, -4, 0), (1448, 176, 6772), (1636, 100, 9399)]
+    return Zone(points=[PathPoint(100 + 200 * n, 400, Keyframe(p, t, z, 10 + n, False, "inquiry"))
+                        for n, (p, t, z) in enumerate(poses)])
+
+
+def test_suspicious_keyframes_are_shown_on_the_page_in_the_health_panel_and_in_the_log(tmp_path):
+    logged = []
+    cfg = C.load(None, ["ptz.driver=sim"])
+    clock = FakeClock(0.0)
+    app = ZoneApp(cfg, C.build(cfg), SimulatedPtz(PtzModel(), clock), clock, bench_zone(), tmp_path / "zone.json",
+                  tmp_path / "out", log=logged.append)
+    client = TestClient(create_web(app))
+    # the log says it as soon as the zone is loaded
+    assert any("keyframe suspeito: P11" in line and "re-ensinar" in line for line in logged)
+    s = client.get("/api/state").json()
+    p11 = s["zone"]["points"][1]
+    assert {w["kind"] for w in p11["warnings"]} == {"order_pan", "zoom_zero", "jump"}   # the marker's reasons
+    assert s["zone"]["points"][0]["warnings"] == []                                     # P10 is fine
+    assert any(line.startswith("P11") for line in s["health"]["keyframe_warnings"])     # red line in health
+    # The operator tests P12 (its tilt goes back: the track dips) and marks it "conferido": its warning goes away.
+    assert s["zone"]["points"][2]["warnings"]
+    assert client.post("/api/teach/confirm_keyframe", json={"index": 2}).status_code == 200
+    s = client.get("/api/state").json()
+    assert s["zone"]["points"][2]["warnings"] == [] and s["zone"]["points"][2]["keyframe"]["confirmed"]
+    assert s["zone"]["points"][1]["warnings"]                                           # P11 still flagged
+    n_lines = len(logged)
+    client.get("/api/state")
+    assert len(logged) == n_lines            # the same warnings are logged once, not on every page refresh
+
+
+def test_testar_through_the_page_reports_the_comparison(tmp_path):
+    client, app, ptz, clock = make(tmp_path, zone=Zone())
+    client.post("/api/teach/mode", json={"on": True})
+    for _ in range(6):                       # jog right for ~1 s
+        client.post("/api/teach/jog", json={"pan": 6})
+        clock.advance(0.15)
+    client.post("/api/teach/jog_stop")
+    clock.advance(1.0)
+    assert client.post("/api/teach/point", json={"x": 10, "y": 10, "keyframe": True}).status_code == 200
+    r = client.post("/api/teach/goto", json={"index": 0}).json()["result"]
+    assert r["checked"] and r["ok"], r
+    # now make the stored pose wrong, as on the bench: "testar" says so, and the page row shows it
+    app.teach.zone.points[0].keyframe.pan += 400
+    r = client.post("/api/teach/goto", json={"index": 0}).json()["result"]
+    assert r["checked"] and not r["ok"] and "re-ensinar" in r["message"]
+    assert client.get("/api/state").json()["zone"]["points"][0]["test"]["ok"] is False
