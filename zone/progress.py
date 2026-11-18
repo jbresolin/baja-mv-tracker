@@ -24,6 +24,17 @@ Dropouts (no detection for a while: dust, another car in front, a few bad frames
   followed track, also when ByteTrack gives the reappearing car a NEW id, or doesn't report it at all yet (a lone raw
   detection: ByteTrack only reports a new track from its second detection).
 
+Where a track was born (`TrackProgress.born_s`, `born_upstream`, `continuous`), for the director's lock rule: only a
+car that came in through the entry (born before `born_limit_s`, set by the runtime from director.s_lock /
+born_window) and was followed continuously since may be locked. A car first seen where the path passes near itself
+is never locked. A new tracker id that takes over from an upstream-born track in a dropout (same gate as the
+re-acquisition) inherits its "born upstream".
+
+Overlapping legs (`SizeProfile`, `ProgressTracker._first_projection`): a NEW detection inside the corridor of two
+stretches of path far apart in s is ambiguous. The learned box height per s (from tracks born unambiguously) picks
+the stretch whose expected height matches; unlearned or no clear match -> no track yet (next frame tries again).
+Existing tracks keep using the monotonic window (unchanged).
+
 Units: `s` is dimensionless (0 = first keyframe, 1 = last keyframe), so `v` is in "zone per second". A car that
 crosses the zone in 4 s has v ~ 0.25 /s.
 """
@@ -192,6 +203,81 @@ def profile_path_for(zone_path):
     return p.with_name(p.stem + ".speed.json")
 
 
+def size_profile_path_for(zone_path):
+    """The size profile lives next to zone.json too: zone.json -> zone.size.json."""
+    p = Path(zone_path)
+    return p.with_name(p.stem + ".size.json")
+
+
+class SizeProfile:
+    """Typical box HEIGHT (pixels) per bin of s, learned from finished tracks that were born unambiguously (a
+    single stretch of path near their first detection). Same layout and rules as SpeedProfile: each finished track
+    adds one value per bin (the median of its own heights there), each bin keeps the last `max_passes` values, and
+    the expected height is their median. Unlike the speed profile there is no borrowing from neighbour bins: a bin
+    with fewer than `min_passes` values is "not learned" (None), and an ambiguous detection there waits."""
+
+    def __init__(self, s_lo=-0.5, s_hi=1.2, bin_width=0.05, max_passes=50):
+        self.s_lo, self.s_hi, self.bin_width = float(s_lo), float(s_hi), float(bin_width)
+        self.n_bins = max(1, int(math.ceil((self.s_hi - self.s_lo) / self.bin_width)))
+        self.max_passes = int(max_passes)
+        self.bins: List[deque] = [deque(maxlen=self.max_passes) for _ in range(self.n_bins)]
+        self.n_passes = 0
+
+    def bin_of(self, s):
+        if s < self.s_lo or s > self.s_hi:
+            return None
+        return int(np.clip(math.floor((s - self.s_lo) / self.bin_width), 0, self.n_bins - 1))
+
+    def add_pass(self, samples):
+        """samples: iterable of (s, box height px). Returns the number of bins it contributed to."""
+        per_bin: Dict[int, list] = {}
+        for s, h in samples:
+            i = self.bin_of(s)
+            if i is None or not np.isfinite(h) or h <= 0:
+                continue
+            per_bin.setdefault(i, []).append(float(h))
+        for i, hs in per_bin.items():
+            self.bins[i].append(float(np.median(hs)))
+        if per_bin:
+            self.n_passes += 1
+        return len(per_bin)
+
+    def expected(self, s, min_passes=3):
+        """Expected box height at s, or None when that bin has fewer than `min_passes` values."""
+        i = self.bin_of(s)
+        if i is None or len(self.bins[i]) < max(1, int(min_passes)):
+            return None
+        return float(np.median(self.bins[i]))
+
+    def learned_bins(self, min_passes=3):
+        return sum(1 for b in self.bins if len(b) >= max(1, int(min_passes)))
+
+    # ---- file
+    def to_dict(self):
+        return dict(kind="box_height_px", s_lo=self.s_lo, s_hi=self.s_hi, bin_width=self.bin_width,
+                    max_passes=self.max_passes, n_passes=self.n_passes,
+                    bins=[[round(v, 1) for v in b] for b in self.bins],
+                    median=[round(float(np.median(b)), 1) if len(b) else None for b in self.bins])
+
+    @classmethod
+    def from_dict(cls, d):
+        p = cls(d["s_lo"], d["s_hi"], d["bin_width"], d.get("max_passes", 50))
+        for i, b in enumerate(d.get("bins", [])[:p.n_bins]):
+            p.bins[i].extend(float(v) for v in b)
+        p.n_passes = int(d.get("n_passes", 0))
+        return p
+
+    def save(self, path):
+        path = Path(path)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(self.to_dict(), indent=1), encoding="utf-8")
+        tmp.replace(path)
+
+    @classmethod
+    def load(cls, path):
+        return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
+
+
 # ===================================================================================================== tracks
 @dataclass
 class ProgressSettings:
@@ -221,6 +307,15 @@ class ProgressSettings:
                                         # the prediction (a car slower than predicted)
     ground_window_s: float = 1.0        # image speed of the ground point (px/s) is measured over this window: the
                                         # director's lock rule uses it (an entry seen head-on, where s grows slowly)
+    continuity_gap_s: float = 3.0       # a track unseen longer than this between two detections is no longer
+                                        # "followed continuously since its birth" (raised to director.lost_timeout_s)
+    overlap_size_check: bool = True     # a NEW detection near two far-apart stretches of path: choose by box size
+    overlap_min_sep_px: float = 200.0   # two corridor stretches closer than this along the path are one place
+    size_tolerance: float = 0.35        # the box height must be within x(1 +- this) of the expected one (as a ratio)
+    size_min_contrast: float = 1.25     # two candidate stretches that both match must differ in expected height by at
+                                        # least this factor, or we can't tell them apart (wait)
+    size_min_passes: int = 3            # a size bin is "learned" with at least this many passes in it
+    size_min_samples: int = 3           # a finished track teaches the size profile with at least this many boxes
 
 
 @dataclass
@@ -238,6 +333,15 @@ class TrackProgress:
     samples: list = field(default_factory=list)   # (t, s_raw, s_filtered, v_filtered) at each update
     ground_hist: deque = field(default_factory=lambda: deque(maxlen=200))   # (t, x, y) of every detection's
                                                                             # ground point, for ground_px_s
+    # ---- where it was born (the director's lock rule) and how
+    born_s: float = 0.0                 # s of its first detection (or of the track it took over from)
+    born_upstream: Optional[bool] = None   # born before the progress tracker's born_limit_s (None = no limit set)
+    continuous: bool = True             # followed without a gap longer than continuity_gap_s since its birth
+    born_how: str = "unique"            # "unique": one stretch of path near its first detection; "size": chosen
+                                        # among overlapping stretches by the size profile
+    inherited_from: Optional[int] = None   # id of the upstream-born track in a dropout it took over from
+    heir: Optional[int] = None          # id of the track that took over from this one (it can't pass it on twice)
+    size_samples: list = field(default_factory=list)   # (s_raw, box height px) at each detection
 
     def s_raw_last(self):
         return self.samples[-1][1] if self.samples else self.filt.s
@@ -265,13 +369,20 @@ class TrackView:
     ground_px_s: Optional[float] = None
     v_typ: Optional[float] = None      # the learned typical speed at s (None until the speed profile has learned)
     held: bool = False                 # the dropout prediction reached max_predict_s_ahead: s holds there, v = 0
+    # where the track was born (see TrackProgress). None = unknown (hand-made views in tests: no rule applies)
+    born_s: Optional[float] = None
+    born_upstream: Optional[bool] = None
+    continuous: bool = True
+    born_how: str = "unique"
 
     def to_log(self):
         return dict(id=self.track_id, s=round(self.s, 4), v=round(self.v, 4), s_std=round(self.s_std, 4),
                     v_std=round(self.v_std, 4), lat=round(self.lateral_px, 1), n=self.n_updates,
                     age=round(self.since_update_s, 3), off=self.off_corridor_frames, pred=self.predicted,
                     gpx=None if self.ground_px_s is None else round(self.ground_px_s, 1),
-                    vtyp=None if self.v_typ is None else round(self.v_typ, 4), held=self.held)
+                    vtyp=None if self.v_typ is None else round(self.v_typ, 4), held=self.held,
+                    born=None if self.born_s is None else round(self.born_s, 3), up=self.born_upstream,
+                    cont=self.continuous, how=self.born_how)
 
 
 DROPOUT_MIN_S = 0.25   # a gap between two updates longer than this is a "dropout" (more than two missed frames at
@@ -291,10 +402,20 @@ class Prediction:
 
 
 class ProgressTracker:
-    def __init__(self, path: PathModel, settings: ProgressSettings = None, profile: SpeedProfile = None):
+    def __init__(self, path: PathModel, settings: ProgressSettings = None, profile: SpeedProfile = None,
+                 size_profile: SizeProfile = None):
         self.path = path
         self.cfg = settings or ProgressSettings()
         self.profile = profile or SpeedProfile(s_lo=min(-0.5, path.s_min), s_hi=max(1.2, path.s_max))
+        self.size_profile = size_profile or SizeProfile(s_lo=min(-0.5, path.s_min), s_hi=max(1.2, path.s_max))
+        # A track born at s below this "came in through the entry" (the director's lock rule). None = no rule. Set by
+        # the runtime from director.s_lock / born_window and the path's start (Director.born_limit).
+        self.born_limit_s: Optional[float] = None
+        # Learn the size profile now? The runtime sets it: only in PASSIVE / AUTO.
+        self.learn_size = True
+        # Overlapping legs: how often a new detection was ambiguous, and what came of it (page + control log).
+        self.ambiguity = dict(ambiguous=0, resolved=0, waited_unlearned=0, waited_no_match=0)
+        self.overlap_events: List[dict] = []   # this update's tracks born by a size decision (for the log)
         self.tracks: Dict[int, TrackProgress] = {}
         self.finished_passes = 0
         self.on_finished = None          # optional callback(TrackProgress) (e.g. to save the profile)
@@ -303,7 +424,8 @@ class ProgressTracker:
         self.reacquired: List[dict] = []
 
     def set_path(self, path: PathModel):
-        """The zone was edited: drop the tracks (their s meant something else) but keep the learned profile."""
+        """The zone was edited: drop the tracks (their s meant something else) but keep the learned profiles. Cars
+        already in the zone are then born again where they are: none of them is lockable (not born upstream)."""
         self.path = path
         self.tracks.clear()
 
@@ -318,6 +440,8 @@ class ProgressTracker:
         lets a lone detection that ByteTrack doesn't report yet update it too."""
         c = self.cfg
         self.reacquired = []
+        self.overlap_events = []
+        newborn = []
         focus_prev_update = self.tracks[focus_id].last_update_t if focus_id in self.tracks else None
         meas_sigma = c.meas_sigma_px / self.path.scale
         seen = set()
@@ -337,30 +461,37 @@ class ProgressTracker:
                 # did something else than "keep the same speed" while unseen is still within reach
                 spread_px = c.window_sigmas * math.sqrt(max(var_s, 0.0)) * self.path.scale
                 back, ahead = max(back, spread_px), max(ahead, spread_px)
-            proj = self.path.project(gx, gy, s_prev, back, ahead)
-            inside = self.path.in_corridor(proj, c.corridor_factor)
+            height = y2 - y1
             if tp is None:
-                if not inside:
-                    continue                        # not on the racing line: not a car of the zone (yet)
+                proj, how = self._first_projection(tid, gx, gy, height)
+                if proj is None:
+                    continue                        # not on the racing line (yet), or an overlap we can't resolve
                 v0 = self.profile.v_typ(proj.s) if self.profile.learned else 0.0
                 tp = TrackProgress(tid, SVFilter(t, proj.s, meas_sigma, c.accel_sigma, v0, c.v_sigma0),
-                                   first_t=t, last_update_t=t, last_seen_t=t)
+                                   first_t=t, last_update_t=t, last_seen_t=t, born_s=proj.s, born_how=how)
+                tp.born_upstream = None if self.born_limit_s is None else bool(proj.s < self.born_limit_s)
                 tp.ground_hist.append((t, gx, gy))
                 tp.samples.append((t, proj.s, proj.s, v0))
+                tp.size_samples.append((proj.s, height))
                 self.tracks[tid] = tp
+                newborn.append(tp)
             else:
+                proj = self.path.project(gx, gy, s_prev, back, ahead)
+                inside = self.path.in_corridor(proj, c.corridor_factor)
                 tp.last_seen_t = t
                 tp.ground_hist.append((t, gx, gy))
                 if not inside:
                     tp.off_corridor_frames += 1
                     tp.box, tp.ground = tuple(box), (gx, gy)
                     continue
-                self._fold(tp, t, proj.s)
+                if self._fold(tp, t, proj.s):
+                    tp.size_samples.append((proj.s, height))
             tp.off_corridor_frames = 0
             tp.lateral_px = proj.lateral_px
             tp.box, tp.ground = tuple(float(v) for v in box), (gx, gy)
         if focus_id in self.tracks and focus_prev_update is not None:
             self._reacquire(focus_id, focus_prev_update, t, seen, tracker_out, raw_boxes)
+        self._inherit(newborn, t, focus_id)
         # finish tracks that have been gone long enough
         for tid in [k for k, tp in self.tracks.items() if t - tp.last_seen_t > c.finish_after_s]:
             self._finish(self.tracks.pop(tid))
@@ -369,6 +500,8 @@ class ProgressTracker:
     def _fold(self, tp: TrackProgress, t, s_meas):
         """One measured s for a track. After a dropout the filter first moves to the dropout prediction (frozen /
         clamped speed, typical profile), so the measurement is compared with what we actually predicted."""
+        if t - tp.last_update_t > self.cfg.continuity_gap_s:
+            tp.continuous = False               # unseen too long: maybe not the car that was born there
         if t - tp.last_update_t > DROPOUT_MIN_S:
             pred = self.prediction(tp, t)
             tp.filt.reseed(t, pred.s_free, pred.v_free)
@@ -378,6 +511,76 @@ class ProgressTracker:
             tp.samples.append((t, s_meas, tp.filt.s, tp.filt.v))
             return True
         return False
+
+    # --------------------------------------------------------------------------------------------- birth
+    def _first_projection(self, tid, gx, gy, height):
+        """Where a NEW track starts: -> (Projection, how) or (None, None) when no track should start from this
+        detection (outside the corridor, or an overlap that can't be resolved yet).
+
+        With `overlap_size_check` off: the closest point of the whole path (the old rule). With it on, every
+        stretch of path whose corridor holds the detection is a candidate (PathModel.candidates): one -> that one
+        ("unique"); two or more (the path passes near itself) -> the one whose learned box height matches
+        ("size"), or none: some candidate's size bin isn't learned yet, nothing matches within size_tolerance, or two
+        match and their expected heights are too alike (size_min_contrast) to tell apart."""
+        c = self.cfg
+        if not c.overlap_size_check:
+            proj = self.path.project(gx, gy)
+            return (proj, "unique") if self.path.in_corridor(proj, c.corridor_factor) else (None, None)
+        cands = self.path.candidates(gx, gy, c.corridor_factor, c.overlap_min_sep_px)
+        if not cands:
+            return None, None
+        if len(cands) == 1:
+            return cands[0].projection, "unique"
+        self.ambiguity["ambiguous"] += 1
+        expected = [self.size_profile.expected(k.projection.s, c.size_min_passes) for k in cands]
+        if any(e is None for e in expected) or height <= 0:
+            self.ambiguity["waited_unlearned"] += 1
+            return None, None
+        misfit = [abs(math.log(height / e)) for e in expected]   # 0 = exactly the expected height
+        limit = math.log(1.0 + c.size_tolerance)
+        order = sorted(range(len(cands)), key=lambda k: misfit[k])
+        best = order[0]
+        if misfit[best] > limit:
+            self.ambiguity["waited_no_match"] += 1
+            return None, None
+        for other in order[1:]:
+            alike = max(expected[best], expected[other]) / min(expected[best], expected[other]) < c.size_min_contrast
+            if misfit[other] <= limit and alike:
+                self.ambiguity["waited_no_match"] += 1
+                return None, None
+        self.ambiguity["resolved"] += 1
+        chosen = cands[best].projection
+        self.overlap_events.append(dict(track_id=int(tid), s=round(chosen.s, 4), h=round(float(height), 1),
+                                        expected=round(expected[best], 1),
+                                        others=[round(cands[k].projection.s, 4) for k in order[1:]]))
+        return chosen, "size"
+
+    def _inherit(self, newborn, t, focus_id):
+        """A new tracker id that appears where an upstream-born car in a dropout is expected to be (the same gate as
+        the followed car's re-acquisition) is that car under a new id (ByteTrack often renumbers a car after a few
+        missed frames): it inherits "born upstream" and the birth s. The old track is marked not continuous, so the
+        two can never both be locked. The followed track is left to re-acquisition."""
+        if self.born_limit_s is None:
+            return
+        for new in newborn:
+            if new.born_upstream or new.track_id not in self.tracks:
+                continue                            # already lockable, or adopted by the followed car
+            s_new = new.s_raw_last()
+            best = None
+            for old in self.tracks.values():
+                if (old is new or old.track_id == focus_id or not old.born_upstream or not old.continuous
+                        or old.heir is not None or old.last_seen_t >= t or old.last_update_t >= new.first_t
+                        or t - old.last_update_t > self.cfg.continuity_gap_s):
+                    continue
+                lo, hi = self.reacquire_gate(old, t)
+                if not lo <= s_new <= hi:
+                    continue
+                s_ref = self.prediction(old, t).s_free
+                if best is None or abs(s_new - s_ref) < abs(self.prediction(best, t).s_free - s_ref):
+                    best = old
+            if best is not None:
+                new.born_upstream, new.born_s, new.inherited_from = True, best.born_s, best.track_id
+                best.heir, best.continuous = new.track_id, False
 
     # --------------------------------------------------------------------------------------------- re-acquisition
     def reacquire_gate(self, tp: TrackProgress, t):
@@ -443,6 +646,7 @@ class ProgressTracker:
         ftp.track_id = new.track_id
         ftp.last_seen_t = max(ftp.last_seen_t, new.last_seen_t)
         ftp.ground_hist.extend(new.ground_hist)
+        ftp.size_samples.extend(new.size_samples)
         ftp.box, ftp.ground, ftp.lateral_px = new.box, new.ground, new.lateral_px
         ftp.off_corridor_frames = 0
         self.tracks[new.track_id] = ftp
@@ -481,16 +685,20 @@ class ProgressTracker:
 
     def _finish(self, tp: TrackProgress):
         c = self.cfg
-        if tp.n_updates < c.profile_min_updates:
-            return
-        ss = [smp[2] for smp in tp.samples]
-        if max(ss) - min(ss) < c.profile_min_span:
-            return
-        # skip the first two updates: the filter's speed hasn't converged yet
-        if self.profile.add_pass([(smp[2], smp[3]) for smp in tp.samples[2:]]):
-            self.finished_passes += 1
-            if self.on_finished:
-                self.on_finished(tp)
+        # the size profile: only tracks born unambiguously (a size-chosen birth could be the wrong stretch, and would
+        # then teach itself), and only while learning (PASSIVE / AUTO)
+        size_added = (self.learn_size and tp.born_how == "unique" and len(tp.size_samples) >= c.size_min_samples
+                      and self.size_profile.add_pass(tp.size_samples) > 0)
+        speed_added = False
+        if tp.n_updates >= c.profile_min_updates:
+            ss = [smp[2] for smp in tp.samples]
+            # skip the first two updates: the filter's speed hasn't converged yet
+            if max(ss) - min(ss) >= c.profile_min_span and self.profile.add_pass(
+                    [(smp[2], smp[3]) for smp in tp.samples[2:]]):
+                self.finished_passes += 1
+                speed_added = True
+        if (speed_added or size_added) and self.on_finished:
+            self.on_finished(tp)
 
     # --------------------------------------------------------------------------------------------- prediction
     def frozen_speed(self, tp: TrackProgress):
@@ -573,7 +781,7 @@ class ProgressTracker:
         return TrackView(tp.track_id, p.s, p.v, math.sqrt(max(p.var_s, 0)), math.sqrt(max(p.var_v, 0)),
                          tp.lateral_px, tp.n_updates, age, tp.off_corridor_frames, bool(age > 1e-9), tp.box,
                          tp.ground, self.ground_speed(tp, t), self.profile.v_typ(p.s) if self.profile.learned else None,
-                         bool(p.held))
+                         bool(p.held), float(tp.born_s), tp.born_upstream, bool(tp.continuous), tp.born_how)
 
 
 def _iou(a, b):

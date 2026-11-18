@@ -32,7 +32,7 @@ from zone import director as D  # noqa: E402
 from zone import draw  # noqa: E402
 from zone import zonefile  # noqa: E402
 from zone.controller import heard_recently  # noqa: E402
-from zone.progress import profile_path_for  # noqa: E402
+from zone.progress import profile_path_for, size_profile_path_for  # noqa: E402
 from zone.runtime import ControlLog, ZoneRuntime  # noqa: E402
 from zone.teach import TeachError, TeachSession, make_pose_source  # noqa: E402
 
@@ -84,7 +84,8 @@ class ZoneApp:
         self.agent = None                # the studio's agent API (zone/agent), when [agent] enabled: attached later
         self.agent_error = None          # why the agent API is down (port taken, websockets missing...): on the page
         self.runtime = ZoneRuntime(settings, zone, ptz, clock, spotter, profile_path=profile_path_for(zone_path),
-                                   log=self.control_log, on_event=self._on_event)
+                                   log=self.control_log, on_event=self._on_event,
+                                   size_profile_path=size_profile_path_for(zone_path))
         self.pose_source = make_pose_source(settings.pose_source, ptz, clock, settings)
         self.teach = TeachSession(zone.copy(), ptz, self.pose_source, cfg["teach"]["preset_base"],
                                   on_change=self.runtime.set_zone)
@@ -382,7 +383,10 @@ class ZoneApp:
         roi = rt.spotter.det.roi if rt.spotter is not None else None
         draw.draw_zone(img, self.teach.zone, rt.path, roi, self.selected)
         st = rt.director.state()
-        draw.draw_tracks(img, res.views, st["locked_id"], res.tracker_out)
+        # cars that can never be locked say why under their box (ASCII: OpenCV can't draw accents)
+        notes = {tid: "fora da entrada" if v.born_upstream is False else "sem continuidade"
+                 for tid, v in res.views.items() if rt.director.lock_block_reason(v)}
+        draw.draw_tracks(img, res.views, st["locked_id"], res.tracker_out, notes)
         lines = ["%s%s" % (st["mode"], (" / " + st["sub"]) if st["sub"] else "")]
         if st["locked_id"] is not None and st["locked_id"] in res.views:
             v = res.views[st["locked_id"]]
@@ -616,6 +620,11 @@ def create_web(zapp: ZoneApp):
         i = body.get("index")
         zapp.selected = None if i is None else int(i)
         return dict(ok=True)
+
+    @web.post("/api/teach/point_width")
+    def point_width(body: dict = Body(...)):
+        """A point's own corridor half-width: {"index": 3, "half_width_px": 40}, or null to use the global one."""
+        return guard(lambda: zapp.teach.set_point_width(int(body["index"]), body.get("half_width_px")), teach=True)
 
     @web.post("/api/teach/corridor")
     def corridor(body: dict = Body(...)):

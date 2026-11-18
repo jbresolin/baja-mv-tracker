@@ -183,7 +183,19 @@ function typedZoom() {
   return S && S.teach.zoom_unknown && v !== "" ? +v : null;
 }
 
+// Per-point corridor width ("largura"): what the operator typed and hasn't applied yet, by point index. The list is
+// rebuilt twice a second; the drafts survive that (and the list isn't rebuilt while a width box has the focus).
+const widthDraft = {};
+async function applyWidth(index) {
+  const raw = widthDraft[index] !== undefined ? widthDraft[index] : "";
+  const r = await post("/api/teach/point_width", { index, half_width_px: raw === "" ? null : +raw });
+  if (r) { delete widthDraft[index]; msg(raw === "" ? `ponto ${index}: largura global` : `ponto ${index}: largura ${raw} px (salve a zona para manter)`); }
+  poll();
+}
+
 function renderPoints(z, t) {
+  const editing = document.activeElement && document.activeElement.classList.contains("pw");
+  if (editing) return;
   const tb = $("#points tbody");
   tb.innerHTML = "";
   z.points.forEach((p) => {
@@ -203,7 +215,24 @@ function renderPoints(z, t) {
     if (kf && kf.confirmed) notes += `<div class="good" style="font-weight:400">conferido pelo operador</div>`;
     tr.innerHTML = `<td>${p.i}</td><td title="${kf ? `pan ${kf.pan} tilt ${kf.tilt} zoom ${kf.zoom}` : ""}">${warns.length || test ? "⚠ " : ""}${kind}
       ${kf ? `<div style="font-size:11px;color:var(--dim)">pan ${kf.pan} tilt ${kf.tilt} zoom ${kf.zoom}</div>` : ""}${notes}</td>
-      <td>${Math.round(p.x)},${Math.round(p.y)}</td><td></td>`;
+      <td>${Math.round(p.x)},${Math.round(p.y)}</td><td class="wcell"></td><td></td>`;
+    // own corridor half-width: empty = the global "Corredor"; Enter or "ok" applies (STOPPED / PASSIVE only)
+    const wcell = tr.querySelector(".wcell");
+    const win = document.createElement("input");
+    win.type = "number"; win.min = 5; win.max = 1000; win.step = 5; win.className = "pw";
+    win.placeholder = String(Math.round(z.corridor));
+    win.value = widthDraft[p.i] !== undefined ? widthDraft[p.i] : (p.half_width_px === undefined || p.half_width_px === null ? "" : p.half_width_px);
+    win.disabled = !t.allowed;
+    win.title = "meia largura do corredor neste ponto (px); vazio = global";
+    win.addEventListener("click", (e) => e.stopPropagation());
+    win.addEventListener("input", () => { widthDraft[p.i] = win.value; });
+    win.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); widthDraft[p.i] = win.value; win.blur(); applyWidth(p.i); } });
+    const wok = document.createElement("button");
+    wok.textContent = "ok"; wok.disabled = !t.allowed; wok.title = "aplicar a largura deste ponto";
+    // pointerdown, not click: it fires before the box loses the focus, so a list refresh can't swallow it
+    wok.addEventListener("pointerdown", (e) => { e.preventDefault(); e.stopPropagation(); widthDraft[p.i] = win.value; applyWidth(p.i); });
+    wok.addEventListener("click", (e) => e.stopPropagation());
+    wcell.appendChild(win); wcell.appendChild(wok);
     const cell = tr.lastElementChild;
     const add = (label, fn, title) => {
       const b = document.createElement("button"); b.textContent = label; b.title = title || "";
@@ -242,6 +271,18 @@ function renderPoints(z, t) {
 function reacquiredText(e) {
   const how = { same_id: "mesmo id", new_id: `novo id (era ${e.old_id})`, raw_detection: "detecção avulsa" }[e.how] || e.how;
   return `reencontrado após ${Number(e.dropout_s).toFixed(1)} s sem detecção (${how})`;
+}
+
+// the cars the tracker sees now, and why one of them can never be locked (director.require_born_upstream)
+function renderCars(r) {
+  const tb = $("#cars tbody");
+  const L = r.director.locked_id;
+  tb.innerHTML = (r.tracks || []).map((c) => {
+    const note = c.id === L ? "seguido" : (c.why_not || (c.how === "size" ? "trecho escolhido pelo tamanho" : ""));
+    return `<tr><td>${c.id}</td><td>${c.s.toFixed(2)}</td><td>${c.v.toFixed(2)}</td>
+      <td>${c.born === null || c.born === undefined ? "–" : c.born.toFixed(2)}</td>
+      <td class="${c.why_not ? "warn" : (c.id === L ? "good" : "")}">${esc(note)}${c.pred ? " (prevendo)" : ""}</td></tr>`;
+  }).join("") || `<tr><td colspan="5" style="color:var(--dim)">nenhum carro no corredor</td></tr>`;
 }
 
 // ------------------------------------------------------------------ state
@@ -292,6 +333,7 @@ function render(s) {
   $("#zoomWarn").style.display = t.zoom_unknown ? "flex" : "none";
   $("#kfZoom").min = t.zoom_limits[0]; $("#kfZoom").max = t.zoom_limits[1];
   renderPoints(z, t);
+  renderCars(s.runtime);
   const kw = z.keyframe_warnings || [];
   $("#kfWarn").style.display = kw.length ? "" : "none";
   $("#kfWarn").innerHTML = kw.length ? "⚠ Keyframes suspeitos (re-ensine ou marque 'conferido'):<br>" + kw.map(esc).join("<br>") : "";
@@ -329,6 +371,7 @@ function render(s) {
     ["gravação PTZ", pr.enabled ? (pr.file ? `${pr.growing ? "gravando" : "PARADA"} ${pr.file} ${pr.size_mb} MB` : "nenhum arquivo")
                                 : "desligada", pr.enabled && !pr.growing ? "bad" : ""],
     ["perfil de velocidade", `${s.runtime.profile_passes} passagens`],
+    ["trechos sobrepostos", overlapText(s.runtime.overlap), ""],
     ["fonte", h.source || "–"],
   ]);
   $("#events").innerHTML = s.events.slice().reverse().map((e) =>
@@ -375,6 +418,15 @@ $("#releaseHold").addEventListener("click", async () => {
   if (await post("/api/agent/release_hold", { confirm: true })) msg("HOLD liberado: câmera em manual");
   poll();
 });
+
+// overlapping legs (zone/progress.py): new detections near two stretches of path, and the size profile
+function overlapText(o) {
+  if (!o) return "–";
+  if (!o.enabled) return "desligado (progress.overlap_size_check)";
+  const c = o.counts || {};
+  return `ambíguas ${c.ambiguous || 0} · resolvidas pelo tamanho ${c.resolved || 0} · aguardando (sem perfil ${c.waited_unlearned || 0},` +
+         ` sem casar ${c.waited_no_match || 0}) · perfil de tamanho ${o.size_passes} passagens, ${o.size_bins} faixas aprendidas`;
+}
 
 async function poll() {
   try {

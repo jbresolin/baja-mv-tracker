@@ -51,10 +51,16 @@ class Keyframe:
 
 @dataclass
 class PathPoint:
-    """One clicked point on the spotter image (pixels). `keyframe` is None for a path-only point."""
+    """One clicked point on the spotter image (pixels). `keyframe` is None for a path-only point.
+
+    `half_width_px`: this point's own corridor half-width (pixels), or None to use the zone's global
+    `corridor_half_width_px`. Between points that have one, the width is interpolated along the path (see
+    `Zone.point_half_widths`). Lets the corridor be narrow where the path passes near another stretch of track and
+    wide where the cars spread out."""
     x: float
     y: float
     keyframe: Optional[Keyframe] = None
+    half_width_px: Optional[float] = None
 
     @property
     def is_keyframe(self):
@@ -62,6 +68,8 @@ class PathPoint:
 
     def to_dict(self):
         d = dict(x=round(float(self.x), 2), y=round(float(self.y), 2))
+        if self.half_width_px is not None:
+            d["half_width_px"] = round(float(self.half_width_px), 1)   # omitted when unset: old files stay as they were
         if self.keyframe is not None:
             d["keyframe"] = self.keyframe.to_dict()
         return d
@@ -69,7 +77,9 @@ class PathPoint:
     @classmethod
     def from_dict(cls, d):
         kf = d.get("keyframe")
-        return cls(float(d["x"]), float(d["y"]), Keyframe.from_dict(kf) if kf else None)
+        hw = d.get("half_width_px")
+        return cls(float(d["x"]), float(d["y"]), Keyframe.from_dict(kf) if kf else None,
+                   None if hw is None else float(hw))
 
 
 @dataclass
@@ -96,6 +106,37 @@ class Zone:
         """The first keyframe's preset: where the PTZ waits for the next car. None until a keyframe exists."""
         kfs = self.keyframes()
         return kfs[0].preset if kfs else None
+
+    def point_half_widths(self):
+        """The corridor half-width (pixels) at every point, in point order.
+
+        * Points with their own `half_width_px` keep it.
+        * Points between two such points get a value interpolated linearly by arc length (distance along the path)
+          between them.
+        * Points before the first / after the last explicit value hold that nearest explicit value.
+        * No point has one: every point gets the global `corridor_half_width_px` (the behaviour of old zone files).
+        Between two consecutive points the corridor then varies linearly too (PathModel.half_width_at_arc)."""
+        n = len(self.points)
+        if n == 0:
+            return []
+        arcs = [0.0]
+        for a, b in zip(self.points, self.points[1:]):
+            arcs.append(arcs[-1] + ((b.x - a.x) ** 2 + (b.y - a.y) ** 2) ** 0.5)
+        known = [(arcs[i], float(p.half_width_px)) for i, p in enumerate(self.points) if p.half_width_px is not None]
+        if not known:
+            return [float(self.corridor_half_width_px)] * n
+        out = []
+        for a in arcs:
+            if a <= known[0][0]:
+                out.append(known[0][1])
+            elif a >= known[-1][0]:
+                out.append(known[-1][1])
+            else:
+                for (a0, w0), (a1, w1) in zip(known, known[1:]):
+                    if a0 <= a <= a1:
+                        out.append(w0 if a1 - a0 <= 1e-9 else w0 + (w1 - w0) * (a - a0) / (a1 - a0))
+                        break
+        return out
 
     def used_presets(self):
         return {k.preset for k in self.keyframes()}

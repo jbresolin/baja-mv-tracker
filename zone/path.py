@@ -16,6 +16,19 @@ and the distance to it is the *lateral offset*. If the path comes back near itse
 the side), the closest point could jump to the wrong leg. So, when we know where the car was a moment ago, we search
 only a window of the path around that previous position ("monotonic window": a little behind, more ahead).
 
+Corridor width
+--------------
+The corridor is the band around the path where detections count as cars of the zone. Its half-width is the zone's
+global `corridor_half_width_px`, unless points carry their own `half_width_px`: then it is interpolated along the path
+(`Zone.point_half_widths`, `half_width_at_arc`). The detector ROI, the in-corridor test and the page's drawing all use
+the varying width.
+
+Overlapping stretches ("legs")
+------------------------------
+When the path passes near itself, a NEW detection may be inside the corridor of two stretches that are far apart along
+the path. `candidates()` lists them; the progress tracker (zone/progress.py) then picks one with the learned box-size
+profile, or waits.
+
 Pose curve
 ----------
 Each keyframe has an `s` (the arc length at its point) and a pose (pan, tilt, zoom). `PoseCurve` interpolates them:
@@ -29,6 +42,14 @@ from typing import Optional
 import numpy as np
 
 from zone.zonefile import Zone
+
+
+@dataclass
+class Candidate:
+    """One stretch of path a detection could belong to (see PathModel.candidates)."""
+    projection: "Projection"
+    distance_px: float      # distance from the detection to the path there
+    half_width_px: float    # corridor half-width at that place
 
 
 @dataclass
@@ -65,7 +86,9 @@ class PathModel:
         if self.arc1 - self.arc0 <= 1e-6:
             raise ValueError("the first and last keyframes are at the same place on the path")
         self.scale = self.arc1 - self.arc0                 # pixels per unit of s
-        self.half_width = float(zone.corridor_half_width_px)
+        self.half_width = float(zone.corridor_half_width_px)          # the global value (fallback)
+        self.point_widths = np.array(zone.point_half_widths(), dtype=np.float64)   # half-width at each point
+        self.max_half_width = float(self.point_widths.max())
         self.keyframe_indices = kfi
 
     @classmethod
@@ -139,16 +162,75 @@ class PathModel:
         return Projection(s=float(self.s_of_arc(arc)), lateral_px=float(lateral), arc_px=float(arc),
                           x=float(q[0]), y=float(q[1]))
 
+    # ----------------------------------------------------------------- corridor width
+    def half_width_at_arc(self, arc):
+        """Corridor half-width (pixels) at arc length `arc`: linear between the points' widths, held at the ends."""
+        return float(np.interp(float(arc), self.cum, self.point_widths))
+
+    def half_width_at_s(self, s):
+        return self.half_width_at_arc(float(self.arc_of_s(s)))
+
     def in_corridor(self, proj: Projection, factor=1.0):
-        return proj.offset_px <= self.half_width * factor
+        return proj.offset_px <= self.half_width_at_arc(proj.arc_px) * factor
+
+    # ----------------------------------------------------------------- several legs near one detection
+    def candidates(self, x, y, factor=1.0, min_separation_px=200.0):
+        """Every stretch of path whose corridor contains (x, y), as a list of Candidate sorted by arc length.
+
+        Each segment gives its closest point to (x, y); segments in a row whose closest point is inside the corridor
+        form one stretch, represented by its closest point. Stretches less than `min_separation_px` apart along the
+        path are the same place (e.g. the two sides of a tight bend): only the closer one is kept. So:
+          * []: the detection is outside the corridor;
+          * one candidate: unambiguous, and it is the plain closest point (`project(x, y)`) when that is inside;
+          * two or more: the path passes near itself here (overlapping legs): the caller must choose."""
+        p = np.array([float(x), float(y)])
+        runs = []                      # [(distance, arc, segment index, t)] best of each run of inside segments
+        current = None
+        for i in range(len(self.seg)):
+            if self.seglen[i] <= 0:
+                continue
+            d = self.seg[i]
+            t = min(1.0, max(0.0, float(np.dot(p - self.points[i], d) / (self.seglen[i] ** 2))))
+            q = self.points[i] + t * d
+            dist = float(np.hypot(*(p - q)))
+            arc = self.cum[i] + t * self.seglen[i]
+            inside = dist <= self.half_width_at_arc(arc) * factor
+            if not inside:
+                current = None
+                continue
+            if current is None:
+                current = [dist, arc, i, t]
+                runs.append(current)
+            elif dist < current[0] - 1e-9:
+                current[:] = [dist, arc, i, t]
+        runs.sort(key=lambda r: r[1])
+        kept = []
+        for r in runs:
+            if kept and r[1] - kept[-1][1] < float(min_separation_px):
+                if r[0] < kept[-1][0]:
+                    kept[-1] = r          # same place: keep the closer one
+                continue
+            kept.append(r)
+        out = []
+        for dist, arc, i, t in kept:
+            q = self.points[i] + t * self.seg[i]
+            d = self.seg[i]
+            cross = d[0] * (p[1] - q[1]) - d[1] * (p[0] - q[0])
+            lateral = -dist if cross > 0 else dist
+            proj = Projection(s=float(self.s_of_arc(arc)), lateral_px=float(lateral), arc_px=float(arc),
+                              x=float(q[0]), y=float(q[1]))
+            out.append(Candidate(proj, dist, self.half_width_at_arc(arc)))
+        return out
 
     # ----------------------------------------------------------------- region of interest
     def corridor_bbox(self, margin_px=0.0, image_size=None):
-        """(x0, y0, x1, y1) integer bounding box of the corridor (polyline +- half width) plus a margin, clipped to
-        the image when its size is given."""
-        r = self.half_width + float(margin_px)
-        x0, y0 = self.points.min(0) - r
-        x1, y1 = self.points.max(0) + r
+        """(x0, y0, x1, y1) integer bounding box of the corridor (polyline +- its half width, which may vary from
+        point to point) plus a margin, clipped to the image when its size is given. Each segment's band lies inside
+        the two discs at its ends (radius = the width there) and the hull between them, so the box of those discs
+        holds the whole band."""
+        r = self.point_widths[:, None] + float(margin_px)
+        x0, y0 = (self.points - r).min(0)
+        x1, y1 = (self.points + r).max(0)
         if image_size:
             w, h = image_size
             x0, y0 = max(0.0, x0), max(0.0, y0)
