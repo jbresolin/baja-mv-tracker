@@ -5,7 +5,8 @@ Workflow on the page (zone/static/index.html):
   2. Jog the PTZ to frame a car at some spot, "Adicionar keyframe", click that spot in the spotter image: the current
      PTZ pose is read, a preset is stored (numbered from teach.preset_base), and the point becomes a keyframe.
   3. Fix things: move / delete / reorder points, re-teach one keyframe (go to it, adjust, save), test a keyframe
-     (recall its preset), change the corridor width. "Salvar" writes zone.json (the previous one is backed up).
+     (recall its preset), change the corridor width (global, or per point: "largura"). "Salvar" writes zone.json
+     (the previous one is backed up).
 
 Where a keyframe's pose comes from (`PoseSource`, chosen from the characterization report, in this order):
   * `InquirySource`: ask the camera (pan/tilt/zoom inquiry). Jogging uses velocity commands.
@@ -548,6 +549,23 @@ class TeachSession:
             if not 5 <= v <= 1000:
                 raise TeachError("largura do corredor fora de 5..1000 px")
             self.zone.corridor_half_width_px = v
+            self._changed()
+
+    def set_point_width(self, i, half_width_px):
+        """Give point i its own corridor half-width (pixels), or None / "" to use the global corridor again. Between
+        points with their own width the corridor is interpolated along the path (Zone.point_half_widths)."""
+        with self.lock:
+            i = self._check_index(i)
+            if half_width_px is None or str(half_width_px).strip() == "":
+                v = None
+            else:
+                try:
+                    v = float(half_width_px)
+                except (TypeError, ValueError):
+                    raise TeachError("largura inválida: %r" % (half_width_px,)) from None
+                if not 5 <= v <= 1000:
+                    raise TeachError("largura do ponto fora de 5..1000 px")
+            self.zone.points[i].half_width_px = v
             self._changed()
 
     def save(self, path, image_size=None, report=None, cameras=None):

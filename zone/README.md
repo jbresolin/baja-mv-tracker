@@ -105,12 +105,12 @@ spotter frame -> car detector on the corridor ROI (rt/) -> ByteTrack (rt/) -> s,
 
 | module | what |
 |---|---|
-| `zonefile.py` | `zone.json`: path points, keyframes (pose + preset), corridor; save with backup |
-| `path.py` | `s` along the path, projection with a monotonic window, pose(s) (pchip / linear, with ease-in) |
+| `zonefile.py` | `zone.json`: path points (optional own corridor width), keyframes (pose + preset), corridor; save with backup |
+| `path.py` | `s` along the path, projection with a monotonic window, variable corridor width, overlapping-stretch candidates, pose(s) (pchip / linear, with ease-in) |
 | `spotter.py` | corridor ROI crop (`downscale` / `tile` / `full`) in front of the rt detector, then rt's ByteTrack |
 | `bench_detector.py` | bench only: a stock COCO YOLO11 in place of the Baja detector (`spotter.detector = "coco"`) |
-| `progress.py` | s/v Kalman filter per track, speed profile learned from finished passes (`zone.speed.json`) |
-| `director.py` | STOPPED / PASSIVE / AUTO (waiting, tracking, returning) and the lock / drop rules |
+| `progress.py` | s/v Kalman filter per track, where each track was born, speed + box-size profiles learned from finished passes (`zone.speed.json`, `zone.size.json`) |
+| `director.py` | STOPPED / PASSIVE / AUTO (waiting, tracking, returning) and the lock (born upstream) / drop rules |
 | `speedmap.py` | wanted rate -> speed step: inverse table, hysteresis, ramp, minimum smooth step |
 | `controller.py` | the control law, Branch A (inquiry feedback) / B (dead reckoning), zoom, TTL on every command |
 | `teach.py` | click-teach edits and the three pose sources (inquiry / commanded absolute / dead reckoning) |
@@ -150,11 +150,32 @@ PTZ IP, report path, recording). `zone\run_zone.bat` picks `site.toml` up by its
    keyframe", then click that spot in the spotter image. The pose is read and a preset is stored (10, 11, ...).
 4. Repeat along the zone, with path points in between to follow curves, until the exit keyframe.
 5. Check: "testar" recalls a keyframe's preset; "re-ensinar" stores the current framing in it. Points can be moved
-   (select in the list, "Mover ponto", click), deleted and reordered. Set the corridor half-width.
+   (select in the list, "Mover ponto", click), deleted and reordered. Set the corridor half-width ("Corredor", for
+   the whole path) and, where needed, a point's own width ("largura" in the list, see below).
 6. "Salvar zona". The previous file goes to `zone_backups/`.
 
 The first keyframe is s = 0, the last is s = 1. Teaching on a recording with the PTZ simulated also works:
 `--set spotter.source="rec.mp4" --set ptz.driver=sim`.
+
+#### Per-point corridor width
+
+The corridor (the green band on the image) is where detections count as cars of the zone, and its bounding box (+
+`spotter.roi_margin_px`) is what the detector looks at. Its half-width is the global "Corredor" value unless points
+have their own:
+
+* In the point list, column **largura**: type a half-width in pixels and press Enter or "ok" (PARADO / PASSIVO only,
+  like every teach edit; it marks the zone "alterações não salvas"). Empty + ok = back to the global value. The point
+  shows `w<N>` on the image.
+* Between two points that have their own width it changes linearly along the path; before the first / after the last
+  such point it holds that point's value; with none, the global value everywhere (old `zone.json` files are
+  unchanged: the key `half_width_px` is written only on points that have one).
+* Used for the in-corridor test (x `progress.corridor_factor`), the detector ROI, the band drawn on the image and the
+  overlap check below. The global "Corredor" box keeps working for points without their own width.
+* From a console: `curl -X POST http://<laptop>:8090/api/teach/point_width -H "Content-Type: application/json" -d
+  "{\"index\": 5, \"half_width_px\": 35}"` (`null` to clear), then `/api/teach/save` (or "Salvar zona").
+
+Use it to keep the corridor narrow where the path passes near another stretch of track (fewer ambiguous detections,
+below) and wide where cars spread out.
 
 #### Teaching keyframes: troubleshooting
 
@@ -251,6 +272,53 @@ put the entry on a head-on stretch (the approach speed is what the camera's feed
 covering it; `bench_hand` waits 4.5 s), then `stopped` (a pause over 3 s). `--set profile=bench_hand` loosens all of them (and the divergence
 guard a little) so the test is about the PTZ's direction and following. It doesn't change the detector: add
 `--set spotter.detector=coco` if the Baja detector doesn't see the picture.
+
+### Only cars that came in through the entry are locked
+
+`director.require_born_upstream = true` (default): a car is lockable only if its track was **born** (first detected,
+inside the corridor) upstream of the entry and followed continuously since:
+
+* "upstream" = born at s < `born_limit` = max(`director.s_lock`, s of the path's first point + `director.born_window`
+  (0.05)). With a normal approach that is "before s_lock"; for a zone whose path starts at (or just before) the entry
+  keyframe it is "within the first 0.05 of s".
+* "continuously" = no gap longer than `director.lost_timeout_s` between two detections. A NEW tracker id that appears
+  inside the re-acquisition gate of an upstream-born car that is in a dropout takes its place (ByteTrack renumbers
+  cars after a few missed frames); the old track can then never be locked.
+* Anything else is never locked: a car first seen where the path passes near itself, a car first detected in the
+  middle of the lock window, every car already in the zone after a zone edit or a restart. The page's **Carros** list
+  says why ("nasceu fora da entrada (s=0.42)", "perdeu a continuidade desde a entrada"), the image writes "fora da
+  entrada" under its box, and the control log's track entries have `born`, `up`, `cont`.
+* Keep at least ~0.1 of s of approach (path points before the first keyframe) that no other stretch overlaps: a car
+  must be detected there (twice: ByteTrack reports a track from its second detection) before `born_limit`.
+* `director.require_born_upstream = false` gives the old rule back.
+
+### Overlapping track sections
+
+Where the taught path passes near (or across) itself in the spotter image, a detection there is inside the corridor
+of two stretches that are far apart along the path. Tracks that already exist are not confused (their projection
+searches only near where they were, as before); a **new** detection is the problem: the closest point may be on the
+wrong stretch.
+
+* `PathModel.candidates()` lists every stretch whose corridor holds the detection; stretches less than
+  `progress.overlap_min_sep_px` (200) apart along the path are one (a bend). One candidate: the track starts there
+  (exactly the old closest-point result).
+* Two or more: the **size profile** decides. In PASSIVO / AUTO the tracker learns the typical box height (px) per bin
+  of s from finished tracks that were born unambiguously (`zones/zone.size.json`, next to `zone.speed.json`; per car
+  one median per bin, the bin's value is the median over the last 50 cars; a bin is learned from
+  `progress.size_min_passes` = 3 cars). The candidate whose expected height matches (ratio closest to 1, within
+  `progress.size_tolerance` = ±35 %) is chosen ("trecho escolhido pelo tamanho" in the Carros list, an `overlap`
+  event in the events list and the log).
+* No track is started from that detection (the tracker tries again next frame, and the car soon leaves the overlap)
+  when a candidate's bin isn't learned yet, nothing matches, or two candidates both match and their expected heights
+  differ by less than `progress.size_min_contrast` (1.25 x).
+* Counters on the page (health, "trechos sobrepostos": ambiguous / resolved / waiting because unlearned / no match,
+  and the size profile's passes and learned bins) and in every `cycle` line of the control log (`amb`).
+* `progress.overlap_size_check = false` gives the old rule back (closest point of the whole path).
+* Learning it: run PASSIVO for a few laps (3+ cars through each overlapping place, each having started outside the
+  overlap) before AUTO. Delete `zone.size.json` after moving the spotter or re-teaching the path. If an overlap
+  covers the approach, narrow the corridor there with per-point widths until the approach is unambiguous: the size
+  bins of an approach that is entirely inside an overlap are never learned (only cars born unambiguously teach the
+  profile), so cars there wait, are born past `born_limit` and are never locked.
 
 ### Detection dropouts (prediction, re-acquisition, zoom)
 

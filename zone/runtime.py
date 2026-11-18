@@ -30,7 +30,7 @@ from zone.config import Settings
 from zone.controller import CycleCommand, Controller
 from zone.director import Decision, Director
 from zone.path import PathModel, Pose, PoseCurve
-from zone.progress import ProgressTracker, SpeedProfile, TrackView
+from zone.progress import ProgressTracker, SizeProfile, SpeedProfile, TrackView
 from zone.zonefile import Zone
 
 
@@ -81,7 +81,8 @@ class CycleResult:
 
 class ZoneRuntime:
     def __init__(self, settings: Settings, zone: Zone, ptz, clock, spotter=None, profile: SpeedProfile = None,
-                 profile_path=None, log: ControlLog = None, on_event=None):
+                 profile_path=None, log: ControlLog = None, on_event=None, size_profile: SizeProfile = None,
+                 size_profile_path=None):
         self.settings = settings
         self.ptz, self.clock = ptz, clock
         self.spotter = spotter
@@ -102,6 +103,14 @@ class ZoneRuntime:
                 self.profile = SpeedProfile.load(self.profile_path)
             except Exception as e:  # noqa: BLE001 (a corrupt profile must not stop the race; start a new one)
                 self._event(dict(type="warning", msg="speed profile not loaded: %s" % e))
+        # the box-size profile (overlapping legs, zone/progress.py): zone.size.json, next to zone.speed.json
+        self.size_profile_path = Path(size_profile_path) if size_profile_path else None
+        self.size_profile = size_profile
+        if self.size_profile is None and self.size_profile_path and self.size_profile_path.exists():
+            try:
+                self.size_profile = SizeProfile.load(self.size_profile_path)
+            except Exception as e:  # noqa: BLE001 (same: start a new one)
+                self._event(dict(type="warning", msg="size profile not loaded: %s" % e))
         self.director = Director(settings.director, on_event=self._event)
         self.controller = Controller(ptz, clock, None, settings.pan_map, settings.tilt_map, settings.controller)
         self.zone = None
@@ -139,11 +148,17 @@ class ZoneRuntime:
                                             bin_width=float(sp.get("bin_width", 0.05)),
                                             max_passes=int(sp.get("max_passes", 50)),
                                             default_v=float(sp.get("default_v", 0.25)))
+            if self.size_profile is None:
+                self.size_profile = SizeProfile(s_lo=min(-0.5, path.s_min), s_hi=max(1.2, path.s_max),
+                                                bin_width=float(sp.get("bin_width", 0.05)),
+                                                max_passes=int(sp.get("max_passes", 50)))
             if self.progress is None:
-                self.progress = ProgressTracker(path, self.settings.progress, self.profile)
+                self.progress = ProgressTracker(path, self.settings.progress, self.profile, self.size_profile)
                 self.progress.on_finished = self._pass_finished
             else:
                 self.progress.set_path(path)
+            # the lock rule's "came in through the entry" (director.require_born_upstream)
+            self.progress.born_limit_s = self.director.cfg.born_limit(path.s_min)
             if self.spotter is not None:
                 size = zone.image_size or self.frame_size
                 margin = float(self.settings.cfg["spotter"].get("roi_margin_px", 40))
@@ -176,6 +191,11 @@ class ZoneRuntime:
                 self.profile.save(self.profile_path)
             except Exception as e:  # noqa: BLE001
                 self._event(dict(type="warning", msg="speed profile not saved: %s" % e))
+        if self.size_profile_path and self.size_profile is not None:
+            try:
+                self.size_profile.save(self.size_profile_path)
+            except Exception as e:  # noqa: BLE001
+                self._event(dict(type="warning", msg="size profile not saved: %s" % e))
         self._event(dict(type="pass_finished", track_id=tp.track_id, n=tp.n_updates,
                          s0=round(tp.samples[0][2], 3), s1=round(tp.samples[-1][2], 3),
                          profile_passes=self.profile.n_passes))
@@ -287,8 +307,12 @@ class ZoneRuntime:
             focus = (self.director.locked_id
                      if self.director.mode == D.AUTO and self.director.sub == D.TRACKING else None)
             raw = self._raw_boxes() if frame_had_detection else None
+            if self.progress:
+                # the size profile learns only while someone runs the zone (PASSIVE / AUTO), not in STOPPED
+                self.progress.learn_size = self.director.mode in (D.PASSIVE, D.AUTO)
             views = self.progress.update(frame.t, tracker_out, focus, raw) if self.progress else {}
             reacquired = list(self.progress.reacquired) if self.progress else []
+            overlap_events = list(self.progress.overlap_events) if self.progress else []
         # ---- control: short, under the lock the big STOP takes
         with self.lock:
             if self.handover_requested is not None:
@@ -298,6 +322,10 @@ class ZoneRuntime:
             if hasattr(self.ptz, "tick"):
                 self.ptz.tick()                      # the simulator integrates its motion up to now
             now = self.clock.monotonic()
+            for ev in overlap_events:
+                # a new track started where two stretches of path overlap: the size profile chose this stretch
+                self._event(dict(type="overlap", msg="trecho sobreposto: carro %d na passagem s=%.2f (altura %.0f px, "
+                                 "esperado %.0f)" % (ev["track_id"], ev["s"], ev["h"], ev["expected"]), **ev))
             for ev in reacquired:
                 self.director.reacquired(now, ev)    # logs it; follows the new id if progress adopted one
             decision = self.director.step(now, views)
@@ -363,7 +391,8 @@ class ZoneRuntime:
                     n_dets=res.n_dets, det_ms=round(res.det_ms, 1),
                     tracks=[v.to_log() for v in res.views.values()],
                     director=self.director.state(), action=res.decision.action, reason=res.decision.reason,
-                    cmd=res.command.to_log() if res.command else None)
+                    cmd=res.command.to_log() if res.command else None,
+                    amb=dict(self.progress.ambiguity) if self.progress else None)
 
     def _event(self, ev):
         if self.log:
@@ -383,8 +412,18 @@ class ZoneRuntime:
                                   age=round(float(tr.since_update_s), 2), held=bool(tr.held),
                                   zoom_extra=round(float(self.director.zoom_extra), 3))
             cmd = self.last.command.to_log() if (self.last and self.last.command) else None
+            tracks = []
+            for v in (self.last.views.values() if self.last else []):
+                d = v.to_log()
+                d["why_not"] = self.director.lock_block_reason(v)   # e.g. "nasceu fora da entrada" ("" = none)
+                tracks.append(d)
+            sz = self.size_profile
+            overlap = dict(enabled=bool(self.settings.progress.overlap_size_check),
+                           counts=dict(self.progress.ambiguity) if self.progress else {},
+                           size_passes=sz.n_passes if sz else 0,
+                           size_bins=sz.learned_bins(self.settings.progress.size_min_passes) if sz else 0)
             return dict(director=st, locked=locked, command=cmd, fps=round(self.fps, 1), cycles=self.cycles,
-                        tracks=[v.to_log() for v in self.last.views.values()] if self.last else [],
+                        tracks=tracks, overlap=overlap,
                         branch=self.settings.controller.branch, zone_ready=self.path is not None,
                         profile_passes=self.profile.n_passes if self.profile else 0,
                         ptz_ok=self.controller.ptz_ok)

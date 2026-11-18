@@ -12,6 +12,10 @@ Modes (chosen on the page):
       v >= v_min, with at least `min_updates` detections, and not already past s_lock + lock_window (a car that
       is deep in the zone when the camera gets back to the entry can't be caught from there: it's skipped).
       Other cars are ignored (overtakes too, for this test).
+      With `require_born_upstream` (default on) a car is lockable only if it came in through the entry: its track was
+      born before `born_limit` (s_lock, or the first `born_window` of the path when the zone has no approach) and has
+      been followed continuously since (zone/progress.py: born_upstream, continuous). A car first detected where the
+      path passes near itself is never locked; `lock_block_reason()` says why, for the page.
       The car is let go when it reaches s >= s_exit (normally 1), or dropped when:
         * lost: no detection for longer than `lost_timeout_s` (meanwhile it's predicted ahead: zone/progress.py,
           frozen speed, typical profile, held at most `progress.max_predict_s_ahead` past the last measured s),
@@ -71,6 +75,15 @@ class DirectorSettings:
     off_corridor_frames: int = 3
     s_exit: float = 1.0
     settle_s: float = 1.5           # wait after recalling the entry preset (seeded from the report)
+    require_born_upstream: bool = True   # lock only a car whose track was born upstream of the entry (born_limit)
+    born_window: float = 0.05       # zone without an approach (path starts at the first keyframe): "upstream" = born
+                                    # within this much s of the path's start
+
+    def born_limit(self, s_min):
+        """A track born at s below this came in through the entry. `s_min`: s of the path's first point (<= 0).
+        Born before s_lock (the approach) -- or, when the approach is short or missing (the path starts at or near
+        the first keyframe), within born_window of the path's start, whichever is further along."""
+        return max(float(self.s_lock), float(s_min) + float(self.born_window))
 
 
 @dataclass
@@ -193,11 +206,24 @@ class Director:
             return None
         return self._release(t, reason, tr)
 
+    def lock_block_reason(self, tr):
+        """Why this track may never be locked, in pt-BR for the page, or "" (it may, when the other lock conditions
+        hold). Only the birth rule: a track not born upstream of the entry, or not followed continuously since."""
+        if not self.cfg.require_born_upstream:
+            return ""
+        if getattr(tr, "born_upstream", None) is False:
+            born = getattr(tr, "born_s", None)
+            return "nasceu fora da entrada" + ("" if born is None else " (s=%.2f)" % born)
+        if getattr(tr, "continuous", True) is False:
+            return "perdeu a continuidade desde a entrada"
+        return ""
+
     def _candidate(self, tracks):
         c = self.cfg
         ok = [tr for tr in tracks.values()
               if c.s_lock <= tr.s <= c.s_lock + c.lock_window and tr.s < c.s_exit and self._moving_forward(tr)
-              and tr.n_updates >= c.min_updates and not tr.predicted and tr.off_corridor_frames == 0]
+              and tr.n_updates >= c.min_updates and not tr.predicted and tr.off_corridor_frames == 0
+              and not self.lock_block_reason(tr)]
         if not ok:
             return None
         return max(ok, key=lambda tr: tr.s)   # two at once: the one further along reached s_lock first

@@ -86,7 +86,9 @@ jog_speeds = [2, 6, 12]           # pan/tilt speed steps for the slow / medium /
 jog_zoom_speed = 3                # zoom speed step for the zoom buttons
 nudge_units = [8, 32, 128]        # "commanded" pose source: pan/tilt nudge per click (raw units), slow/medium/fast
 zoom_nudge_units = [100, 400, 1600]
-default_corridor_px = 60          # corridor half-width of a new zone
+default_corridor_px = 60          # corridor half-width of a new zone (the global "Corredor" on the page). Each point
+                                  # may also get its own width ("largura" in the point list, zone.json
+                                  # "half_width_px"): interpolated between such points, the global value where none
 
 [progress]
 meas_sigma_px = 6.0               # noise of one ground point along the path (pixels)
@@ -116,6 +118,17 @@ reacquire_gate_max_s = 0.35       # doesn't report yet) is re-attached to the fo
                                   # dropout: a car that was already there is another car
 ground_window_s = 1.0             # the ground point's image speed (px/s, director.lock_px_s, "gpx" in the log) is
                                   # measured over this
+# Overlapping track sections (README "Overlapping track sections"): where the path passes near itself, a NEW detection
+# can be inside the corridor of two stretches far apart along the path. Then the learned box height per s
+# (zones/zone.size.json, learned in PASSIVE / AUTO from cars whose track started unambiguously) picks the stretch whose
+# expected height matches; not learned yet, or no clear match -> no track from that detection (it tries again next
+# frame). Tracks that already exist keep following their own stretch (projection window), unchanged.
+overlap_size_check = true         # false = the old rule: a new detection goes to the closest point of the whole path
+overlap_min_sep_px = 200.0        # corridor stretches closer than this along the path (arc pixels) are one place
+size_tolerance = 0.35             # box height within x(1 +- this) of the expected height (as a ratio) to match
+size_min_contrast = 1.25          # when two stretches both match, their expected heights must differ by at least
+                                  # this factor to tell them apart; else wait
+size_min_passes = 3               # a size bin counts as learned with at least this many cars through it
 
 [speed_profile]
 bin_width = 0.05                  # in s
@@ -179,6 +192,12 @@ stopped_px_s = 8.0                #  - and still in the image: its ground point 
 off_corridor_frames = 3           # drop a car outside the corridor for more frames than this
 s_exit = 1.0                      # release the car here and go back to the entry
 settle_s = "auto"                 # wait after recalling the entry preset ("auto" = report preset_settle_s, default 1.5)
+require_born_upstream = true      # lock only a car that came in through the entry: its track was born before s_lock
+                                  # (in the approach) and followed continuously since (dropouts up to lost_timeout_s
+                                  # allowed, also across a new tracker id). A car first seen elsewhere (e.g. where the
+                                  # path passes near itself) is never locked: the page says "nasceu fora da entrada"
+born_window = 0.05                # a zone with no (or a short) approach: born within this much s of the path's start
+                                  # also counts as "came in through the entry"
 
 [web]
 host = "0.0.0.0"                  # 0.0.0.0 = reachable from a phone on the LAN; "127.0.0.1" = this PC only
@@ -261,6 +280,7 @@ lost_timeout_s = 4.5              # the detector misses a blurred / covered pict
 stopped_timeout_s = 6.0           # the hand pauses (race: 3)
 stopped_px_s = 4.0
 off_corridor_frames = 10          # the bottom edge of a hand-held picture wanders off the taught line (race: 3)
+require_born_upstream = false     # the picture is often first seen in the middle of the corridor (race: true)
 [profiles.bench_hand.progress]
 corridor_factor = 2.0             # accept detections up to 2x the corridor half-width from the line
 window_back_px = 150.0            # the hand moves it backwards a little (race: 40)

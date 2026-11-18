@@ -2110,3 +2110,30 @@ the controller faithfully followed that curve (target pan 1764, zoom 0, steps up
   flags P11 for all three reasons; P12 gets a soft tilt warning (136 -> 176 -> 100 can be a real dip).
 * Control behaviour unchanged (the controller still follows whatever keyframes it is given).
 
+
+## Session 3: per-point corridor width, born-upstream lock rule, overlapping legs (zone-corridor-overlap, 2026-11-18)
+
+Before the race (19-22 Nov): the race zone's path passes near itself, so a car on a later stretch could be detected
+for the first time right at the entry and be locked as if it had just come in. Three changes, all synthetic-tested
+(`zone/tests/test_corridor_width.py`, `test_born_upstream.py`, `test_overlap.py`), not yet seen on real footage:
+
+* **Per-point corridor width** (`half_width_px` on any point, linear along the path between such points, held past
+  the first / last, the global width where none; old zone.json files load and save unchanged). Used by the
+  in-corridor test, the detector ROI (box of the per-point discs: it holds the whole band), the drawn band and the
+  overlap candidates. Teach page: "largura" per row (Enter / "ok"); API `POST /api/teach/point_width`.
+* **Lock only cars born upstream** (`director.require_born_upstream`, default on): born before
+  max(s_lock, s_min + `born_window` 0.05) and no gap > `lost_timeout_s` since. A new tracker id inside the
+  re-acquisition gate of an upstream-born car in a dropout inherits its birth (else ByteTrack's renumbering after a
+  short dropout in the approach would cost the car). Reproduced the failure on a looped synthetic path: with the old
+  rules (closest point, no birth rule) the crossing car is locked at s ~ 0.03; the birth rule alone refuses it.
+  Consequences: after a zone edit or a restart, cars already in the zone are not lockable (correct); a zone needs
+  enough approach for two detections before `born_limit`.
+* **Overlapping legs**: a NEW detection inside the corridor of two stretches > `overlap_min_sep_px` (200) apart along
+  the path is ambiguous; the learned box-height profile (`zone.size.json`, PASSIVE / AUTO only, only from tracks born
+  unambiguously, so a wrong guess can't teach itself) picks the stretch whose expected height is within ±35 %, with
+  the two stretches' expected heights at least 1.25 x apart; otherwise no track from that detection (next frame).
+  Existing tracks are unchanged (projection window). With every width equal and one candidate the result is exactly
+  the old closest-point one. Counters on the page and in the cycle log (`amb`).
+* Drawing: `cv2.fillPoly` with several overlapping polygons leaves their overlaps empty (even-odd): the band is drawn
+  one quad at a time (`fillConvexPoly`) plus a disc per point.
+* Controller control law and dropout logic unchanged.

@@ -40,6 +40,7 @@
   .bad { color:#ff6b5e; font-weight:700; } .good { color:#5bd77b; } .warn { color:#f0b93a; }
   #msg { min-height:20px; color:var(--amber); font-weight:600; }
   #events { font-size:12px; color:var(--dim); max-height:180px; overflow:auto; }
+  input.pw { width:56px; padding:2px 4px; font-size:12px; }
   input[type=number] { width:80px; background:#111; color:var(--text); border:1px solid var(--line); padding:6px; border-radius:4px; }
   .big { font-size:20px; font-weight:700; }
 </style>
@@ -73,6 +74,10 @@
       <div id="clickHint"></div>
     </div>
     <section style="margin-top:12px">
+      <h2>Carros</h2>
+      <table id="cars"><thead><tr><th>id</th><th>s</th><th>v</th><th>nasceu em</th><th></th></tr></thead><tbody></tbody></table>
+    </section>
+    <section>
       <h2>Eventos</h2>
       <div id="events"></div>
     </section>
@@ -100,7 +105,9 @@
       <div style="font-size:12px;color:var(--dim)">Fonte da pose: <b id="poseSrc"></b> · pose atual: <span id="poseNow">–</span>
         · arquivo <span id="zoneFile"></span></div>
       <div id="kfWarn" class="bad" style="display:none;font-size:12px;font-weight:400"></div>
-      <table id="points"><thead><tr><th>#</th><th>tipo</th><th>x,y</th><th></th></tr></thead><tbody></tbody></table>
+      <table id="points"><thead><tr><th>#</th><th>tipo</th><th>x,y</th>
+        <th title="Meia largura do corredor neste ponto (px). Vazio = usa o Corredor global; entre pontos com largura própria ela é interpolada">largura</th>
+        <th></th></tr></thead><tbody></tbody></table>
     </section>
     <section>
       <h2>Mover PTZ</h2>

@@ -193,7 +193,9 @@ def build(cfg, report: Report = None) -> Settings:
         lock_px_s=float(d.get("lock_px_s", 15.0)),
         loosen_after_s=float(d.get("loosen_after_s", 0.5)), loosen_max=float(d.get("loosen_max", 0.3)),
         loosen_restore_s=float(d.get("loosen_restore_s", 1.0)),
-        s_exit=float(d["s_exit"]), settle_s=float(settle))
+        s_exit=float(d["s_exit"]), settle_s=float(settle),
+        require_born_upstream=bool(d.get("require_born_upstream", True)),
+        born_window=float(d.get("born_window", 0.05)))
 
     p = cfg["progress"]
     progress = ProgressSettings(
@@ -207,12 +209,20 @@ def build(cfg, report: Report = None) -> Settings:
         speed_band=tuple(float(x) for x in p.get("speed_band", (0.5, 1.5))),
         speed_band_window_s=float(p.get("speed_band_window_s", 1.0)),
         reacquire_gate_s=float(p.get("reacquire_gate_s", 0.10)),
-        reacquire_gate_max_s=float(p.get("reacquire_gate_max_s", 0.35)))
+        reacquire_gate_max_s=float(p.get("reacquire_gate_max_s", 0.35)),
+        overlap_size_check=bool(p.get("overlap_size_check", True)),
+        overlap_min_sep_px=float(p.get("overlap_min_sep_px", 200.0)),
+        size_tolerance=float(p.get("size_tolerance", 0.35)),
+        size_min_contrast=float(p.get("size_min_contrast", 1.25)),
+        size_min_passes=int(p.get("size_min_passes", 3)))
     # a followed car must still exist while the director waits for it: progress may not finish (forget) a track
     # before the director's lost_timeout_s has run out, or the drop would read "gone" instead of "lost", early
     progress.finish_after_s = max(progress.finish_after_s, director.lost_timeout_s + 0.5)
     # the prediction must last as long as the director waits, too (past max_prediction_s it would stop moving)
     progress.max_prediction_s = max(progress.max_prediction_s, director.lost_timeout_s)
+    # "followed continuously since it came in through the entry" (the lock rule) tolerates the same dropouts the
+    # director tolerates for a followed car
+    progress.continuity_gap_s = director.lost_timeout_s
 
     s = cfg["speedmap"]
     pan_min = _auto(s["pan_min_smooth_step"], getattr(m, "pan_min_smooth_step", 1) or 1)
